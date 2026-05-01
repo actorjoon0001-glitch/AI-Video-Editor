@@ -5,8 +5,8 @@ const { FFmpeg } = window.FFmpegWASM;
 const { fetchFile, toBlobURL } = window.FFmpegUtil;
 
 // 백엔드 서버 URL (고속 모드용). 비어 있으면 백엔드 모드 비활성.
-// 배포 후 Render URL 로 바꾸세요. localStorage 로 사용자가 덮어쓸 수도 있음.
-const DEFAULT_BACKEND_URL = ""; // 예: "https://ai-video-editor-api.onrender.com"
+// localStorage("backendUrl") 로 사용자가 덮어쓸 수 있음.
+const DEFAULT_BACKEND_URL = "https://ai-video-editor-api.onrender.com";
 const BACKEND_URL = localStorage.getItem("backendUrl") || DEFAULT_BACKEND_URL;
 
 // jsDelivr 는 cross-origin 리소스에 적절한 CORP 헤더를 일관되게 보냄.
