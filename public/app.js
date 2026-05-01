@@ -302,9 +302,37 @@ async function runPipeline() {
     bgmVolDb: parseFloat($("bgmVol").value),
     loudnorm: $("loudnorm").checked,
   };
-  setStatus(`컷·인코딩 중... (제거 ${cutTotal.toFixed(1)}s · ${state.ratio} · ${state.speed}x${bgmFile ? " · BGM" : ""})`);
-  setBar(0);
-  await applyCutsAndRatio(ff, inName, outName, keeps, encodeOpts);
+  // 인코딩 진행률 = 출력 영상의 인코딩된 시간 / 출력 예상 길이
+  const expectedOut = (pickedDuration - cutTotal) / state.speed;
+  const encodeStart = Date.now();
+  let encodeTimer = null;
+  let lastEncodeTime = 0;
+  const encodeProgressHandler = ({ message }) => {
+    // ffmpeg 로그: "frame=  120 fps= 15 q=28.0 size=...time=00:00:04.00 bitrate=..."
+    const m = message.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
+    if (m) {
+      lastEncodeTime = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+    }
+  };
+  ff.on("log", encodeProgressHandler);
+  // 1초마다 경과 시간 + 인코딩 진행률 업데이트
+  encodeTimer = setInterval(() => {
+    const elapsed = (Date.now() - encodeStart) / 1000;
+    const pct = expectedOut > 0 ? Math.min(99, (lastEncodeTime / expectedOut) * 100) : 0;
+    setBar(pct);
+    setStatus(
+      `컷·인코딩 중 — ${formatHMS(lastEncodeTime)} / ${formatHMS(expectedOut)} ` +
+      `(${pct.toFixed(0)}%) · 경과 ${formatHMS(elapsed)}`
+    );
+  }, 500);
+
+  try {
+    await applyCutsAndRatio(ff, inName, outName, keeps, encodeOpts);
+  } finally {
+    clearInterval(encodeTimer);
+    ff.off("log", encodeProgressHandler);
+  }
+  setBar(100);
   doneStep("encode");
 
   // 결과 추출
@@ -663,6 +691,13 @@ function buildCapCutDraft(fileName, keeps, duration) {
 
 // ── UI helpers ───────────────────────────────────────────────────────────────
 function setBar(pct) { bar.style.width = `${pct}%`; }
+function formatHMS(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const s = Math.round(seconds);
+  const m = Math.floor(s / 60);
+  const r = (s % 60).toString().padStart(2, "0");
+  return `${m}:${r}`;
+}
 function setStatus(msg) { statusEl.textContent = msg; }
 function appendLog(msg) {
   logEl.textContent += msg + "\n";
