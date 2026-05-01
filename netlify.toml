@@ -8,6 +8,8 @@
   for = "/*"
   [headers.values]
     Cross-Origin-Opener-Policy = "same-origin"
-    Cross-Origin-Embedder-Policy = "require-corp"
+    # credentialless 는 cross-origin 리소스에 CORP 헤더가 없어도 로드 가능.
+    # require-corp 는 unpkg/jsDelivr 등 CDN이 CORP 헤더를 안 보낼 때 ffmpeg-core 로드가 막힘.
+    Cross-Origin-Embedder-Policy = "credentialless"
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
