@@ -4,6 +4,11 @@
 const { FFmpeg } = window.FFmpegWASM;
 const { fetchFile, toBlobURL } = window.FFmpegUtil;
 
+// 백엔드 서버 URL (고속 모드용). 비어 있으면 백엔드 모드 비활성.
+// 배포 후 Render URL 로 바꾸세요. localStorage 로 사용자가 덮어쓸 수도 있음.
+const DEFAULT_BACKEND_URL = ""; // 예: "https://ai-video-editor-api.onrender.com"
+const BACKEND_URL = localStorage.getItem("backendUrl") || DEFAULT_BACKEND_URL;
+
 // jsDelivr 는 cross-origin 리소스에 적절한 CORP 헤더를 일관되게 보냄.
 // unpkg 보다 ffmpeg.wasm 로드 호환성이 높음.
 const FFMPEG_CORE_BASE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/umd";
@@ -207,6 +212,19 @@ window.addEventListener("drop", (e) => {
   if (f && f.type.startsWith("video/")) handleFile(f);
 });
 
+// 백엔드 URL 미설정 시 토글 비활성
+window.addEventListener("DOMContentLoaded", () => {
+  const cb = $("serverMode");
+  const hint = $("serverModeHint");
+  if (!cb) return;
+  if (!BACKEND_URL) {
+    cb.disabled = true;
+    if (hint) hint.textContent = "* 백엔드 URL 이 설정되지 않았습니다. localStorage.setItem('backendUrl','https://...') 또는 코드 DEFAULT_BACKEND_URL 변경 필요.";
+  } else if (hint) {
+    hint.textContent = `* 영상이 일시 서버를 거칩니다 (HTTPS, 처리 후 1시간 내 자동 삭제). 백엔드: ${BACKEND_URL}`;
+  }
+});
+
 resetBtn.addEventListener("click", () => {
   pickedFile = null;
   fileInput.value = "";
@@ -228,7 +246,113 @@ resetBtn.addEventListener("click", () => {
   setStatus("");
 });
 
-runBtn.addEventListener("click", () => runPipeline().catch(onError));
+runBtn.addEventListener("click", () => {
+  const useServer = $("serverMode")?.checked && BACKEND_URL;
+  (useServer ? runServerPipeline() : runPipeline()).catch(onError);
+});
+
+// ── 백엔드 파이프라인 ────────────────────────────────────────────────────────
+async function runServerPipeline() {
+  if (!pickedFile) return;
+  runBtn.disabled = true;
+  resultSection.hidden = true;
+  progress.hidden = false;
+  logEl.textContent = "";
+  resetSteps();
+  setBar(0);
+
+  // 1) 길이
+  setStep("probe");
+  setStatus("길이 확인 중...");
+  pickedDuration = await measureDurationFromFile(pickedFile);
+  if (pickedDuration <= 0) throw new Error("브라우저가 영상 길이를 읽지 못했습니다. 다른 형식으로 시도해 주세요.");
+  appendLog(`duration = ${pickedDuration.toFixed(2)}s`);
+  doneStep("probe");
+
+  // 2) Web Audio 무음 감지
+  setStep("detect");
+  let keeps;
+  if (state.mode === "short") {
+    setStatus("숏폼 모드는 고속 모드에서 미지원 — 영상 중앙 구간 사용");
+    const targetLen = parseFloat($("shortLen").value);
+    const start = Math.max(0, (pickedDuration - targetLen) / 2);
+    keeps = [{ start, end: Math.min(pickedDuration, start + targetLen) }];
+  } else {
+    const noiseDb = parseFloat($("silenceDb").value);
+    const minSilence = parseFloat($("minSilence").value);
+    const padding = parseFloat($("padding").value);
+    setStatus("Web Audio 로 무음 감지 중...");
+    let silences = [];
+    try {
+      silences = await detectSilencesWebAudio(pickedFile, noiseDb, minSilence);
+    } catch (e) {
+      throw new Error("브라우저가 영상의 오디오를 디코딩하지 못합니다. (HEVC+오디오 코덱 호환 문제) — 다른 형식으로 시도해 주세요. 원인: " + e.message);
+    }
+    keeps = invertSilences(pickedDuration, silences, padding);
+    appendLog(`silences=${silences.length}, keeps=${keeps.length}`);
+  }
+  if (keeps.length === 0) throw new Error("남은 구간이 없습니다. 임계값을 완화해 주세요.");
+  lastKeeps = keeps;
+  doneStep("detect");
+
+  // 3) 서버 업로드 + 처리
+  setStep("encode");
+  const serverOpts = {
+    keeps,
+    ratio: state.ratio,
+    speed: state.speed,
+    loudnorm: $("loudnorm").checked,
+  };
+  const reqStart = Date.now();
+  let phase = "upload";
+  const { blob, durationMs, sizeBytes } = await processOnBackend(pickedFile, serverOpts, (p) => {
+    phase = p.phase;
+    if (p.phase === "upload" && p.total) {
+      const pct = (p.loaded / p.total) * 100;
+      setBar(pct * 0.4); // 업로드는 전체의 40% 가정
+      setStatus(`서버에 업로드 중... ${(p.loaded / 1024 / 1024).toFixed(1)} / ${(p.total / 1024 / 1024).toFixed(1)} MB`);
+    } else if (p.phase === "processing") {
+      setBar(45);
+      setStatus("서버에서 인코딩 중... (보통 영상 길이의 0.1~0.3배)");
+    } else if (p.phase === "downloading") {
+      setBar(85);
+      setStatus("결과 영상 다운로드 중...");
+    }
+  });
+  appendLog(`server processed in ${(durationMs / 1000).toFixed(1)}s, ${(sizeBytes / 1024 / 1024).toFixed(1)}MB`);
+  doneStep("encode");
+
+  // 결과 표시
+  if (outputUrl) URL.revokeObjectURL(outputUrl);
+  outputUrl = URL.createObjectURL(blob);
+  resultVideo.src = outputUrl;
+  downloadBtn.href = outputUrl;
+  downloadBtn.download = outputFileName(pickedFile.name);
+
+  const outDuration = keeps.reduce((a, k) => a + (k.end - k.start), 0) / state.speed;
+  const cutTotal = pickedDuration - keeps.reduce((a, k) => a + (k.end - k.start), 0);
+  renderStats({
+    inputDuration: pickedDuration,
+    outputDuration: outDuration,
+    cutTime: cutTotal,
+    cuts: keeps.length,
+    ratio: state.ratio,
+    speed: state.speed,
+    sizeMB: blob.size / 1024 / 1024,
+  });
+
+  // 썸네일은 결과 mp4 가 작아서 ffmpeg.wasm 로 빠르게 추출 가능 — 일단 스킵하거나 결과에서 직접 추출
+  setStep("thumbs");
+  setStatus("썸네일 추출 (선택)");
+  doneStep("thumbs");
+  thumbsBlock.hidden = true;
+
+  setBar(100);
+  setStatus(`완료! 총 ${((Date.now() - reqStart) / 1000).toFixed(1)}초`);
+  resultSection.hidden = false;
+  resultSection.scrollIntoView({ behavior: "smooth", block: "start" });
+  runBtn.disabled = false;
+}
 
 // ── 파이프라인 ───────────────────────────────────────────────────────────────
 async function runPipeline() {
@@ -404,6 +528,92 @@ async function runPipeline() {
   try { await ff.deleteFile(inName); } catch {}
   try { await ff.deleteFile(outName); } catch {}
   if (encodeOpts.bgmName) { try { await ff.deleteFile(encodeOpts.bgmName); } catch {} }
+}
+
+// ── Web Audio 기반 무음 감지 (백엔드 모드용 — ffmpeg.wasm 불필요) ─────────────
+async function detectSilencesWebAudio(file, noiseDb, minSilence) {
+  // AudioContext 로 디코딩 (브라우저가 코덱 지원해야 함, AAC 는 대부분 OK).
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  let buf;
+  try {
+    buf = await ctx.decodeAudioData(await file.arrayBuffer());
+  } finally {
+    ctx.close().catch(() => {});
+  }
+  const sr = buf.sampleRate;
+  const nch = buf.numberOfChannels;
+  const winSize = Math.max(1, Math.floor(sr * 0.05)); // 50ms 창
+  const winDuration = winSize / sr;
+  const totalWin = Math.floor(buf.length / winSize);
+  const noiseLin = Math.pow(10, noiseDb / 20);
+
+  const channels = [];
+  for (let c = 0; c < nch; c++) channels.push(buf.getChannelData(c));
+
+  const silences = [];
+  let silentRun = 0;
+  let runStart = 0;
+  for (let w = 0; w < totalWin; w++) {
+    let sumSq = 0;
+    const off = w * winSize;
+    for (let c = 0; c < nch; c++) {
+      const data = channels[c];
+      for (let i = 0; i < winSize; i++) {
+        const s = data[off + i];
+        sumSq += s * s;
+      }
+    }
+    const rms = Math.sqrt(sumSq / (winSize * nch));
+    const isSilent = rms < noiseLin;
+    if (isSilent) {
+      if (silentRun === 0) runStart = w * winDuration;
+      silentRun++;
+    } else if (silentRun > 0) {
+      const dur = silentRun * winDuration;
+      if (dur >= minSilence) silences.push({ start: runStart, end: runStart + dur });
+      silentRun = 0;
+    }
+  }
+  if (silentRun > 0) {
+    const dur = silentRun * winDuration;
+    if (dur >= minSilence) silences.push({ start: runStart, end: runStart + dur });
+  }
+  return silences;
+}
+
+// ── 백엔드 처리 흐름 (/api/process 업로드) ───────────────────────────────────
+async function processOnBackend(file, opts, onProgress) {
+  if (!BACKEND_URL) throw new Error("백엔드 URL 이 설정되지 않았습니다.");
+
+  const fd = new FormData();
+  fd.append("video", file);
+  fd.append("options", JSON.stringify(opts));
+
+  // 업로드 진행률 추적을 위해 XHR 사용 (fetch 는 upload progress 지원 약함)
+  const result = await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BACKEND_URL}/api/process`);
+    xhr.responseType = "json";
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress({ phase: "upload", loaded: e.loaded, total: e.total });
+      }
+    };
+    xhr.upload.onloadend = () => onProgress?.({ phase: "processing" });
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
+      else reject(new Error(`서버 ${xhr.status}: ${xhr.response?.error || "fail"}`));
+    };
+    xhr.onerror = () => reject(new Error("네트워크 오류"));
+    xhr.send(fd);
+  });
+
+  // 결과 mp4 다운로드
+  onProgress?.({ phase: "downloading" });
+  const r = await fetch(`${BACKEND_URL}${result.url}`);
+  if (!r.ok) throw new Error(`결과 다운로드 실패: ${r.status}`);
+  const blob = await r.blob();
+  return { blob, durationMs: result.durationMs, sizeBytes: result.sizeBytes };
 }
 
 // ── ffmpeg helpers ───────────────────────────────────────────────────────────

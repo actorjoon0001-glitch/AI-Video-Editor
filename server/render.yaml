@@ -1,0 +1,16 @@
+# Render Blueprint — 한 번에 서비스 생성용
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: ai-video-editor-api
+    runtime: docker
+    rootDir: server
+    dockerfilePath: ./Dockerfile
+    plan: starter      # free 도 동작하지만 15분 idle 후 슬립
+    region: singapore  # 한국 사용자 가까운 리전
+    healthCheckPath: /healthz
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://ai-video-editor-good.netlify.app
+      - key: NODE_ENV
+        value: production

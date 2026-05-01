@@ -204,6 +204,13 @@
             <input type="checkbox" id="loudnorm" checked />
             <span>음량 자동 정규화 (방송 표준 -16 LUFS)</span>
           </label>
+          <label class="toggle">
+            <input type="checkbox" id="serverMode" />
+            <span>고속 모드 — 외부 서버에서 인코딩 (5~10배 빠름, HEVC OK)</span>
+          </label>
+          <p class="bgm-hint" id="serverModeHint" style="margin-top:8px">
+            * 영상이 일시적으로 서버를 거칩니다 (HTTPS 전송, 처리 직후 1시간 내 자동 삭제). 백엔드 URL 설정 필요.
+          </p>
         </details>
 
         <div class="row btn-row">
