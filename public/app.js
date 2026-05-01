@@ -117,7 +117,9 @@ async function ensureFFmpeg() {
   setStatus("ffmpeg 엔진 로드 중... (최초 1회, ~30MB)");
   const instance = new FFmpeg();
   instance.on("log", ({ message }) => appendLog(message));
-  instance.on("progress", ({ progress: p }) => setBar(Math.min(0.99, p) * 100));
+  // 주의: 전역 progress 핸들러를 두지 않는다. 인코딩 단계에서 직접 시간 기반으로 추적.
+  // ffmpeg.wasm 의 progress 이벤트는 복잡한 필터 그래프에서 0↔1 을 오가며 튀는 경향이 있어
+  // 우리의 time= 파싱 진행률과 충돌해 바가 갑자기 0% 로 보이는 문제 유발.
   try {
     const [coreURL, wasmURL, workerURL] = await Promise.all([
       toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
@@ -311,7 +313,9 @@ async function runPipeline() {
     // ffmpeg 로그: "frame=  120 fps= 15 q=28.0 size=...time=00:00:04.00 bitrate=..."
     const m = message.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
     if (m) {
-      lastEncodeTime = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+      const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+      // 단조 증가만 허용. 복잡한 필터 그래프에서 time= 가 잠깐 작은 값으로 튈 수 있음.
+      if (t > lastEncodeTime) lastEncodeTime = t;
     }
   };
   ff.on("log", encodeProgressHandler);
