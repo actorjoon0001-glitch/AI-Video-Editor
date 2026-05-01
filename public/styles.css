@@ -610,6 +610,29 @@ input[type=range] {
   color: var(--accent);
   border-color: var(--accent);
   background: rgba(92, 242, 192, 0.08);
+  animation: stepper-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes stepper-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(92, 242, 192, 0.45); }
+  50%      { box-shadow: 0 0 0 6px rgba(92, 242, 192, 0); }
+}
+
+.fill {
+  position: relative;
+  overflow: hidden;
+}
+.fill::after {
+  content: "";
+  position: absolute;
+  top: 0; left: -40%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent);
+  animation: bar-shimmer 1.6s linear infinite;
+}
+@keyframes bar-shimmer {
+  to { left: 100%; }
 }
 
 .stepper li.done {
