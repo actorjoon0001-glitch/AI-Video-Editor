@@ -3,67 +3,218 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AI Video Editor · 드래그하면 자동 편집</title>
-  <meta name="description" content="영상을 드래그하면 무음 구간을 자동으로 잘라내고 화면에서 바로 미리보기. 모두 브라우저에서 동작." />
+  <title>AI Video Editor · 끌어다 놓으면 편집이 끝납니다</title>
+  <meta name="description" content="영상을 드래그하면 AI가 무음을 잘라내고 비율을 맞춰 완성본을 보여줍니다. 브라우저에서 바로 작동, 업로드 없음." />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a href="#" class="brand">
+        <span class="logo-dot"></span>
+        AI Video Editor
+      </a>
+      <div class="nav-links">
+        <a href="#features">기능</a>
+        <a href="#how">사용법</a>
+        <a href="#faq">FAQ</a>
+        <a href="#app" class="btn btn-sm primary">지금 편집</a>
+      </div>
+    </div>
+  </nav>
+
   <main>
-    <header class="hero">
-      <h1>AI Video Editor</h1>
-      <p class="tagline">영상을 끌어다 놓으면 <strong>무음 구간</strong>을 자동으로 잘라내고, <strong>완성본을 화면에서 바로</strong> 확인할 수 있습니다. 영상은 서버로 가지 않고 브라우저에서 처리됩니다.</p>
-    </header>
-
-    <section id="dropzone" class="dropzone" tabindex="0" aria-label="영상 파일 드롭 영역">
-      <div class="dz-inner">
-        <div class="dz-icon">⬇</div>
-        <p class="dz-title">여기로 영상 파일을 드래그하세요</p>
-        <p class="dz-sub">또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm · 권장 길이 5분 이내</p>
-        <input id="fileInput" type="file" accept="video/*" hidden />
+    <section class="hero">
+      <span class="badge">브라우저에서 바로 · 업로드 없음</span>
+      <h1>
+        영상을 끌어다 놓으면,<br/>
+        <span class="grad">AI가 편집을 끝냅니다.</span>
+      </h1>
+      <p class="lead">
+        무음 구간을 자동으로 잘라내고, 원하는 비율(쇼츠·롱폼)로 맞춰
+        완성본을 <strong>그 자리에서 미리보기</strong>합니다. 영상은 서버로 가지 않고
+        여러분의 브라우저 안에서만 처리됩니다.
+      </p>
+      <div class="hero-cta">
+        <a href="#app" class="btn primary lg">영상 끌어다 놓기 →</a>
+        <a href="#how" class="btn lg ghost">3단계 작동 보기</a>
+      </div>
+      <div class="hero-stats">
+        <div><strong>0원</strong><span>무료 · 회원가입 불필요</span></div>
+        <div><strong>~30s</strong><span>1분 영상 평균 처리</span></div>
+        <div><strong>100%</strong><span>로컬 처리 · 업로드 없음</span></div>
       </div>
     </section>
 
-    <section class="controls" id="controls" hidden>
-      <div class="row">
-        <label>무음 임계 dB
-          <input type="range" id="silenceDb" min="-50" max="-20" step="1" value="-32" />
-          <span id="silenceDbVal">-32 dB</span>
-        </label>
-        <label>최소 무음 길이(초)
-          <input type="range" id="minSilence" min="0.2" max="2.0" step="0.1" value="0.6" />
-          <span id="minSilenceVal">0.6 s</span>
-        </label>
-        <label>경계 여유(초)
-          <input type="range" id="padding" min="0" max="0.5" step="0.05" value="0.1" />
-          <span id="paddingVal">0.10 s</span>
-        </label>
-      </div>
-      <div class="row">
-        <button type="button" id="runBtn" class="btn primary">자동 편집 시작</button>
-        <button type="button" id="resetBtn" class="btn">다른 영상</button>
+    <section id="features" class="features">
+      <h2 class="section-title">무엇이 자동으로 됩니까</h2>
+      <p class="section-sub">크리에이터가 매번 손으로 하던 반복 작업을 한 번에.</p>
+      <div class="grid">
+        <article class="card">
+          <div class="card-icon">⏭</div>
+          <h3>무음 자동 컷</h3>
+          <p>임계 dB·최소 무음 길이를 슬라이더로 조절. 말 사이 정적이 길수록 자동으로 잘라냅니다.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">📐</div>
+          <h3>비율 자동 변환</h3>
+          <p>16:9 롱폼, 9:16 쇼츠, 1:1 SNS — 한 번 클릭으로 출력 비율을 맞춥니다.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">⚡</div>
+          <h3>편집 프리셋</h3>
+          <p>빠른 컷 / 표준 / 꼼꼼히 — 영상 종류에 맞춰 한 번에 설정합니다.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">🎬</div>
+          <h3>숏폼 자동 추출</h3>
+          <p>긴 영상에서 음량이 가장 활발한 구간을 찾아 30~60초 클립으로 뽑아냅니다.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">📥</div>
+          <h3>CapCut 드래프트</h3>
+          <p>편집 결과를 CapCut 드래프트(<code>draft_content.json</code>)로 내보내 마무리합니다.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">🔒</div>
+          <h3>완전 로컬 처리</h3>
+          <p>영상은 외부 서버로 전송되지 않습니다. 모든 처리가 여러분의 브라우저에서 끝납니다.</p>
+        </article>
       </div>
     </section>
 
-    <section class="progress" id="progress" hidden>
-      <div class="bar"><div class="fill" id="bar"></div></div>
-      <p class="status" id="status">준비 중...</p>
-      <details class="logbox">
-        <summary>상세 로그</summary>
-        <pre id="log"></pre>
+    <section id="how" class="how">
+      <h2 class="section-title">3단계로 끝</h2>
+      <ol class="steps">
+        <li>
+          <div class="step-num">1</div>
+          <h3>영상을 드래그</h3>
+          <p>mp4·mov·webm 파일을 페이지에 끌어다 놓습니다.</p>
+        </li>
+        <li>
+          <div class="step-num">2</div>
+          <h3>AI가 분석·편집</h3>
+          <p>무음 감지 → 컷 → 비율 맞춤까지 자동으로 진행됩니다.</p>
+        </li>
+        <li>
+          <div class="step-num">3</div>
+          <h3>완성본 확인 후 다운로드</h3>
+          <p>결과를 바로 재생해보고, 마음에 들면 mp4 또는 CapCut 드래프트로 저장합니다.</p>
+        </li>
+      </ol>
+    </section>
+
+    <section id="app" class="app">
+      <h2 class="section-title">지금 바로 편집하기</h2>
+      <p class="section-sub">권장 길이 5분 이내 · 처음 실행 시 ffmpeg 엔진 다운로드(~30MB)가 한 번 발생합니다.</p>
+
+      <div id="dropzone" class="dropzone" tabindex="0" aria-label="영상 파일 드롭 영역">
+        <div class="dz-inner">
+          <div class="dz-icon">⬇</div>
+          <p class="dz-title">여기로 영상을 드래그하세요</p>
+          <p class="dz-sub">또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm</p>
+          <input id="fileInput" type="file" accept="video/*" hidden />
+        </div>
+      </div>
+
+      <section class="controls" id="controls" hidden>
+        <div class="preset-row">
+          <span class="preset-label">프리셋</span>
+          <button type="button" class="chip" data-preset="fast">빠른 컷</button>
+          <button type="button" class="chip active" data-preset="standard">표준</button>
+          <button type="button" class="chip" data-preset="strict">꼼꼼히</button>
+        </div>
+        <div class="preset-row">
+          <span class="preset-label">출력 비율</span>
+          <button type="button" class="chip active" data-ratio="16:9">16:9 롱폼</button>
+          <button type="button" class="chip" data-ratio="9:16">9:16 쇼츠</button>
+          <button type="button" class="chip" data-ratio="1:1">1:1 SNS</button>
+        </div>
+        <div class="preset-row">
+          <span class="preset-label">모드</span>
+          <button type="button" class="chip active" data-mode="full">전체 영상 컷</button>
+          <button type="button" class="chip" data-mode="short">숏폼 자동 추출</button>
+        </div>
+
+        <details class="advanced">
+          <summary>세부 설정</summary>
+          <div class="row">
+            <label>무음 임계 dB
+              <input type="range" id="silenceDb" min="-50" max="-20" step="1" value="-32" />
+              <span id="silenceDbVal">-32 dB</span>
+            </label>
+            <label>최소 무음 길이(초)
+              <input type="range" id="minSilence" min="0.2" max="2.0" step="0.1" value="0.6" />
+              <span id="minSilenceVal">0.6 s</span>
+            </label>
+            <label>경계 여유(초)
+              <input type="range" id="padding" min="0" max="0.5" step="0.05" value="0.1" />
+              <span id="paddingVal">0.10 s</span>
+            </label>
+            <label>숏폼 길이(초)
+              <input type="range" id="shortLen" min="15" max="90" step="5" value="45" />
+              <span id="shortLenVal">45 s</span>
+            </label>
+          </div>
+        </details>
+
+        <div class="row btn-row">
+          <button type="button" id="runBtn" class="btn primary lg">자동 편집 시작</button>
+          <button type="button" id="resetBtn" class="btn">다른 영상</button>
+        </div>
+      </section>
+
+      <section class="progress" id="progress" hidden>
+        <ol class="stepper" id="stepper">
+          <li data-step="load">엔진 로드</li>
+          <li data-step="probe">길이 측정</li>
+          <li data-step="detect">무음 감지</li>
+          <li data-step="encode">컷·인코딩</li>
+        </ol>
+        <div class="bar"><div class="fill" id="bar"></div></div>
+        <p class="status" id="status">준비 중...</p>
+        <details class="logbox">
+          <summary>상세 로그</summary>
+          <pre id="log"></pre>
+        </details>
+      </section>
+
+      <section class="result" id="result" hidden>
+        <h3 class="result-title">완성본</h3>
+        <video id="resultVideo" controls playsinline></video>
+        <div class="result-stats" id="resultStats"></div>
+        <div class="row">
+          <a id="downloadBtn" class="btn primary" download="edited.mp4">mp4 다운로드</a>
+          <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트 내보내기</button>
+        </div>
+      </section>
+    </section>
+
+    <section id="faq" class="faq">
+      <h2 class="section-title">자주 묻는 질문</h2>
+      <details class="qa">
+        <summary>영상이 외부 서버로 전송되나요?</summary>
+        <p>아니요. 모든 처리는 여러분의 브라우저 안에서만 이뤄집니다. 영상 파일은 서버로 업로드되지 않습니다.</p>
+      </details>
+      <details class="qa">
+        <summary>어떤 형식의 영상을 지원하나요?</summary>
+        <p>mp4, mov, webm 등 일반적인 컨테이너를 지원합니다. 출력은 mp4(H.264 + AAC)로 고정입니다.</p>
+      </details>
+      <details class="qa">
+        <summary>긴 영상도 가능한가요?</summary>
+        <p>브라우저 메모리 한계상 5분 내외 영상에 가장 적합합니다. 그 이상은 처리가 느리거나 실패할 수 있어요.</p>
+      </details>
+      <details class="qa">
+        <summary>"숏폼 자동 추출"은 어떻게 동작하나요?</summary>
+        <p>오디오 에너지 분석을 통해 가장 활발한 구간을 찾고, 설정한 길이(15~90초)만큼 잘라 9:16 비율로 변환합니다.</p>
+      </details>
+      <details class="qa">
+        <summary>CapCut 드래프트는 어떻게 사용하나요?</summary>
+        <p>내보낸 <code>draft_content.json</code>을 CapCut 드래프트 폴더에 두면 CapCut에서 컷이 적용된 프로젝트가 보입니다. 거기서 BGM·트랜지션을 마무리하시면 됩니다.</p>
       </details>
     </section>
 
-    <section class="result" id="result" hidden>
-      <h2>완성본</h2>
-      <video id="resultVideo" controls playsinline></video>
-      <div class="row">
-        <a id="downloadBtn" class="btn primary" download="edited.mp4">다운로드</a>
-        <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트로 내보내기</button>
-        <span class="meta" id="resultMeta"></span>
-      </div>
-    </section>
-
-    <footer>
+    <footer class="footer">
       <p>Built with Claude Code · Powered by ffmpeg.wasm · Deployed on Netlify</p>
     </footer>
   </main>
