@@ -4,7 +4,9 @@
 const { FFmpeg } = window.FFmpegWASM;
 const { fetchFile, toBlobURL } = window.FFmpegUtil;
 
-const FFMPEG_CORE_BASE = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/umd";
+// jsDelivr 는 cross-origin 리소스에 적절한 CORP 헤더를 일관되게 보냄.
+// unpkg 보다 ffmpeg.wasm 로드 호환성이 높음.
+const FFMPEG_CORE_BASE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/umd";
 
 // ── DOM ──────────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -108,19 +110,30 @@ async function ensureFFmpeg() {
   if (!window.crossOriginIsolated) {
     throw new Error(
       "이 페이지가 cross-origin isolated 상태가 아닙니다. " +
-      "Netlify 배포본에서 시도해 주세요."
+      "Netlify 배포본에서 시도해 주세요. (로컬 정적 서버는 COOP/COEP 헤더가 필요)"
     );
   }
   setStep("load");
   setStatus("ffmpeg 엔진 로드 중... (최초 1회, ~30MB)");
-  ffmpeg = new FFmpeg();
-  ffmpeg.on("log", ({ message }) => appendLog(message));
-  ffmpeg.on("progress", ({ progress: p }) => setBar(Math.min(0.99, p) * 100));
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
-    wasmURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
-    workerURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.worker.js`, "text/javascript"),
-  });
+  const instance = new FFmpeg();
+  instance.on("log", ({ message }) => appendLog(message));
+  instance.on("progress", ({ progress: p }) => setBar(Math.min(0.99, p) * 100));
+  try {
+    const [coreURL, wasmURL, workerURL] = await Promise.all([
+      toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+      toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+      toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.worker.js`, "text/javascript"),
+    ]);
+    await instance.load({ coreURL, wasmURL, workerURL });
+  } catch (e) {
+    // 로드 실패 시 다음 시도가 깨끗하게 다시 시작하도록 인스턴스 폐기
+    ffmpeg = null;
+    throw new Error(
+      "ffmpeg 엔진 로드 실패: " + (e?.message || e) +
+      "\n네트워크 또는 CDN 차단(광고 차단기/회사 방화벽) 가능성. 새로고침 후 다시 시도해 주세요."
+    );
+  }
+  ffmpeg = instance;
   doneStep("load");
   return ffmpeg;
 }
