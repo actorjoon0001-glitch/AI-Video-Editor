@@ -309,19 +309,32 @@ async function runPipeline() {
   const encodeStart = Date.now();
   let encodeTimer = null;
   let lastEncodeTime = 0;
-  const encodeProgressHandler = ({ message }) => {
-    // ffmpeg 로그: "frame=  120 fps= 15 q=28.0 size=...time=00:00:04.00 bitrate=..."
-    const m = message.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
-    if (m) {
-      const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
-      // 단조 증가만 허용. 복잡한 필터 그래프에서 time= 가 잠깐 작은 값으로 튈 수 있음.
+  // progress 이벤트의 time 필드 (마이크로초). ffmpeg.wasm 0.12 의 주된 진행 신호.
+  const encodeProgressEventHandler = ({ time }) => {
+    if (typeof time === "number") {
+      const t = time / 1_000_000;
       if (t > lastEncodeTime) lastEncodeTime = t;
     }
   };
-  ff.on("log", encodeProgressHandler);
+  // 보조: 일부 빌드에서는 stderr log 로 time= 라인이 그대로 나오기도 함.
+  const encodeProgressLogHandler = ({ message }) => {
+    const m = message.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
+    if (m) {
+      const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+      if (t > lastEncodeTime) lastEncodeTime = t;
+    }
+  };
+  ff.on("progress", encodeProgressEventHandler);
+  ff.on("log", encodeProgressLogHandler);
   // 1초마다 경과 시간 + 인코딩 진행률 업데이트
   encodeTimer = setInterval(() => {
     const elapsed = (Date.now() - encodeStart) / 1000;
+    if (lastEncodeTime <= 0) {
+      // ffmpeg 가 아직 첫 프레임을 출력하지 않은 초기 단계
+      setBar(2); // 1~2% 정도로 살아있음 표시
+      setStatus(`필터 그래프 초기화 중... · 경과 ${formatHMS(elapsed)}`);
+      return;
+    }
     const pct = expectedOut > 0 ? Math.min(99, (lastEncodeTime / expectedOut) * 100) : 0;
     setBar(pct);
     setStatus(
@@ -334,7 +347,8 @@ async function runPipeline() {
     await applyCutsAndRatio(ff, inName, outName, keeps, encodeOpts);
   } finally {
     clearInterval(encodeTimer);
-    ff.off("log", encodeProgressHandler);
+    ff.off("progress", encodeProgressEventHandler);
+    ff.off("log", encodeProgressLogHandler);
   }
   setBar(100);
   doneStep("encode");
