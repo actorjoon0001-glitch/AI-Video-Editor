@@ -243,6 +243,13 @@ async function runPipeline() {
   const outName = "output.mp4";
 
   setStep("probe");
+  setStatus("길이 확인 중...");
+  // 1단계: 브라우저 메타데이터로 즉시 길이 읽기 시도 (대부분의 코덱에서 즉시 끝남)
+  pickedDuration = await measureDurationFromFile(pickedFile);
+  if (pickedDuration > 0) {
+    appendLog(`duration (browser) = ${pickedDuration.toFixed(2)}s`);
+  }
+
   setStatus("파일 업로드 중...");
   await ff.writeFile(inName, await fetchFile(pickedFile));
   if (bgmFile) {
@@ -250,9 +257,15 @@ async function runPipeline() {
     await ff.writeFile("bgm" + extOf(bgmFile.name), await fetchFile(bgmFile));
   }
 
-  setStatus("길이 측정 중...");
-  pickedDuration = await measureDuration(ff, inName);
-  appendLog(`duration = ${pickedDuration.toFixed(2)}s`);
+  // 2단계: 메타데이터로 못 읽었으면 ffmpeg 로 폴백 (HEVC 등 일부 브라우저 미지원 코덱)
+  if (pickedDuration <= 0) {
+    setStatus("길이 측정 중 (ffmpeg)...");
+    pickedDuration = await measureDuration(ff, inName);
+    appendLog(`duration (ffmpeg) = ${pickedDuration.toFixed(2)}s`);
+  }
+  if (pickedDuration <= 0) {
+    throw new Error("영상 길이를 읽을 수 없습니다. 다른 형식의 파일로 시도해 주세요.");
+  }
   doneStep("probe");
 
   // 모드별 keep 구간 결정
@@ -346,14 +359,40 @@ function outputFileName(orig) {
   return `${tag}-${base}.mp4`;
 }
 
+// 길이는 HTML5 video 메타데이터로 즉시 읽음. ffmpeg 디코딩 불필요.
+// 브라우저가 코덱(HEVC 등)을 못 읽으면 ffmpeg fallback.
+function measureDurationFromFile(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement("video");
+    v.preload = "metadata";
+    v.muted = true;
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      URL.revokeObjectURL(url);
+      resolve(val);
+    };
+    v.onloadedmetadata = () => {
+      if (Number.isFinite(v.duration) && v.duration > 0) finish(v.duration);
+      else finish(0);
+    };
+    v.onerror = () => finish(0);
+    setTimeout(() => finish(0), 5000);
+    v.src = url;
+  });
+}
+
 async function measureDuration(ff, inName) {
+  // ffmpeg fallback: -t 0.001 로 1ms 만 처리 후 종료. probe 정보만 출력되고 디코딩 안 함.
   let dur = 0;
   const handler = ({ message }) => {
     const m = message.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
     if (m) dur = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
   };
   ff.on("log", handler);
-  await ff.exec(["-i", inName, "-f", "null", "-"]).catch(() => {});
+  await ff.exec(["-t", "0.001", "-i", inName, "-f", "null", "-"]).catch(() => {});
   ff.off("log", handler);
   return dur;
 }
@@ -374,8 +413,10 @@ async function detectSilences(ff, inName, noiseDb, minSilence) {
     }
   };
   ff.on("log", handler);
+  // -vn: 비디오 디코딩 건너뜀 → 오디오만 처리해 무음 감지가 훨씬 빠름.
   await ff.exec([
     "-i", inName,
+    "-vn",
     "-af", `silencedetect=noise=${noiseDb}dB:d=${minSilence}`,
     "-f", "null", "-",
   ]);
