@@ -24,6 +24,12 @@ const downloadBtn = $("downloadBtn");
 const exportDraftBtn = $("exportDraftBtn");
 const resultStats = $("resultStats");
 const stepper = $("stepper");
+const thumbsBlock = $("thumbsBlock");
+const thumbsGrid = $("thumbsGrid");
+const bgmInput = $("bgmInput");
+const bgmPickBtn = $("bgmPickBtn");
+const bgmClearBtn = $("bgmClearBtn");
+const bgmStatusEl = $("bgmStatus");
 
 // ── State ────────────────────────────────────────────────────────────────────
 let ffmpeg = null;
@@ -31,11 +37,14 @@ let pickedFile = null;
 let pickedDuration = 0;
 let lastKeeps = [];
 let outputUrl = null;
+let bgmFile = null;
+let thumbUrls = [];
 
 const state = {
   preset: "standard",
   ratio: "16:9",
   mode: "full",
+  speed: 1.0,
 };
 
 // ── Sliders ──────────────────────────────────────────────────────────────────
@@ -44,6 +53,7 @@ const sliders = [
   ["minSilence", "minSilenceVal", (v) => `${parseFloat(v).toFixed(1)} s`],
   ["padding", "paddingVal", (v) => `${parseFloat(v).toFixed(2)} s`],
   ["shortLen", "shortLenVal", (v) => `${v} s`],
+  ["bgmVol", "bgmVolVal", (v) => `${v} dB`],
 ];
 for (const [src, label, fmt] of sliders) {
   const s = $(src), l = $(label);
@@ -72,6 +82,12 @@ function bindChips(attr, key) {
 bindChips("preset", "preset");
 bindChips("ratio", "ratio");
 bindChips("mode", "mode");
+bindChips("speed", "speed");
+// 속도는 숫자
+const _origSpeedHandler = state.speed;
+document.querySelectorAll("[data-speed]").forEach((btn) => {
+  btn.addEventListener("click", () => { state.speed = parseFloat(btn.dataset.speed); });
+});
 
 function applyPreset(name) {
   const presets = {
@@ -150,6 +166,24 @@ dropzone.addEventListener("drop", (e) => {
   if (f) handleFile(f);
 });
 
+// BGM 파일 선택
+bgmPickBtn.addEventListener("click", () => bgmInput.click());
+bgmInput.addEventListener("change", () => {
+  const f = bgmInput.files[0];
+  if (!f) return;
+  bgmFile = f;
+  bgmStatusEl.textContent = `${f.name} (${(f.size / 1024 / 1024).toFixed(1)} MB)`;
+  bgmStatusEl.classList.add("has-file");
+  bgmClearBtn.hidden = false;
+});
+bgmClearBtn.addEventListener("click", () => {
+  bgmFile = null;
+  bgmInput.value = "";
+  bgmStatusEl.textContent = "없음";
+  bgmStatusEl.classList.remove("has-file");
+  bgmClearBtn.hidden = true;
+});
+
 // 페이지 어디서든 드래그 가능하도록 (드롭존 외부)
 window.addEventListener("dragover", (e) => e.preventDefault());
 window.addEventListener("drop", (e) => {
@@ -164,6 +198,10 @@ resetBtn.addEventListener("click", () => {
   controls.hidden = true;
   progress.hidden = true;
   resultSection.hidden = true;
+  thumbsBlock.hidden = true;
+  thumbUrls.forEach((u) => URL.revokeObjectURL(u));
+  thumbUrls = [];
+  thumbsGrid.innerHTML = "";
   if (outputUrl) { URL.revokeObjectURL(outputUrl); outputUrl = null; }
   document.querySelector(".dz-title").textContent = "여기로 영상을 드래그하세요";
   document.querySelector(".dz-sub").innerHTML =
@@ -194,6 +232,10 @@ async function runPipeline() {
   setStep("probe");
   setStatus("파일 업로드 중...");
   await ff.writeFile(inName, await fetchFile(pickedFile));
+  if (bgmFile) {
+    appendLog(`uploading BGM: ${bgmFile.name}`);
+    await ff.writeFile("bgm" + extOf(bgmFile.name), await fetchFile(bgmFile));
+  }
 
   setStatus("길이 측정 중...");
   pickedDuration = await measureDuration(ff, inName);
@@ -224,12 +266,19 @@ async function runPipeline() {
   }
   lastKeeps = keeps;
 
-  // 컷 + 비율 변환
+  // 컷 + 비율 + 속도 + BGM + 정규화
   setStep("encode");
   const cutTotal = pickedDuration - keeps.reduce((a, k) => a + (k.end - k.start), 0);
-  setStatus(`컷·인코딩 중... (제거 ${cutTotal.toFixed(1)}s · 비율 ${state.ratio})`);
+  const encodeOpts = {
+    ratio: state.ratio,
+    speed: state.speed,
+    bgmName: bgmFile ? "bgm" + extOf(bgmFile.name) : null,
+    bgmVolDb: parseFloat($("bgmVol").value),
+    loudnorm: $("loudnorm").checked,
+  };
+  setStatus(`컷·인코딩 중... (제거 ${cutTotal.toFixed(1)}s · ${state.ratio} · ${state.speed}x${bgmFile ? " · BGM" : ""})`);
   setBar(0);
-  await applyCutsAndRatio(ff, inName, outName, keeps, state.ratio);
+  await applyCutsAndRatio(ff, inName, outName, keeps, encodeOpts);
   doneStep("encode");
 
   // 결과 추출
@@ -242,16 +291,24 @@ async function runPipeline() {
   downloadBtn.href = outputUrl;
   downloadBtn.download = outputFileName(pickedFile.name);
 
-  // 통계
-  const outDuration = keeps.reduce((a, k) => a + (k.end - k.start), 0);
+  // 통계 (속도 적용 후 길이)
+  const rawOutDuration = keeps.reduce((a, k) => a + (k.end - k.start), 0);
+  const outDuration = rawOutDuration / state.speed;
   renderStats({
     inputDuration: pickedDuration,
     outputDuration: outDuration,
     cutTime: cutTotal,
     cuts: keeps.length,
     ratio: state.ratio,
+    speed: state.speed,
     sizeMB: blob.size / 1024 / 1024,
   });
+
+  // 썸네일 후보 추출
+  setStep("thumbs");
+  setStatus("썸네일 후보 추출 중...");
+  await extractThumbnails(ff, outName, outDuration, 6);
+  doneStep("thumbs");
 
   setBar(100);
   setStatus("완료!");
@@ -261,6 +318,7 @@ async function runPipeline() {
 
   try { await ff.deleteFile(inName); } catch {}
   try { await ff.deleteFile(outName); } catch {}
+  if (encodeOpts.bgmName) { try { await ff.deleteFile(encodeOpts.bgmName); } catch {} }
 }
 
 // ── ffmpeg helpers ───────────────────────────────────────────────────────────
@@ -366,8 +424,13 @@ async function pickHighlightWindow(ff, inName, duration, targetLen) {
   return [{ start, end }];
 }
 
-async function applyCutsAndRatio(ff, inName, outName, keeps, ratio) {
+async function applyCutsAndRatio(ff, inName, outName, keeps, opts) {
+  const { ratio, speed, bgmName, bgmVolDb, loudnorm } = opts;
   const ratioFilter = ratioToFilter(ratio);
+  const speedV = `setpts=${(1 / speed).toFixed(4)}*PTS`;
+  const speedA = atempoChain(speed);
+
+  // 1단계: 각 keep 구간을 trim 후 concat → [vmid][amid]
   const parts = [];
   for (let i = 0; i < keeps.length; i++) {
     const { start, end } = keeps[i];
@@ -377,18 +440,54 @@ async function applyCutsAndRatio(ff, inName, outName, keeps, ratio) {
     );
   }
   const concatInputs = keeps.map((_, i) => `[v${i}][a${i}]`).join("");
-  const filter = parts.join(";") +
-    `;${concatInputs}concat=n=${keeps.length}:v=1:a=1[outv][outa]`;
+  let filter = parts.join(";") +
+    `;${concatInputs}concat=n=${keeps.length}:v=1:a=1[vcat][acat]`;
 
-  await ff.exec([
+  // 2단계: 속도
+  filter += `;[vcat]${speedV}[vsp];[acat]${speedA}[asp]`;
+  let vOut = "[vsp]", aOut = "[asp]";
+
+  // 3단계: 음량 정규화 (메인 보이스에 적용)
+  if (loudnorm) {
+    filter += `;${aOut}loudnorm=I=-16:LRA=11:TP=-1.5[anorm]`;
+    aOut = "[anorm]";
+  }
+
+  // 4단계: BGM 믹스 + 사이드체인 더킹
+  // sidechaincompress 로 음성 세기에 맞춰 BGM을 자동 감쇠.
+  if (bgmName) {
+    // BGM 볼륨 조정 후 사이드체인: voice 신호로 BGM 컴프레서 트리거 → 듀얼 amerge
+    filter +=
+      `;[1:a]volume=${bgmVolDb}dB,aloop=loop=-1:size=2e9[bgmraw]` +
+      `;${aOut}asplit=2[voice][voice2]` +
+      `;[bgmraw][voice2]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=250[bgmducked]` +
+      `;[voice][bgmducked]amix=inputs=2:duration=first:dropout_transition=0[afinal]`;
+    aOut = "[afinal]";
+  }
+
+  const args = [
     "-i", inName,
+    ...(bgmName ? ["-i", bgmName] : []),
     "-filter_complex", filter,
-    "-map", "[outv]", "-map", "[outa]",
+    "-map", vOut, "-map", aOut,
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-    "-c:a", "aac", "-b:a", "128k",
+    "-c:a", "aac", "-b:a", "160k",
     "-movflags", "+faststart",
+    "-shortest",
     outName,
-  ]);
+  ];
+  await ff.exec(args);
+}
+
+// atempo 는 0.5~2.0 범위만 허용 → 큰 배율은 체인.
+function atempoChain(speed) {
+  if (speed === 1.0) return "anull";
+  let parts = [];
+  let s = speed;
+  while (s > 2.0) { parts.push("atempo=2.0"); s /= 2.0; }
+  while (s < 0.5) { parts.push("atempo=0.5"); s /= 0.5; }
+  parts.push(`atempo=${s.toFixed(4)}`);
+  return parts.join(",");
 }
 
 function ratioToFilter(ratio) {
@@ -406,6 +505,49 @@ function ratioToFilter(ratio) {
     return "crop='min(iw,ih)':'min(iw,ih)',scale=720:720,setsar=1";
   }
   return "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+}
+
+// ── 썸네일 후보 추출 ─────────────────────────────────────────────────────────
+async function extractThumbnails(ff, srcName, duration, count) {
+  // 기존 썸네일 정리
+  thumbUrls.forEach((u) => URL.revokeObjectURL(u));
+  thumbUrls = [];
+  thumbsGrid.innerHTML = "";
+
+  for (let i = 0; i < count; i++) {
+    // 영상 시작/끝은 페이드/타이틀 가능성 → 안쪽 80% 구간에서 균등 분포
+    const t = duration * 0.1 + (duration * 0.8 * (i + 0.5) / count);
+    const out = `thumb_${i}.jpg`;
+    try {
+      await ff.exec([
+        "-ss", t.toFixed(2),
+        "-i", srcName,
+        "-frames:v", "1",
+        "-q:v", "3",
+        "-vf", "scale=480:-2",
+        out,
+      ]);
+      const data = await ff.readFile(out);
+      const blob = new Blob([data.buffer], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+      thumbUrls.push(url);
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = `${t.toFixed(1)}s 시점 썸네일`;
+      img.title = `${t.toFixed(1)}s — 클릭하면 다운로드`;
+      img.addEventListener("click", () => {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `thumb-${i + 1}.jpg`;
+        a.click();
+      });
+      thumbsGrid.appendChild(img);
+      try { await ff.deleteFile(out); } catch {}
+    } catch (e) {
+      appendLog(`thumb ${i} failed: ${e.message || e}`);
+    }
+  }
+  if (thumbUrls.length > 0) thumbsBlock.hidden = false;
 }
 
 // ── CapCut 드래프트 내보내기 ─────────────────────────────────────────────────
@@ -489,7 +631,7 @@ function doneStep(name) {
   }
 }
 
-function renderStats({ inputDuration, outputDuration, cutTime, cuts, ratio, sizeMB }) {
+function renderStats({ inputDuration, outputDuration, cutTime, cuts, ratio, speed, sizeMB }) {
   const fmt = (s) => {
     const m = Math.floor(s / 60);
     const r = Math.round(s - m * 60);
@@ -500,6 +642,7 @@ function renderStats({ inputDuration, outputDuration, cutTime, cuts, ratio, size
     <div><strong>${fmt(cutTime)}</strong><span>제거된 시간</span></div>
     <div><strong>${cuts}</strong><span>컷 수</span></div>
     <div><strong>${ratio}</strong><span>출력 비율</span></div>
+    <div><strong>${speed}x</strong><span>재생 속도</span></div>
     <div><strong>${sizeMB.toFixed(1)} MB</strong><span>파일 크기</span></div>
   `;
 }
