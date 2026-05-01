@@ -71,6 +71,26 @@
           <p>긴 영상에서 음량이 가장 활발한 구간을 찾아 30~60초 클립으로 뽑아냅니다.</p>
         </article>
         <article class="card">
+          <div class="card-icon">⏩</div>
+          <h3>점프컷 가속</h3>
+          <p>잘라내고 남은 구간을 1.0~1.5배로 빠르게 — 같은 분량이라도 훨씬 압축된 느낌.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">🎵</div>
+          <h3>BGM + 자동 더킹</h3>
+          <p>음악을 깔면 음성 구간에서 자동으로 음량이 줄어듭니다 (사이드체인 컴프레서).</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">🖼️</div>
+          <h3>썸네일 후보 추출</h3>
+          <p>완성본에서 6장의 프레임을 자동으로 뽑아 썸네일 후보로 보여줍니다.</p>
+        </article>
+        <article class="card">
+          <div class="card-icon">🔊</div>
+          <h3>음량 자동 정규화</h3>
+          <p>방송 표준(-16 LUFS)에 맞춰 음량을 일정하게 — 다른 영상과 섞일 때도 균일.</p>
+        </article>
+        <article class="card">
           <div class="card-icon">📥</div>
           <h3>CapCut 드래프트</h3>
           <p>편집 결과를 CapCut 드래프트(<code>draft_content.json</code>)로 내보내 마무리합니다.</p>
@@ -135,6 +155,30 @@
           <button type="button" class="chip active" data-mode="full">전체 영상 컷</button>
           <button type="button" class="chip" data-mode="short">숏폼 자동 추출</button>
         </div>
+        <div class="preset-row">
+          <span class="preset-label">재생 속도</span>
+          <button type="button" class="chip active" data-speed="1.0">1.0x 자연</button>
+          <button type="button" class="chip" data-speed="1.1">1.1x</button>
+          <button type="button" class="chip" data-speed="1.25">1.25x 점프컷</button>
+          <button type="button" class="chip" data-speed="1.5">1.5x</button>
+        </div>
+
+        <div class="bgm-area">
+          <div class="bgm-head">
+            <span class="bgm-label">배경음악 <em>선택사항</em></span>
+            <span id="bgmStatus" class="bgm-status">없음</span>
+          </div>
+          <div class="row bgm-row">
+            <button type="button" id="bgmPickBtn" class="btn">BGM 파일 선택</button>
+            <button type="button" id="bgmClearBtn" class="btn ghost" hidden>제거</button>
+            <input id="bgmInput" type="file" accept="audio/*" hidden />
+            <label class="bgm-volume">BGM 볼륨
+              <input type="range" id="bgmVol" min="-30" max="-3" step="1" value="-14" />
+              <span id="bgmVolVal">-14 dB</span>
+            </label>
+          </div>
+          <p class="bgm-hint">BGM 추가 시 음성 구간에서 자동으로 음악이 작아집니다 (사이드체인 더킹).</p>
+        </div>
 
         <details class="advanced">
           <summary>세부 설정</summary>
@@ -156,6 +200,10 @@
               <span id="shortLenVal">45 s</span>
             </label>
           </div>
+          <label class="toggle">
+            <input type="checkbox" id="loudnorm" checked />
+            <span>음량 자동 정규화 (방송 표준 -16 LUFS)</span>
+          </label>
         </details>
 
         <div class="row btn-row">
@@ -170,6 +218,7 @@
           <li data-step="probe">길이 측정</li>
           <li data-step="detect">무음 감지</li>
           <li data-step="encode">컷·인코딩</li>
+          <li data-step="thumbs">썸네일 추출</li>
         </ol>
         <div class="bar"><div class="fill" id="bar"></div></div>
         <p class="status" id="status">준비 중...</p>
@@ -186,6 +235,11 @@
         <div class="row">
           <a id="downloadBtn" class="btn primary" download="edited.mp4">mp4 다운로드</a>
           <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트 내보내기</button>
+        </div>
+
+        <div class="thumbs-block" id="thumbsBlock" hidden>
+          <h4 class="thumbs-title">썸네일 후보 <span class="thumbs-hint">클릭하면 다운로드</span></h4>
+          <div class="thumbs-grid" id="thumbsGrid"></div>
         </div>
       </section>
     </section>
@@ -207,6 +261,14 @@
       <details class="qa">
         <summary>"숏폼 자동 추출"은 어떻게 동작하나요?</summary>
         <p>오디오 에너지 분석을 통해 가장 활발한 구간을 찾고, 설정한 길이(15~90초)만큼 잘라 9:16 비율로 변환합니다.</p>
+      </details>
+      <details class="qa">
+        <summary>BGM은 어떻게 자동으로 작아지나요?</summary>
+        <p>음성 신호를 키로 한 사이드체인 컴프레서를 적용합니다. 말이 나올 때 음악이 살짝 줄고, 말이 끝나면 다시 올라오는 자연스러운 더킹이 자동으로 적용됩니다.</p>
+      </details>
+      <details class="qa">
+        <summary>점프컷 가속은 무엇인가요?</summary>
+        <p>잘라낸 뒤 남은 영상 전체를 1.1~1.5배로 빠르게 재생합니다. 음성도 피치 변화 없이 자연스럽게 빨라져서 시청 시간을 줄이는 효과가 있어요.</p>
       </details>
       <details class="qa">
         <summary>CapCut 드래프트는 어떻게 사용하나요?</summary>
