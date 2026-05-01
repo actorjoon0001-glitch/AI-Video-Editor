@@ -1,0 +1,13 @@
+[build]
+  publish = "public"
+  command = ""
+
+# ffmpeg.wasm (multithreaded) 가 SharedArrayBuffer 를 쓰려면
+# COOP/COEP cross-origin isolation 헤더가 필요합니다.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "require-corp"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
