@@ -316,12 +316,24 @@ async function runPipeline() {
       if (t > lastEncodeTime) lastEncodeTime = t;
     }
   };
-  // 보조: 일부 빌드에서는 stderr log 로 time= 라인이 그대로 나오기도 함.
+  // 보조: stderr log 라인 파싱.
+  // -progress pipe:2 사용 시 "out_time_us=4500000" / "out_time=00:00:04.500" 형식도 들어옴.
+  let lastActivityHint = "";
   const encodeProgressLogHandler = ({ message }) => {
-    const m = message.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
-    if (m) {
+    let m;
+    if ((m = message.match(/^out_time_us=(\d+)/))) {
+      const t = parseInt(m[1], 10) / 1_000_000;
+      if (t > lastEncodeTime) lastEncodeTime = t;
+    } else if ((m = message.match(/out_time=(\d+):(\d+):(\d+\.?\d*)/))) {
       const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
       if (t > lastEncodeTime) lastEncodeTime = t;
+    } else if ((m = message.match(/time=(\d+):(\d+):(\d+\.?\d*)/))) {
+      const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+      if (t > lastEncodeTime) lastEncodeTime = t;
+    }
+    // 첫 프레임 전엔 활동 표시용으로 의미있는 라인 캡처
+    if (lastEncodeTime <= 0 && /^(Stream|Output|Input|frame=)/i.test(message.trim())) {
+      lastActivityHint = message.trim().slice(0, 80);
     }
   };
   ff.on("progress", encodeProgressEventHandler);
@@ -330,9 +342,10 @@ async function runPipeline() {
   encodeTimer = setInterval(() => {
     const elapsed = (Date.now() - encodeStart) / 1000;
     if (lastEncodeTime <= 0) {
-      // ffmpeg 가 아직 첫 프레임을 출력하지 않은 초기 단계
-      setBar(2); // 1~2% 정도로 살아있음 표시
-      setStatus(`필터 그래프 초기화 중... · 경과 ${formatHMS(elapsed)}`);
+      // ffmpeg 가 아직 첫 프레임을 출력하지 않은 초기 단계 (HEVC 디코딩·필터 셋업 등)
+      setBar(2);
+      const hint = lastActivityHint ? ` · ${lastActivityHint}` : "";
+      setStatus(`필터 그래프 초기화 중... · 경과 ${formatHMS(elapsed)}${hint}`);
       return;
     }
     const pct = expectedOut > 0 ? Math.min(99, (lastEncodeTime / expectedOut) * 100) : 0;
@@ -570,10 +583,13 @@ async function applyCutsAndRatio(ff, inName, outName, keeps, opts) {
     ...(bgmName ? ["-i", bgmName] : []),
     "-filter_complex", filter,
     "-map", vOut, "-map", aOut,
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
     "-c:a", "aac", "-b:a", "160k",
     "-movflags", "+faststart",
     "-shortest",
+    // 명시적 progress 출력을 stderr 로 → SDK 의 progress 이벤트가 확실히 발화
+    "-progress", "pipe:2",
+    "-stats_period", "0.5",
     outName,
   ];
   await ff.exec(args);
