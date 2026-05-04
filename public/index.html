@@ -290,6 +290,12 @@
           <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT 자막</a>
         </div>
 
+        <div class="subtitle-debug" id="subtitleDebugBlock" hidden>
+          <h4 class="thumbs-title">자막 파이프라인 <span class="thumbs-hint">단계별 진단</span></h4>
+          <div class="sub-banner" id="subtitleDebugBanner" hidden></div>
+          <ol class="sub-steps" id="subtitleSteps"></ol>
+        </div>
+
         <div class="edit-plan" id="editPlanBlock" hidden>
           <h4 class="thumbs-title">편집 계획 <span class="thumbs-hint">Whisper 분석 결과</span></h4>
           <div class="edit-plan-summary" id="editPlanSummary"></div>
