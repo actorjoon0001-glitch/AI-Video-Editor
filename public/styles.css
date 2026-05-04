@@ -685,7 +685,21 @@ input[type=range] {
 .result-title {
   font-size: 18px;
   font-weight: 600;
-  margin: 0 0 16px;
+  margin: 0;
+}
+
+.result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.preview-tabs {
+  display: flex;
+  gap: 6px;
 }
 
 .result video {
