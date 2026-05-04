@@ -86,6 +86,25 @@ let subtitleSrtUrl = null;
 let subtitleVttUrl = null;
 // 자막 생성 마지막 결과 사유 — "완료!" 가 에러를 덮어쓰지 않도록 보존.
 let lastSubtitleStatus = null; // null | { ok: true, count, ms } | { ok: false, reason }
+
+// 자막 파이프라인 단계별 상태 (진단 패널용). key 별로 status + detail 보관.
+// status: "pending" | "running" | "ok" | "warn" | "error"
+const SUB_STEP_ORDER = [
+  ["option",       "1. 자동 자막 옵션"],
+  ["api_base",     "2. API_BASE_URL"],
+  ["health",       "3. /api/health 응답"],
+  ["jobs_route",   "4. /api/transcribe/jobs 라우트 등록"],
+  ["job_register", "5. POST /api/transcribe/jobs"],
+  ["whisper",      "6. Whisper 처리 (폴링)"],
+  ["srt_text",     "7. SRT 텍스트 길이"],
+  ["vtt_text",     "8. VTT 텍스트 길이"],
+  ["blob",         "9. Blob URL 생성"],
+  ["buttons",      "10. SRT/VTT 버튼 활성화"],
+  ["track",        "11. <video> track src 연결"],
+  ["burn",         "12. 자막 번인 (옵션)"],
+];
+const subtitleSteps = new Map();
+let subtitleDebugBanner = "";
 // 백엔드 헬스체크 캐시 — 한 세션 내 중복 호출 방지.
 let backendHealthCache = null; // { ok, routes, checkedAt } | { ok: false, error }
 
@@ -873,12 +892,15 @@ async function runTranscribeJob(file, { fillerMode = "off", model, onProgress } 
     throw new Error(`자막 작업 등록 실패: HTTP ${startResp.status} ${t.slice(0, 200)}`);
   }
   const { jobId, pollIntervalMs = 2500 } = await startResp.json();
+  setSubtitleStep("job_register", "ok",
+    `HTTP ${startResp.status} · jobId=${jobId.slice(0, 8)}…`);
   appendLog(`자막 작업 등록: ${jobId}`);
 
   // 2) 폴링. 최대 5분 (영상 길이/모델에 따라 조정 가능).
   const POLL_MS = Math.max(1500, pollIntervalMs);
   const MAX_TOTAL_MS = 5 * 60 * 1000;
   const startedAt = Date.now();
+  setSubtitleStep("whisper", "running", "폴링 시작 (Whisper 처리 대기)");
   while (Date.now() - startedAt < MAX_TOTAL_MS) {
     await new Promise((res) => setTimeout(res, POLL_MS));
     let st;
@@ -901,6 +923,7 @@ async function runTranscribeJob(file, { fillerMode = "off", model, onProgress } 
       return st.result;
     }
     if (st.status === "error") {
+      setSubtitleStep("whisper", "error", st.error || "백엔드에서 처리 실패");
       throw new Error(st.error || "자막 생성 실패");
     }
     // pending / running
@@ -975,26 +998,45 @@ function renderEditPlan() {
 async function checkBackendHealth() {
   if (backendHealthCache) return backendHealthCache;
   if (!BACKEND_URL) {
-    backendHealthCache = { ok: false, error: "백엔드 URL 이 설정돼 있지 않습니다." };
+    backendHealthCache = {
+      ok: false,
+      error: "백엔드 URL 이 설정돼 있지 않습니다.",
+      url: null, httpStatus: null, body: null,
+    };
     return backendHealthCache;
   }
+  const url = `${BACKEND_URL}/api/health`;
   try {
-    const r = await fetch(`${BACKEND_URL}/api/health`, { method: "GET" });
+    const r = await fetch(url, { method: "GET" });
     if (!r.ok) {
+      const txt = await r.text().catch(() => "");
       // /api/health 가 없으면 /healthz fallback 시도 (구버전 호환).
       const r2 = await fetch(`${BACKEND_URL}/healthz`).catch(() => null);
       if (r2?.ok) {
-        backendHealthCache = { ok: true, routes: null, legacy: true };
+        backendHealthCache = {
+          ok: true, routes: null, legacy: true,
+          url, httpStatus: r.status, body: txt.slice(0, 200),
+        };
         return backendHealthCache;
       }
-      backendHealthCache = { ok: false, error: `백엔드 헬스체크 실패 (HTTP ${r.status}). 배포 상태 확인 필요.` };
+      backendHealthCache = {
+        ok: false,
+        error: `백엔드 헬스체크 실패 (HTTP ${r.status}). 배포 상태 확인 필요.`,
+        url, httpStatus: r.status, body: txt.slice(0, 200),
+      };
       return backendHealthCache;
     }
     const body = await r.json();
-    backendHealthCache = { ok: true, routes: body.routes || null, version: body.version };
+    backendHealthCache = {
+      ok: true, routes: body.routes || null, version: body.version,
+      url, httpStatus: 200, body: JSON.stringify(body).slice(0, 200),
+    };
     return backendHealthCache;
   } catch (e) {
-    backendHealthCache = { ok: false, error: `백엔드 연결 실패: ${e?.message || e}` };
+    backendHealthCache = {
+      ok: false, error: `백엔드 연결 실패: ${e?.message || e}`,
+      url, httpStatus: null, body: null,
+    };
     return backendHealthCache;
   }
 }
@@ -1006,13 +1048,20 @@ function isRouteMissingResponse(text) {
 
 async function maybeGenerateSubtitles(resultBlob) {
   resetSubtitleState();
+  resetSubtitleSteps();
   lastSubtitleStatus = null;
+
+  // 1) 옵션
   const enabled = $("autoSubtitles")?.checked === true;
+  setSubtitleStep("option", enabled ? "ok" : "warn", enabled ? "ON" : "OFF (사용자가 해제)");
   if (!enabled) {
     lastSubtitleStatus = { ok: false, reason: "자동 자막 OFF" };
-    syncSubtitleButtons(); // 비활성 상태 그대로 유지
+    syncSubtitleButtons();
     return;
   }
+
+  // 2) API_BASE_URL
+  setSubtitleStep("api_base", BACKEND_URL ? "ok" : "error", BACKEND_URL || "(없음)");
   if (!BACKEND_URL) {
     const reason = "백엔드 URL 미설정";
     appendLog("자동 자막: " + reason);
@@ -1021,29 +1070,56 @@ async function maybeGenerateSubtitles(resultBlob) {
     return;
   }
 
-  // 사전 헬스체크. /api/transcribe/jobs 라우트가 없으면 무거운 업로드를 시작하지 않는다.
+  // 3) 헬스체크
+  setSubtitleStep("health", "running", `GET ${BACKEND_URL}/api/health`);
   setStatus("자동 자막: 백엔드 헬스체크 중...");
   const health = await checkBackendHealth();
+  const healthDetail = `HTTP ${health.httpStatus ?? "—"}${health.legacy ? " (legacy /healthz fallback)" : ""}${health.body ? ` · ${health.body.slice(0, 80)}` : ""}`;
   if (!health.ok) {
+    setSubtitleStep("health", "error", healthDetail);
+    // 백엔드가 옛 컨테이너로 도는 케이스 ("Cannot GET /api/health") → 명시적 안내 배너
+    if (health.body && /Cannot GET \/api\/health/.test(health.body)) {
+      setSubtitleBanner(
+        "<strong>Render 백엔드가 최신 코드로 배포되지 않았습니다.</strong><br>" +
+        "Render 대시보드 → ai-video-editor-api 서비스 → <code>Manual Deploy → Deploy latest commit</code> 클릭 후 빌드 완료 대기."
+      );
+    } else {
+      setSubtitleBanner(`<strong>자막 서버 연결 실패.</strong><br>${escapeHtml(health.error || "알 수 없음")}`);
+    }
     const reason = `백엔드 연결 실패 — ${health.error || "알 수 없음"}`;
     appendLog(`자막 서버 연결 실패: ${health.error || "알 수 없음"}`);
     lastSubtitleStatus = { ok: false, reason };
     syncSubtitleButtons("백엔드 연결 실패 (배포 상태 확인 필요)");
     return;
   }
+  setSubtitleStep("health", "ok", healthDetail);
+
+  // 4) jobs 라우트 등록 확인
   if (Array.isArray(health.routes)) {
     const has = health.routes.some(
       (r) => r.path === "/api/transcribe/jobs" && r.method === "POST"
     );
     if (!has) {
+      setSubtitleStep("jobs_route", "error",
+        "routes 응답에 POST /api/transcribe/jobs 가 없음. 옛 컨테이너로 추정.");
+      setSubtitleBanner(
+        "<strong>Render 백엔드가 최신 코드로 배포되지 않았습니다.</strong><br>" +
+        "헬스체크는 살아있지만 <code>/api/transcribe/jobs</code> 라우트가 없습니다. " +
+        "Render 대시보드 → <code>Manual Deploy → Deploy latest commit</code> 필요."
+      );
       const reason = "/api/transcribe/jobs 라우트 없음 — Render 재배포 필요";
       appendLog("자막 서버는 살아있지만 " + reason);
       lastSubtitleStatus = { ok: false, reason };
       syncSubtitleButtons("자막 jobs 라우트 없음 (백엔드 재배포 필요)");
       return;
     }
+    setSubtitleStep("jobs_route", "ok", "POST /api/transcribe/jobs 등록됨");
+  } else {
+    setSubtitleStep("jobs_route", "warn", "legacy /healthz 응답 — routes 검증 불가");
   }
 
+  // 5–6) 작업 등록 + Whisper 폴링
+  setSubtitleStep("job_register", "running", `POST ${BACKEND_URL}/api/transcribe/jobs`);
   setStatus("자동 자막: 작업 등록 중...");
   let result;
   try {
@@ -1053,29 +1129,42 @@ async function maybeGenerateSubtitles(resultBlob) {
   } catch (e) {
     console.error("자동 자막 실패:", e);
     const reason = e?.message || String(e);
+    // job_register 또는 whisper 단계 중 하나가 실패. running 인 단계를 error 로.
+    if (subtitleSteps.get("job_register")?.status !== "ok") {
+      setSubtitleStep("job_register", "error", reason);
+    } else {
+      setSubtitleStep("whisper", "error", reason);
+    }
+    setSubtitleBanner(`<strong>자막 처리 실패.</strong><br>${escapeHtml(reason)}`);
     appendLog(`자동 자막 실패: ${reason}`);
     lastSubtitleStatus = { ok: false, reason };
     syncSubtitleButtons(`실패: ${reason}`);
     return;
   }
+  setSubtitleStep("whisper", "ok",
+    `${result?.segments?.length || 0}줄 · ${((result?.durationMs || 0) / 1000).toFixed(1)}s · 모델 ${result?.model || "?"}`);
+
   lastSubtitleStatus = {
     ok: true,
     count: result?.segments?.length || 0,
     ms: result?.durationMs || 0,
   };
 
-  // /api/transcribe 응답 검증 + 상태 저장
+  // 7–8) SRT/VTT 텍스트
   subtitleJson = result;
   subtitleSrtText = (result.srt || "").trim();
   subtitleVttText = (result.vtt || "").trim();
+  setSubtitleStep("srt_text", subtitleSrtText.length > 0 ? "ok" : "warn",
+    `${subtitleSrtText.length} bytes`);
+  setSubtitleStep("vtt_text", subtitleVttText.length > 0 ? "ok" : "warn",
+    `${subtitleVttText.length} bytes`);
   appendLog(
     `자막 ${result.segments?.length || 0}줄 · ` +
     `SRT ${subtitleSrtText.length}바이트 · VTT ${subtitleVttText.length}바이트 · ` +
     `${((result.durationMs || 0) / 1000).toFixed(1)}s`
   );
 
-  // SRT Blob URL — application/x-subrip 가 정확. 일부 브라우저는 알 수 없는 MIME 일 때
-  // download attr 를 무시하므로 명시적으로 지정.
+  // 9) Blob URL
   if (subtitleSrtText.length > 0) {
     subtitleSrtUrl = URL.createObjectURL(
       new Blob([subtitleSrtText], { type: "application/x-subrip;charset=utf-8" })
@@ -1086,12 +1175,27 @@ async function maybeGenerateSubtitles(resultBlob) {
       new Blob([subtitleVttText], { type: "text/vtt;charset=utf-8" })
     );
     attachVttTrack(subtitleVttUrl);
+  } else {
+    setSubtitleStep("track", "warn", "VTT 본문이 비어 있어 트랙을 부착하지 않음");
   }
+  const blobOk = !!(subtitleSrtUrl || subtitleVttUrl);
+  setSubtitleStep("blob", blobOk ? "ok" : "error",
+    `SRT=${subtitleSrtUrl ? "OK" : "—"} · VTT=${subtitleVttUrl ? "OK" : "—"}`);
+
+  // 10) 버튼 활성화
   syncSubtitleButtons();
+  setSubtitleStep("buttons",
+    (subtitleSrtUrl || subtitleVttUrl) ? "ok" : "warn",
+    `SRT ${subtitleSrtUrl ? "활성" : "비활성"} · VTT ${subtitleVttUrl ? "활성" : "비활성"}`);
 
   // 번인 옵션
   const burn = $("burnSubtitles")?.checked === true;
-  if (burn && subtitleSrtText.length > 0) {
+  if (!burn) {
+    setSubtitleStep("burn", "warn", "OFF (자막 번인 토글 꺼짐)");
+  } else if (subtitleSrtText.length === 0) {
+    setSubtitleStep("burn", "warn", "건너뜀 (SRT 본문 없음)");
+  } else {
+    setSubtitleStep("burn", "running", `POST ${BACKEND_URL}/api/burn-subtitles`);
     setStatus("자막 번인 중 (백엔드 ffmpeg)...");
     try {
       const fd = new FormData();
@@ -1110,9 +1214,11 @@ async function maybeGenerateSubtitles(resultBlob) {
       dl.href = outputUrl;
       dl.download = (dl.download || "edited.mp4").replace(/\.mp4$/, "-subtitled.mp4");
       appendLog("번인 완료 — 편집본을 자막 합성본으로 교체");
+      setSubtitleStep("burn", "ok", `${(burnedBlob.size / 1024 / 1024).toFixed(1)} MB 교체 완료`);
     } catch (e) {
       console.error("번인 실패:", e);
       appendLog(`번인 실패 (자막은 정상 생성됨): ${e?.message || e}`);
+      setSubtitleStep("burn", "error", e?.message || String(e));
     }
   }
 }
@@ -1179,6 +1285,11 @@ function resetSubtitleState() {
   // 비디오 element 의 기존 track 제거
   resultVideo.querySelectorAll("track").forEach((t) => t.remove());
   syncSubtitleButtons();
+  // 진단 패널도 숨김 — 새 파이프라인 진입 시점에 다시 띄워진다.
+  const block = document.getElementById("subtitleDebugBlock");
+  if (block) block.hidden = true;
+  setSubtitleBanner("");
+  subtitleSteps.clear();
 }
 
 // VTT track 부착. <video crossorigin="anonymous"> + blob: URL 조합에서 일부 브라우저가
@@ -1193,9 +1304,14 @@ function attachVttTrack(vttUrl) {
   track.srclang = "ko";
   track.src = vttUrl;
   track.default = true;
+  setSubtitleStep("track", "running", `track.src=${vttUrl.slice(0, 60)}…`);
   // load 이벤트 시 강제로 showing 으로 설정 (default 무시되는 브라우저 대응)
   track.addEventListener("load", () => {
     if (track.track) track.track.mode = "showing";
+    setSubtitleStep("track", "ok", `track 부착 완료 · mode=${track.track?.mode || "?"}`);
+  });
+  track.addEventListener("error", () => {
+    setSubtitleStep("track", "error", "track 로드 실패 (VTT 형식 또는 CORS 확인 필요)");
   });
   resultVideo.appendChild(track);
   // 비디오에 이미 src 가 적용된 상태라면 재해석 트리거 (현재 위치 보존).
@@ -1786,6 +1902,66 @@ function formatHMS(seconds) {
   return `${m}:${r}`;
 }
 function setStatus(msg) { statusEl.textContent = msg; }
+
+// ── 자막 파이프라인 진단 패널 ────────────────────────────────────────────
+function resetSubtitleSteps() {
+  subtitleSteps.clear();
+  subtitleDebugBanner = "";
+  for (const [key] of SUB_STEP_ORDER) {
+    subtitleSteps.set(key, { status: "pending", detail: "" });
+  }
+  renderSubtitleSteps();
+}
+
+function setSubtitleStep(key, status, detail) {
+  if (!subtitleSteps.has(key)) subtitleSteps.set(key, { status: "pending", detail: "" });
+  const cur = subtitleSteps.get(key);
+  subtitleSteps.set(key, {
+    status: status || cur.status,
+    detail: detail !== undefined ? String(detail) : cur.detail,
+  });
+  // 진단 패널을 즉시 노출 — 자막 처리 중 라이브로 보이게.
+  const block = document.getElementById("subtitleDebugBlock");
+  if (block) block.hidden = false;
+  renderSubtitleSteps();
+}
+
+function setSubtitleBanner(html) {
+  subtitleDebugBanner = html || "";
+  const banner = document.getElementById("subtitleDebugBanner");
+  if (!banner) return;
+  if (html) {
+    banner.innerHTML = html;
+    banner.hidden = false;
+    const block = document.getElementById("subtitleDebugBlock");
+    if (block) block.hidden = false;
+  } else {
+    banner.hidden = true;
+    banner.textContent = "";
+  }
+}
+
+const SUB_ICON = {
+  pending: "·",
+  running: "⏳",
+  ok: "✓",
+  warn: "⚠",
+  error: "✗",
+};
+function renderSubtitleSteps() {
+  const ol = document.getElementById("subtitleSteps");
+  if (!ol) return;
+  ol.innerHTML = SUB_STEP_ORDER.map(([key, label]) => {
+    const s = subtitleSteps.get(key) || { status: "pending", detail: "" };
+    const icon = SUB_ICON[s.status] || "·";
+    const detail = s.detail
+      ? `<span class="detail">${escapeHtml(s.detail)}</span>` : "";
+    return `<li class="sub-step ${s.status}">
+      <span class="icon">${icon}</span>
+      <span><span class="label">${label}</span>${detail}</span>
+    </li>`;
+  }).join("");
+}
 
 // 인코딩 완료 메시지에 자막 결과를 덧붙인다 — 자막 실패가 "완료!" 에 가려지지 않게.
 function combineCompletionStatus(base) {
