@@ -84,6 +84,8 @@ let subtitleVttText = "";
 let subtitleJson = null;     // /api/transcribe 응답 전체 (segments / words / language ...)
 let subtitleSrtUrl = null;
 let subtitleVttUrl = null;
+// 자막 생성 마지막 결과 사유 — "완료!" 가 에러를 덮어쓰지 않도록 보존.
+let lastSubtitleStatus = null; // null | { ok: true, count, ms } | { ok: false, reason }
 // 백엔드 헬스체크 캐시 — 한 세션 내 중복 호출 방지.
 let backendHealthCache = null; // { ok, routes, checkedAt } | { ok: false, error }
 
@@ -540,7 +542,7 @@ async function runServerPipeline() {
   await maybeGenerateSubtitles(blob);
 
   setBar(100);
-  setStatus(`완료! 총 ${((Date.now() - reqStart) / 1000).toFixed(1)}초`);
+  setStatus(combineCompletionStatus(`완료! 총 ${((Date.now() - reqStart) / 1000).toFixed(1)}초`));
   resultSection.hidden = false;
   resultSection.scrollIntoView({ behavior: "smooth", block: "start" });
   runBtn.disabled = false;
@@ -762,7 +764,7 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
   await maybeGenerateSubtitles(blob);
 
   setBar(100);
-  setStatus("완료!");
+  setStatus(combineCompletionStatus("완료!"));
   resultSection.hidden = false;
   resultSection.scrollIntoView({ behavior: "smooth", block: "start" });
   runBtn.disabled = false;
@@ -1004,14 +1006,18 @@ function isRouteMissingResponse(text) {
 
 async function maybeGenerateSubtitles(resultBlob) {
   resetSubtitleState();
+  lastSubtitleStatus = null;
   const enabled = $("autoSubtitles")?.checked === true;
   if (!enabled) {
+    lastSubtitleStatus = { ok: false, reason: "자동 자막 OFF" };
     syncSubtitleButtons(); // 비활성 상태 그대로 유지
     return;
   }
   if (!BACKEND_URL) {
-    appendLog("자동 자막: 백엔드 URL 이 설정돼 있지 않아 건너뜀");
-    syncSubtitleButtons("백엔드 URL 미설정");
+    const reason = "백엔드 URL 미설정";
+    appendLog("자동 자막: " + reason);
+    lastSubtitleStatus = { ok: false, reason };
+    syncSubtitleButtons(reason);
     return;
   }
 
@@ -1019,9 +1025,9 @@ async function maybeGenerateSubtitles(resultBlob) {
   setStatus("자동 자막: 백엔드 헬스체크 중...");
   const health = await checkBackendHealth();
   if (!health.ok) {
-    const msg = `자막 서버 연결 실패: ${health.error || "알 수 없음"}`;
-    appendLog(msg);
-    setStatus(msg);
+    const reason = `백엔드 연결 실패 — ${health.error || "알 수 없음"}`;
+    appendLog(`자막 서버 연결 실패: ${health.error || "알 수 없음"}`);
+    lastSubtitleStatus = { ok: false, reason };
     syncSubtitleButtons("백엔드 연결 실패 (배포 상태 확인 필요)");
     return;
   }
@@ -1030,10 +1036,9 @@ async function maybeGenerateSubtitles(resultBlob) {
       (r) => r.path === "/api/transcribe/jobs" && r.method === "POST"
     );
     if (!has) {
-      const msg = "자막 서버는 살아있지만 /api/transcribe/jobs 라우트가 없음. " +
-        "백엔드(Render) 가 옛 컨테이너로 돌고 있을 가능성 — 강제 재배포 필요.";
-      appendLog(msg);
-      setStatus(msg);
+      const reason = "/api/transcribe/jobs 라우트 없음 — Render 재배포 필요";
+      appendLog("자막 서버는 살아있지만 " + reason);
+      lastSubtitleStatus = { ok: false, reason };
       syncSubtitleButtons("자막 jobs 라우트 없음 (백엔드 재배포 필요)");
       return;
     }
@@ -1047,11 +1052,17 @@ async function maybeGenerateSubtitles(resultBlob) {
     });
   } catch (e) {
     console.error("자동 자막 실패:", e);
-    appendLog(`자동 자막 실패: ${e?.message || e}`);
-    setStatus(`자막 생성 실패 (영상은 정상 출력됨): ${e?.message || e}`);
-    syncSubtitleButtons(`실패: ${e?.message || e}`);
+    const reason = e?.message || String(e);
+    appendLog(`자동 자막 실패: ${reason}`);
+    lastSubtitleStatus = { ok: false, reason };
+    syncSubtitleButtons(`실패: ${reason}`);
     return;
   }
+  lastSubtitleStatus = {
+    ok: true,
+    count: result?.segments?.length || 0,
+    ms: result?.durationMs || 0,
+  };
 
   // /api/transcribe 응답 검증 + 상태 저장
   subtitleJson = result;
@@ -1775,6 +1786,15 @@ function formatHMS(seconds) {
   return `${m}:${r}`;
 }
 function setStatus(msg) { statusEl.textContent = msg; }
+
+// 인코딩 완료 메시지에 자막 결과를 덧붙인다 — 자막 실패가 "완료!" 에 가려지지 않게.
+function combineCompletionStatus(base) {
+  const s = lastSubtitleStatus;
+  if (!s) return base;
+  if (s.ok) return `${base} · 자막 ${s.count}줄 (${(s.ms / 1000).toFixed(1)}s)`;
+  if (s.reason === "자동 자막 OFF") return base; // 사용자가 끈 거니 침묵
+  return `${base} · ⚠ 자막 실패: ${s.reason}`;
+}
 function appendLog(msg) {
   logEl.textContent += msg + "\n";
   logEl.scrollTop = logEl.scrollHeight;
