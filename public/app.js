@@ -89,7 +89,11 @@ const state = {
   ratio: "16:9",
   mode: "full",
   speed: 1.0,
+  filler: "off", // "off" | "conservative" | "aggressive"
 };
+
+// 백엔드 분석 결과를 보관 (편집 후 결과 패널 렌더링용)
+let lastEditPlan = null;
 
 // ── Sliders ──────────────────────────────────────────────────────────────────
 const sliders = [
@@ -127,6 +131,7 @@ bindChips("preset", "preset");
 bindChips("ratio", "ratio");
 bindChips("mode", "mode");
 bindChips("speed", "speed");
+bindChips("filler", "filler");
 
 // ── 원본/편집본 미리보기 탭 ─────────────────────────────────────────────────
 // 결과 video 태그 하나의 src 만 갈아끼운다 — 두 영상을 동시에 로드하지 않아 메모리 안전.
@@ -347,6 +352,8 @@ resetBtn.addEventListener("click", () => {
   resultVideo.load();
   setPreviewMode("edited");
   resetSubtitleState();
+  lastEditPlan = null;
+  const epb = $("editPlanBlock"); if (epb) epb.hidden = true;
   document.querySelector(".dz-title").textContent = "여기로 영상을 드래그하세요";
   document.querySelector(".dz-sub").innerHTML =
     '또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm · 여러 개 가능';
@@ -517,6 +524,7 @@ async function runServerPipeline() {
     sizeMB: blob.size / 1024 / 1024,
     inputCount: pickedFiles.length,
   });
+  renderEditPlan();
 
   // 썸네일은 결과 mp4 가 작아서 ffmpeg.wasm 로 빠르게 추출 가능 — 일단 스킵하거나 결과에서 직접 추출
   setStep("thumbs");
@@ -613,8 +621,29 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
     const padding = parseFloat($("padding").value);
     setStatus(`무음 감지 (noise<${noiseDb}dB, ≥${minSilence}s)...`);
     const silences = await detectSilences(ff, inName, noiseDb, minSilence);
-    keeps = invertSilences(pickedDuration, silences, padding);
-    appendLog(`silences: ${silences.length} · keeps: ${keeps.length}`);
+
+    // 필러 모드 ON 이면 백엔드 Whisper 분석을 호출해 filler cuts 를 받아
+    // 무음 컷과 합친다. 안전 모드/오디오 없는 입력에선 의미 없으므로 건너뜀.
+    let fillerCuts = [];
+    if (state.filler !== "off" && !safeMode) {
+      try {
+        setStatus(`백엔드 Whisper 분석 (필러 모드: ${state.filler})...`);
+        // 다중 입력은 첫 파일만 보낼 수 없으므로 분석 건너뜀 (병합 후엔 ffmpeg FS 안)
+        if (pickedFiles.length === 1) {
+          lastEditPlan = await fetchEditPlan(pickedFiles[0], state.filler);
+          fillerCuts = lastEditPlan?.editPlan?.cuts || [];
+          appendLog(`editPlan: filler ${fillerCuts.length}개 · NG ${lastEditPlan?.editPlan?.ngCandidates?.length || 0}개 · slow ${lastEditPlan?.editPlan?.speedSegments?.length || 0}개`);
+        } else {
+          appendLog("필러 분석 생략: 다중 입력은 단일 파일 업로드만 지원");
+        }
+      } catch (e) {
+        appendLog(`필러 분석 실패 (무음 컷만 적용): ${e?.message || e}`);
+      }
+    }
+
+    const allCuts = mergeAllCuts(silences, fillerCuts);
+    keeps = invertSilences(pickedDuration, allCuts, padding);
+    appendLog(`silences: ${silences.length} · filler: ${fillerCuts.length} · merged cuts: ${allCuts.length} · keeps: ${keeps.length}`);
   }
   doneStep("detect");
 
@@ -716,6 +745,7 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
     sizeMB: blob.size / 1024 / 1024,
     inputCount: pickedFiles.length,
   });
+  renderEditPlan();
 
   // 썸네일 후보 추출
   setStep("thumbs");
@@ -793,6 +823,84 @@ async function detectSilencesWebAudio(file, noiseDb, minSilence) {
 // ── 자동 자막 (백엔드 Whisper) ─────────────────────────────────────────────
 // 인코딩 끝난 결과 blob 을 백엔드 /api/transcribe 로 전송 → SRT/VTT 받음.
 // "자막 번인" 옵션이면 SRT 와 함께 /api/burn-subtitles 호출 → 번인된 mp4 로 교체.
+// ── 백엔드 Whisper 분석 (editPlan) ──────────────────────────────────────────
+// 필러 모드 가 OFF 가 아닐 때 인코딩 전 호출. 같은 /api/transcribe 엔드포인트를
+// fillerMode 옵션과 함께 호출해 word-level + editPlan 을 받는다.
+async function fetchEditPlan(file, fillerMode) {
+  if (!BACKEND_URL) throw new Error("백엔드 URL 미설정");
+  const fd = new FormData();
+  fd.append("video", file);
+  fd.append("language", "ko");
+  fd.append("model", "small");
+  fd.append("fillerMode", fillerMode);
+  const r = await fetch(`${BACKEND_URL}/api/transcribe`, { method: "POST", body: fd });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`HTTP ${r.status}: ${t.slice(0, 200)}`);
+  }
+  return r.json();
+}
+
+// 무음 컷 (silences) 과 필러 컷 (fillerCuts) 을 합쳐 시간순 정렬·중복 병합.
+// padding 은 invertSilences 에서 적용되므로 여기선 단순 병합만.
+function mergeAllCuts(silences, fillerCuts) {
+  const all = [
+    ...silences.map((s) => ({ start: s.start, end: s.end })),
+    ...fillerCuts.map((c) => ({ start: c.start, end: c.end })),
+  ].sort((a, b) => a.start - b.start);
+  if (all.length === 0) return [];
+  const merged = [all[0]];
+  for (let i = 1; i < all.length; i++) {
+    const last = merged[merged.length - 1];
+    if (all[i].start <= last.end + 0.05) {
+      last.end = Math.max(last.end, all[i].end);
+    } else {
+      merged.push(all[i]);
+    }
+  }
+  return merged;
+}
+
+// 결과 패널의 editPlan 카드 렌더 — 카드 + 상세보기.
+function renderEditPlan() {
+  const block = $("editPlanBlock");
+  const sum = $("editPlanSummary");
+  const det = $("editPlanDetails");
+  if (!block || !sum || !det) return;
+  if (!lastEditPlan?.editPlan) {
+    block.hidden = true;
+    return;
+  }
+  const ep = lastEditPlan.editPlan;
+  const cutSeconds = (ep.cuts || []).reduce((a, c) => a + (c.end - c.start), 0);
+  const ngSeconds = (ep.ngCandidates || []).reduce((a, c) => a + (c.end - c.start), 0);
+
+  sum.innerHTML = `
+    <div><strong>${ep.cuts?.length || 0}개</strong><span>필러 컷 (${cutSeconds.toFixed(1)}s)</span></div>
+    <div><strong>${ep.speedSegments?.length || 0}개</strong><span>가속 후보 (느린 구간)</span></div>
+    <div><strong>${ep.ngCandidates?.length || 0}개</strong><span>NG 후보 (${ngSeconds.toFixed(1)}s)</span></div>
+  `;
+
+  const fillerList = (ep.cuts || [])
+    .slice(0, 50)
+    .map((c) => `<li>${formatHMS(c.start)} — "${c.word || "?"}" (${(c.end - c.start).toFixed(2)}s)</li>`)
+    .join("");
+  const speedList = (ep.speedSegments || [])
+    .slice(0, 30)
+    .map((s) => `<li>${formatHMS(s.start)} → ${formatHMS(s.end)} · ${s.speed}x · ${s.wps} 단어/초</li>`)
+    .join("");
+  const ngList = (ep.ngCandidates || [])
+    .slice(0, 20)
+    .map((c) => `<li>${formatHMS(c.start)} → ${formatHMS(c.end)} · 유사도 ${c.similarity} · 다음: "${(c.next_text_preview || "").slice(0, 40)}…"</li>`)
+    .join("");
+  det.innerHTML = `
+    ${fillerList ? `<p><strong>필러 컷 (적용됨)</strong><ul>${fillerList}</ul></p>` : ""}
+    ${speedList ? `<p><strong>가속 후보 (이번 PR 에선 표시만)</strong><ul>${speedList}</ul></p>` : ""}
+    ${ngList ? `<p><strong>NG 후보 (자동 삭제 X — 검토용)</strong><ul>${ngList}</ul></p>` : ""}
+  `;
+  block.hidden = false;
+}
+
 async function maybeGenerateSubtitles(resultBlob) {
   resetSubtitleState();
   const enabled = $("autoSubtitles")?.checked === true;

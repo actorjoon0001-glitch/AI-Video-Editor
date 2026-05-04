@@ -132,9 +132,10 @@ app.post("/api/transcribe", upload.single("video"), async (req, res) => {
     if (!inputPath) return res.status(400).json({ error: "video file required" });
     const language = sanitizeLang(req.body.language);
     const model = sanitizeModel(req.body.model || process.env.WHISPER_MODEL || "small");
-    console.log(`[${id}] transcribe: lang=${language} model=${model}`);
+    const fillerMode = sanitizeFillerMode(req.body.fillerMode);
+    console.log(`[${id}] transcribe: lang=${language} model=${model} fillerMode=${fillerMode}`);
     const t0 = Date.now();
-    const result = await runTranscribe(inputPath, { language, model });
+    const result = await runTranscribe(inputPath, { language, model, fillerMode });
     const elapsed = Date.now() - t0;
     console.log(`[${id}] transcribe done in ${(elapsed / 1000).toFixed(1)}s, ${result.segments?.length || 0} segments`);
     res.json({ ...result, durationMs: elapsed });
@@ -310,20 +311,26 @@ function sanitizeModel(v) {
   return ALLOWED_MODELS.has(s) ? s : "small";
 }
 
+const ALLOWED_FILLER_MODES = new Set(["off", "conservative", "aggressive"]);
+function sanitizeFillerMode(v) {
+  const s = String(v || "off").toLowerCase();
+  return ALLOWED_FILLER_MODES.has(s) ? s : "off";
+}
+
 // transcribe.py 를 별도 프로세스로 실행해 stdout JSON 파싱.
 // stdout 은 깨끗한 JSON 만 반환하도록 transcribe.py 가 보장한다.
-function runTranscribe(input, { language, model }) {
+function runTranscribe(input, { language, model, fillerMode }) {
   return new Promise((resolve, reject) => {
-    const py = spawn(
-      "python3",
-      [
-        path.join(__dirname, "transcribe.py"),
-        "--input", input,
-        "--language", language,
-        "--model", model,
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] }
-    );
+    const args = [
+      path.join(__dirname, "transcribe.py"),
+      "--input", input,
+      "--language", language,
+      "--model", model,
+    ];
+    if (fillerMode && fillerMode !== "off") {
+      args.push("--filler-mode", fillerMode);
+    }
+    const py = spawn("python3", args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     py.stdout.on("data", (d) => { stdout += d.toString(); });
