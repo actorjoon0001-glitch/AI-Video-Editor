@@ -59,6 +59,8 @@ function healthBody() {
       { method: "POST", path: "/api/process" },
       { method: "GET",  path: "/api/result/:id" },
       { method: "POST", path: "/api/transcribe" },
+      { method: "POST", path: "/api/transcribe/jobs" },
+      { method: "GET",  path: "/api/transcribe/jobs/:id" },
       { method: "POST", path: "/api/burn-subtitles" },
       { method: "GET",  path: "/api/health" },
       { method: "GET",  path: "/healthz" },
@@ -150,7 +152,7 @@ app.post("/api/transcribe", upload.single("video"), async (req, res) => {
   try {
     if (!inputPath) return res.status(400).json({ error: "video file required" });
     const language = sanitizeLang(req.body.language);
-    const model = sanitizeModel(req.body.model || process.env.WHISPER_MODEL || "small");
+    const model = sanitizeModel(req.body.model || process.env.WHISPER_MODEL || "tiny");
     const fillerMode = sanitizeFillerMode(req.body.fillerMode);
     console.log(`[${id}] transcribe: lang=${language} model=${model} fillerMode=${fillerMode}`);
     const t0 = Date.now();
@@ -219,6 +221,133 @@ app.post(
     }
   }
 );
+
+// ── /api/transcribe/jobs — 비동기 자막 작업 ─────────────────────────────────
+// Render Free 의 응답 timeout(약 30~60초) 안에 small/base 모델로 5분 영상 자막을
+// 끝낼 수 없는 케이스가 잦아 동기식 /api/transcribe 가 502 로 끊어짐.
+// 작업을 등록만 하고 즉시 jobId 를 돌려준 뒤 백그라운드에서 transcribe 를 돌리고,
+// 프론트가 GET /api/transcribe/jobs/:id 로 폴링한다.
+//
+// 메모리 저장 — Render Free 는 단일 인스턴스이므로 in-memory Map 으로 충분.
+// 30분 후 GC.
+const jobs = new Map(); // jobId → { status, result?, error?, ... }
+const JOB_TTL_MS = 30 * 60 * 1000;
+const JOB_GC_INTERVAL_MS = 5 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs.entries()) {
+    const finishedAt = job.completedAt || job.createdAt;
+    if (finishedAt && now - finishedAt > JOB_TTL_MS) jobs.delete(id);
+  }
+}, JOB_GC_INTERVAL_MS).unref();
+
+app.post("/api/transcribe/jobs", upload.single("video"), async (req, res) => {
+  const id = randomUUID();
+  const inputPath = req.file?.path;
+  if (!inputPath) {
+    return res.status(400).json({ error: "video file required" });
+  }
+  const language = sanitizeLang(req.body.language);
+  const model = sanitizeModel(req.body.model || process.env.WHISPER_MODEL || "tiny");
+  const fillerMode = sanitizeFillerMode(req.body.fillerMode);
+
+  jobs.set(id, {
+    status: "pending",
+    model, language, fillerMode,
+    createdAt: Date.now(),
+  });
+
+  // 클라이언트에는 즉시 응답. 폴링용 URL 동봉.
+  res.status(202).json({
+    jobId: id,
+    statusUrl: `/api/transcribe/jobs/${id}`,
+    pollIntervalMs: 2500,
+    estimatedSeconds: estimateTranscribeSeconds(model),
+  });
+
+  // 백그라운드 실행. 완료 후 입력 파일 정리.
+  (async () => {
+    const t0 = Date.now();
+    jobs.set(id, { ...jobs.get(id), status: "running", startedAt: t0 });
+    console.log(`[job ${id}] start: lang=${language} model=${model} fillerMode=${fillerMode}`);
+    try {
+      const result = await runTranscribe(inputPath, { language, model, fillerMode });
+      const elapsed = Date.now() - t0;
+      jobs.set(id, {
+        ...jobs.get(id),
+        status: "done",
+        result: { ...result, durationMs: elapsed },
+        completedAt: Date.now(),
+      });
+      console.log(`[job ${id}] done in ${(elapsed / 1000).toFixed(1)}s, ${result.segments?.length || 0} segments`);
+    } catch (e) {
+      console.error(`[job ${id}] failed:`, e);
+      jobs.set(id, {
+        ...jobs.get(id),
+        status: "error",
+        error: friendlyTranscribeError(e),
+        completedAt: Date.now(),
+      });
+    } finally {
+      try { await unlink(inputPath); } catch {}
+    }
+  })().catch((e) => {
+    // (외부에서 잡히지 않도록 안전장치)
+    console.error(`[job ${id}] dispatcher crash:`, e);
+  });
+});
+
+app.get("/api/transcribe/jobs/:id", (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const job = jobs.get(id);
+  if (!job) {
+    return res.status(404).json({
+      status: "not_found",
+      error: "작업을 찾을 수 없거나 만료됐습니다 (30분 보관). 다시 시도해 주세요.",
+    });
+  }
+  const base = {
+    status: job.status,
+    model: job.model,
+    language: job.language,
+  };
+  if (job.status === "done") return res.json({ ...base, result: job.result });
+  if (job.status === "error") return res.json({ ...base, error: job.error });
+  // pending / running — 진행률은 알 수 없지만 경과 시간 정도는 노출.
+  const startedAt = job.startedAt || job.createdAt;
+  return res.json({ ...base, elapsedMs: Date.now() - startedAt });
+});
+
+// 모델별 대략의 실행 시간 (영상 길이 1초당 추가 초) — 프론트가 사용자 안내에 활용.
+function estimateTranscribeSeconds(model) {
+  return ({
+    tiny: 0.4,
+    base: 0.7,
+    small: 1.4,
+    medium: 3.0,
+    large: 6.0,
+    "large-v2": 6.5,
+    "large-v3": 7.0,
+  })[model] || 0.5;
+}
+
+// transcribe.py 가 OOM/timeout 등으로 실패한 경우 사용자에게 한국어 힌트.
+function friendlyTranscribeError(e) {
+  const raw = String(e?.message || e || "").slice(-1500);
+  if (/OOM|out of memory|MemoryError|killed/i.test(raw)) {
+    return "메모리 부족: 기본 모델 tiny 로 자동 폴백되어야 하지만 그래도 실패 — 영상이 너무 길거나 백엔드 RAM 부족.";
+  }
+  if (/timeout|ETIMEDOUT/i.test(raw)) {
+    return "백엔드 timeout: 영상이 너무 길거나 cold start 가 길었습니다. 다시 시도해 주세요.";
+  }
+  if (/no module named|ImportError|faster.whisper/i.test(raw)) {
+    return "백엔드에 faster-whisper 가 설치돼 있지 않습니다. Dockerfile 빌드 확인 필요.";
+  }
+  if (/exit (code )?137/i.test(raw)) {
+    return "백엔드 프로세스가 OOM 으로 강제 종료됐습니다 (exit 137). 더 작은 모델 또는 더 짧은 영상 시도.";
+  }
+  return raw || "자막 생성 실패 (원인 불명).";
+}
 
 app.listen(PORT, () => {
   console.log(`AI Video Editor backend listening on :${PORT}`);
@@ -326,8 +455,8 @@ function sanitizeLang(v) {
   return ALLOWED_LANGS.has(s) ? s : "ko";
 }
 function sanitizeModel(v) {
-  const s = String(v || "small").toLowerCase();
-  return ALLOWED_MODELS.has(s) ? s : "small";
+  const s = String(v || "tiny").toLowerCase();
+  return ALLOWED_MODELS.has(s) ? s : "tiny";
 }
 
 const ALLOWED_FILLER_MODES = new Set(["off", "conservative", "aggressive"]);
@@ -345,6 +474,9 @@ function runTranscribe(input, { language, model, fillerMode }) {
       "--input", input,
       "--language", language,
       "--model", model,
+      // beam_size=1 + int8 = Render Free CPU 에서 가장 안전한 기본값.
+      "--beam-size", "1",
+      "--compute-type", "int8",
     ];
     if (fillerMode && fillerMode !== "off") {
       args.push("--filler-mode", fillerMode);

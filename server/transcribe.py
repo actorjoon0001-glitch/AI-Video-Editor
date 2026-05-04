@@ -199,9 +199,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="입력 영상/오디오 파일 경로")
     ap.add_argument("--language", default="ko", help="ISO-639-1 언어 코드 (기본 ko)")
-    ap.add_argument("--model", default="small", help="tiny / base / small / medium / large")
+    # tiny 가 Render Free 의 메모리/CPU 한계에서 가장 안정적. 더 큰 모델이 필요하면
+    # WHISPER_MODEL 환경변수 또는 --model 인자로 override.
+    ap.add_argument("--model", default="tiny", help="tiny / base / small / medium / large")
     ap.add_argument("--compute-type", default="int8",
                     help="ctranslate2 compute type (int8 가 CPU 에서 가장 빠름)")
+    ap.add_argument("--beam-size", type=int, default=1,
+                    help="디코딩 beam 크기. 1 이 가장 빠름 (정확도 약간 손실)")
     ap.add_argument("--filler-mode", default="off",
                     choices=["off", "conservative", "aggressive"],
                     help="off 면 자막만 생성. conservative/aggressive 면 word-level + editPlan 도 반환")
@@ -217,6 +221,7 @@ def main() -> int:
         language=args.language,
         vad_filter=True,
         word_timestamps=want_words,
+        beam_size=args.beam_size,
     )
 
     segments: list[dict] = []
