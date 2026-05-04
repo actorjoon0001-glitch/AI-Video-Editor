@@ -4,6 +4,29 @@
 const { FFmpeg } = window.FFmpegWASM;
 const { fetchFile, toBlobURL } = window.FFmpegUtil;
 
+// 일부 환경(macOS/Safari, iCloud·사진 라이브러리에서 선택한 파일, 큰 파일,
+// 네트워크 드라이브)에서 @ffmpeg/util 의 fetchFile 이 내부적으로 쓰는
+// FileReader 가 "File could not be read! Code=-1" 로 실패한다.
+// File.arrayBuffer() 를 먼저 시도하고 실패 시 fetchFile 로 폴백한다.
+async function readFileBytes(file) {
+  try {
+    if (file && typeof file.arrayBuffer === "function") {
+      return new Uint8Array(await file.arrayBuffer());
+    }
+  } catch (e) {
+    console.warn("arrayBuffer() failed, falling back to fetchFile:", e);
+  }
+  try {
+    return await fetchFile(file);
+  } catch (e) {
+    throw new Error(
+      "파일을 읽을 수 없습니다. iCloud/사진 라이브러리/네트워크 드라이브 등에 있는 " +
+      "파일이라면 로컬 폴더(Downloads, Desktop)로 옮긴 뒤 다시 시도해 주세요. " +
+      "원본 오류: " + (e?.message || e)
+    );
+  }
+}
+
 // 백엔드 서버 URL (고속 모드용). 비어 있으면 백엔드 모드 비활성.
 // localStorage("backendUrl") 로 사용자가 덮어쓸 수 있음.
 const DEFAULT_BACKEND_URL = "https://ai-video-editor-api.onrender.com";
@@ -376,11 +399,18 @@ async function runPipeline() {
     appendLog(`duration (browser) = ${pickedDuration.toFixed(2)}s`);
   }
 
-  setStatus("파일 업로드 중...");
-  await ff.writeFile(inName, await fetchFile(pickedFile));
+  setStatus("파일 읽는 중...");
+  const inputBytes = await readFileBytes(pickedFile);
+  appendLog(`read ${inputBytes.byteLength} bytes from ${pickedFile.name}`);
+  if (inputBytes.byteLength === 0) {
+    throw new Error("파일이 비어 있거나 읽기에 실패했습니다.");
+  }
+  setStatus("ffmpeg에 파일 적재 중...");
+  await ff.writeFile(inName, inputBytes);
   if (bgmFile) {
     appendLog(`uploading BGM: ${bgmFile.name}`);
-    await ff.writeFile("bgm" + extOf(bgmFile.name), await fetchFile(bgmFile));
+    const bgmBytes = await readFileBytes(bgmFile);
+    await ff.writeFile("bgm" + extOf(bgmFile.name), bgmBytes);
   }
 
   // 2단계: 메타데이터로 못 읽었으면 ffmpeg 로 폴백 (HEVC 등 일부 브라우저 미지원 코덱)
