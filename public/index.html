@@ -272,13 +272,13 @@
             <button type="button" class="chip active" data-preview="edited" role="tab" aria-selected="true">편집본</button>
           </div>
         </div>
-        <video id="resultVideo" controls playsinline crossorigin="anonymous"></video>
+        <video id="resultVideo" controls playsinline></video>
         <div class="result-stats" id="resultStats"></div>
         <div class="row">
           <a id="downloadBtn" class="btn primary" download="edited.mp4">mp4 다운로드</a>
           <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트 내보내기</button>
-          <a id="srtDownloadBtn" class="btn" download="subtitles.srt" hidden>SRT 자막</a>
-          <a id="vttDownloadBtn" class="btn" download="subtitles.vtt" hidden>VTT 자막</a>
+          <a id="srtDownloadBtn" class="btn disabled" download="subtitles.srt" aria-disabled="true" role="button">SRT 자막</a>
+          <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT 자막</a>
         </div>
 
         <div class="edit-plan" id="editPlanBlock" hidden>
