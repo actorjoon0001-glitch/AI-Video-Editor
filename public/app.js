@@ -602,7 +602,10 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
   if (state.mode === "short") {
     setStatus("음량 분석으로 하이라이트 구간 탐색 중...");
     const targetLen = parseFloat($("shortLen").value);
-    keeps = await pickHighlightWindow(ff, inName, pickedDuration, targetLen);
+    // 단일 파일이면 sourceFile 을 넘겨 Web Audio 빠른 경로 시도. 다중 입력 병합은
+    // 이미 ffmpeg 안에 있어 file 객체가 없으므로 ffmpeg fallback 만 사용.
+    const sourceFile = pickedFiles.length === 1 ? pickedFiles[0] : null;
+    keeps = await pickHighlightWindow(ff, inName, pickedDuration, targetLen, sourceFile);
     appendLog(`highlight: ${keeps[0].start.toFixed(2)} → ${keeps[0].end.toFixed(2)}`);
   } else {
     const noiseDb = parseFloat($("silenceDb").value);
@@ -1025,33 +1028,101 @@ function invertSilences(duration, silences, padding) {
   return keeps.filter((k) => k.end - k.start > 0.1);
 }
 
-// 숏폼: astats(루드니스 평균 dB) 윈도우 검색으로 가장 시끄러운 구간 N초 선택
-async function pickHighlightWindow(ff, inName, duration, targetLen) {
-  // 1초 간격으로 RMS 측정 → 슬라이딩 윈도우 합 최대 위치
-  const samples = [];
-  const handler = ({ message }) => {
-    const m = message.match(/lavfi\.astats\.Overall\.RMS_level=(-?\d+\.?\d*)/);
-    if (m) samples.push(parseFloat(m[1]));
-  };
-  ff.on("log", handler);
-  await ff.exec([
+// 숏폼: 가장 음량이 큰 N초 윈도우를 찾는다. 두 가지 전략:
+//  1) Web Audio API 로 원본 파일 디코딩 → JS 에서 RMS 슬라이딩 윈도우 (가장 빠름,
+//     비디오 디코딩 안 함, ffmpeg.wasm 손 안 댐)
+//  2) Web Audio 디코딩이 실패하면 (코덱 미지원, 대용량) ffmpeg.wasm fallback —
+//     이 경우에도 -vn 으로 비디오 디코딩 회피 + 1초당 1샘플로 다운샘플 +
+//     메타데이터를 file=stdout 이 아니라 ffmpeg FS 파일로 받아 파싱.
+async function pickHighlightWindow(ff, inName, duration, targetLen, sourceFile) {
+  // ── 전략 1: Web Audio (sourceFile 이 있을 때만) ──────────────────────────
+  if (sourceFile) {
+    try {
+      const win = await pickHighlightWindowWebAudio(sourceFile, duration, targetLen);
+      if (win) {
+        appendLog(`highlight (WebAudio): ${win.start.toFixed(2)} → ${win.end.toFixed(2)}`);
+        return [win];
+      }
+    } catch (e) {
+      appendLog(`WebAudio highlight 실패 (ffmpeg 로 fallback): ${e?.message || e}`);
+    }
+  }
+
+  // ── 전략 2: ffmpeg.wasm fallback ─────────────────────────────────────────
+  // -vn: 비디오 디코딩 회피 (HEVC 같이 무거운 코덱에서 결정적). 하이라이트엔 비디오 불필요.
+  // asetnsamples=44100:p=0: 약 1초 단위로 프레임을 모아 astats 호출 횟수를 1/N 로 감소.
+  // metadata 는 ffmpeg FS 의 stats.txt 로 떨어뜨려 한 번에 읽는다 (worker stderr 채널 포화 회피).
+  const statsFile = "highlight_stats.txt";
+  try { await ff.deleteFile(statsFile); } catch {}
+  await execWithWatchdog(ff, [
     "-i", inName,
-    "-af", "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
+    "-vn",
+    "-af",
+    `asetnsamples=44100:p=0,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=${statsFile}`,
     "-f", "null", "-",
-  ]).catch(() => {});
-  ff.off("log", handler);
+  ]);
+
+  let samples = [];
+  try {
+    const raw = await ff.readFile(statsFile);
+    const text = new TextDecoder().decode(raw);
+    samples = [...text.matchAll(/lavfi\.astats\.Overall\.RMS_level=(-?\d+\.?\d*)/g)]
+      .map((m) => parseFloat(m[1]));
+    try { await ff.deleteFile(statsFile); } catch {}
+  } catch (e) {
+    appendLog(`highlight stats 파일 읽기 실패: ${e?.message || e}`);
+  }
 
   if (samples.length === 0) {
-    // 측정 실패 시 영상 중간을 사용
+    // 측정 실패 → 영상 중앙 구간 사용
     const start = Math.max(0, (duration - targetLen) / 2);
     return [{ start, end: Math.min(duration, start + targetLen) }];
   }
+  return [pickWindowFromSamples(samples, duration, targetLen)];
+}
 
-  // RMS는 dB(음수). -inf 같은 값은 -100으로 클램프
+// Web Audio 전략: AudioContext 로 디코딩 → 50ms 단위 RMS → targetLen 슬라이딩 윈도우 최대.
+async function pickHighlightWindowWebAudio(file, duration, targetLen) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  let buf;
+  try {
+    buf = await ctx.decodeAudioData(await file.arrayBuffer());
+  } finally {
+    ctx.close().catch(() => {});
+  }
+  const sr = buf.sampleRate;
+  const winSize = Math.max(1, Math.floor(sr * 0.05)); // 50ms
+  const winDur = winSize / sr;
+  const totalWin = Math.floor(buf.length / winSize);
+  const channels = [];
+  for (let c = 0; c < buf.numberOfChannels; c++) channels.push(buf.getChannelData(c));
+
+  const samples = new Array(totalWin);
+  for (let w = 0; w < totalWin; w++) {
+    let sumSq = 0;
+    const off = w * winSize;
+    for (let c = 0; c < channels.length; c++) {
+      const data = channels[c];
+      for (let i = 0; i < winSize; i++) {
+        const s = data[off + i];
+        sumSq += s * s;
+      }
+    }
+    const rms = Math.sqrt(sumSq / (winSize * channels.length));
+    // dB 로 환산 (참조 1.0). 무음(-Infinity)은 -100 으로 클램프.
+    samples[w] = rms > 0 ? 20 * Math.log10(rms) : -100;
+  }
+  if (totalWin === 0) return null;
+  // duration 추정은 buf.duration 우선. 인자로 받은 duration 은 fallback.
+  const effectiveDur = buf.duration > 0 ? buf.duration : duration;
+  return pickWindowFromSamples(samples, effectiveDur, targetLen);
+}
+
+// 공통: dB 샘플 배열 + 총 길이 + 타깃 길이 → 가장 음량 큰 윈도우 시작/끝 (초).
+function pickWindowFromSamples(samples, duration, targetLen) {
   const norm = samples.map((v) => (Number.isFinite(v) ? v : -100));
   const secPerSample = duration / norm.length;
   const window = Math.max(1, Math.round(targetLen / secPerSample));
-
   let bestSum = -Infinity, bestIdx = 0, runSum = 0;
   for (let i = 0; i < norm.length; i++) {
     runSum += norm[i];
@@ -1063,7 +1134,7 @@ async function pickHighlightWindow(ff, inName, duration, targetLen) {
   }
   const start = Math.max(0, bestIdx * secPerSample);
   const end = Math.min(duration, start + targetLen);
-  return [{ start, end }];
+  return { start, end };
 }
 
 // 거대한 단일 filter_complex 는 ffmpeg.wasm core-mt 에서 keep 수가 늘어나면
