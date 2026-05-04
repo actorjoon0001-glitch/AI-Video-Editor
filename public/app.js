@@ -4,6 +4,29 @@
 const { FFmpeg } = window.FFmpegWASM;
 const { fetchFile, toBlobURL } = window.FFmpegUtil;
 
+// 일부 환경(특히 macOS/Safari, iCloud·사진 라이브러리에서 선택한 파일,
+// 큰 파일)에서 @ffmpeg/util 의 fetchFile 이 내부적으로 쓰는 FileReader 가
+// "File could not be read! Code=-1" 로 실패한다. File.arrayBuffer() 를 먼저
+// 시도하고 실패 시 fetchFile 로 폴백한다.
+async function readFileBytes(file) {
+  try {
+    if (file && typeof file.arrayBuffer === "function") {
+      return new Uint8Array(await file.arrayBuffer());
+    }
+  } catch (e) {
+    console.warn("arrayBuffer() failed, falling back to fetchFile:", e);
+  }
+  try {
+    return await fetchFile(file);
+  } catch (e) {
+    throw new Error(
+      "파일을 읽을 수 없습니다. iCloud/사진 라이브러리/네트워크 드라이브 등에 있는 " +
+      "파일이라면 로컬 폴더(Downloads, Desktop)로 옮긴 뒤 다시 시도해 주세요. " +
+      "원본 오류: " + (e?.message || e)
+    );
+  }
+}
+
 // jsDelivr 는 cross-origin 리소스에 적절한 CORP 헤더를 일관되게 보냄.
 // unpkg 보다 ffmpeg.wasm 로드 호환성이 높음.
 const FFMPEG_CORE_BASE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/umd";
@@ -243,11 +266,18 @@ async function runPipeline() {
   const outName = "output.mp4";
 
   setStep("probe");
-  setStatus("파일 업로드 중...");
-  await ff.writeFile(inName, await fetchFile(pickedFile));
+  setStatus("파일 읽는 중...");
+  const inputBytes = await readFileBytes(pickedFile);
+  appendLog(`read ${inputBytes.byteLength} bytes from ${pickedFile.name}`);
+  if (inputBytes.byteLength === 0) {
+    throw new Error("파일이 비어 있거나 읽기에 실패했습니다.");
+  }
+  setStatus("ffmpeg에 파일 적재 중...");
+  await ff.writeFile(inName, inputBytes);
   if (bgmFile) {
     appendLog(`uploading BGM: ${bgmFile.name}`);
-    await ff.writeFile("bgm" + extOf(bgmFile.name), await fetchFile(bgmFile));
+    const bgmBytes = await readFileBytes(bgmFile);
+    await ff.writeFile("bgm" + extOf(bgmFile.name), bgmBytes);
   }
 
   setStatus("길이 측정 중...");
