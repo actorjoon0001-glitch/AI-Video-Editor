@@ -72,6 +72,8 @@ let pickedFile = null;
 let pickedDuration = 0;
 let lastKeeps = [];
 let outputUrl = null;
+let originalUrl = null;
+let previewMode = "edited"; // "edited" | "original"
 let bgmFile = null;
 let thumbUrls = [];
 
@@ -118,6 +120,25 @@ bindChips("preset", "preset");
 bindChips("ratio", "ratio");
 bindChips("mode", "mode");
 bindChips("speed", "speed");
+
+// ── 원본/편집본 미리보기 탭 ─────────────────────────────────────────────────
+// 결과 video 태그 하나의 src 만 갈아끼운다 — 두 영상을 동시에 로드하지 않아 메모리 안전.
+function setPreviewMode(mode) {
+  const url = mode === "original" ? originalUrl : outputUrl;
+  if (!url) return;
+  previewMode = mode;
+  // 새 src 적용 시 자동으로 처음부터 재생 위치가 0 이 됨 (의도).
+  resultVideo.src = url;
+  resultVideo.load();
+  document.querySelectorAll(".preview-tabs [data-preview]").forEach((btn) => {
+    const active = btn.dataset.preview === mode;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+}
+document.querySelectorAll(".preview-tabs [data-preview]").forEach((btn) => {
+  btn.addEventListener("click", () => setPreviewMode(btn.dataset.preview));
+});
 // 속도는 숫자
 const _origSpeedHandler = state.speed;
 document.querySelectorAll("[data-speed]").forEach((btn) => {
@@ -194,6 +215,10 @@ function handleFile(file) {
     return;
   }
   pickedFile = file;
+  // 새 파일이 들어오면 이전 미리보기 URL 들 정리 (메모리 누수 방지).
+  if (originalUrl) { URL.revokeObjectURL(originalUrl); originalUrl = null; }
+  if (outputUrl) { URL.revokeObjectURL(outputUrl); outputUrl = null; }
+  originalUrl = URL.createObjectURL(file);
   controls.hidden = false;
   resultSection.hidden = true;
   progress.hidden = true;
@@ -278,6 +303,10 @@ resetBtn.addEventListener("click", () => {
   thumbUrls = [];
   thumbsGrid.innerHTML = "";
   if (outputUrl) { URL.revokeObjectURL(outputUrl); outputUrl = null; }
+  if (originalUrl) { URL.revokeObjectURL(originalUrl); originalUrl = null; }
+  resultVideo.removeAttribute("src");
+  resultVideo.load();
+  setPreviewMode("edited");
   document.querySelector(".dz-title").textContent = "여기로 영상을 드래그하세요";
   document.querySelector(".dz-sub").innerHTML =
     '또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm';
@@ -424,7 +453,7 @@ async function runServerPipeline() {
   // 결과 표시
   if (outputUrl) URL.revokeObjectURL(outputUrl);
   outputUrl = URL.createObjectURL(blob);
-  resultVideo.src = outputUrl;
+  setPreviewMode("edited"); // 기본은 편집본 탭. 사용자가 원본 탭을 누르면 전환.
   downloadBtn.href = outputUrl;
   downloadBtn.download = outputFileName(pickedFile.name);
 
@@ -591,7 +620,7 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
   const blob = new Blob([data.buffer], { type: "video/mp4" });
   if (outputUrl) URL.revokeObjectURL(outputUrl);
   outputUrl = URL.createObjectURL(blob);
-  resultVideo.src = outputUrl;
+  setPreviewMode("edited"); // 기본은 편집본 탭. 사용자가 원본 탭을 누르면 전환.
   downloadBtn.href = outputUrl;
   downloadBtn.download = outputFileName(pickedFile.name);
 
@@ -1160,6 +1189,8 @@ function renderStats({ inputDuration, outputDuration, cutTime, cuts, ratio, spee
 
 function onError(err) {
   console.error(err);
+  // 편집 실패 시 미리보기는 노출하지 않는다. 진행 패널의 status 영역에 에러만 표시.
+  resultSection.hidden = true;
   setStatus("오류: " + (err?.message || err));
   runBtn.disabled = false;
 }

@@ -243,7 +243,13 @@
       </section>
 
       <section class="result" id="result" hidden>
-        <h3 class="result-title">완성본</h3>
+        <div class="result-head">
+          <h3 class="result-title">완성본</h3>
+          <div class="preview-tabs" role="tablist" aria-label="미리보기 전환">
+            <button type="button" class="chip" data-preview="original" role="tab" aria-selected="false">원본</button>
+            <button type="button" class="chip active" data-preview="edited" role="tab" aria-selected="true">편집본</button>
+          </div>
+        </div>
         <video id="resultVideo" controls playsinline></video>
         <div class="result-stats" id="resultStats"></div>
         <div class="row">
