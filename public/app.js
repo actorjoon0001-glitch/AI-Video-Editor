@@ -68,8 +68,10 @@ const bgmStatusEl = $("bgmStatus");
 // ── State ────────────────────────────────────────────────────────────────────
 let ffmpeg = null;
 let ffmpegEngine = null; // "mt" | "st"
+// pickedFiles 가 source of truth. pickedFile 은 pickedFiles[0] 의 별칭(편의용).
+let pickedFiles = [];
 let pickedFile = null;
-let pickedDuration = 0;
+let pickedDuration = 0; // 다중 입력 시 합산 길이
 let lastKeeps = [];
 let outputUrl = null;
 let originalUrl = null;
@@ -209,24 +211,48 @@ async function ensureFFmpeg(engine = "mt") {
 }
 
 // ── Dropzone & file picker ───────────────────────────────────────────────────
-function handleFile(file) {
-  if (!file || !file.type.startsWith("video/")) {
+// 단일 파일 호환을 위해 handleFile 도 alias 로 유지.
+function handleFile(file) { return handleFiles(file ? [file] : []); }
+
+function handleFiles(files) {
+  // 영상 파일만 통과시킴. 순서는 사용자가 선택한 순서대로 유지.
+  const accepted = (files || []).filter((f) => f && f.type && f.type.startsWith("video/"));
+  if (accepted.length === 0) {
     setStatus("영상 파일이 아닙니다.");
     return;
   }
-  pickedFile = file;
-  // 새 파일이 들어오면 이전 미리보기 URL 들 정리 (메모리 누수 방지).
+  // 이전 선택의 미리보기 URL 정리 (메모리 누수 방지).
   if (originalUrl) { URL.revokeObjectURL(originalUrl); originalUrl = null; }
   if (outputUrl) { URL.revokeObjectURL(outputUrl); outputUrl = null; }
-  originalUrl = URL.createObjectURL(file);
+
+  pickedFiles = accepted;
+  pickedFile = accepted[0]; // 단일 호환 별칭 — 파이프라인은 pickedFiles 를 본다.
+  // 미리보기는 일단 첫 번째 영상을 보여줌. 다중 입력이면 편집 후 편집본은 합쳐진 결과.
+  originalUrl = URL.createObjectURL(accepted[0]);
+
   controls.hidden = false;
   resultSection.hidden = true;
   progress.hidden = true;
-  document.querySelector(".dz-title").textContent = `✓ ${file.name}`;
-  document.querySelector(".dz-sub").textContent =
-    `${(file.size / 1024 / 1024).toFixed(1)} MB · 다른 파일을 드래그하면 교체됩니다`;
+
+  const totalMb = accepted.reduce((a, f) => a + f.size, 0) / 1024 / 1024;
+  if (accepted.length === 1) {
+    document.querySelector(".dz-title").textContent = `✓ ${accepted[0].name}`;
+    document.querySelector(".dz-sub").textContent =
+      `${totalMb.toFixed(1)} MB · 다른 파일을 드래그하면 교체됩니다`;
+  } else {
+    document.querySelector(".dz-title").textContent = `✓ ${accepted.length}개 영상 선택됨`;
+    document.querySelector(".dz-sub").innerHTML =
+      `총 ${totalMb.toFixed(1)} MB · 업로드 순서대로 자동 병합됩니다<br>` +
+      accepted.map((f, i) => `<span class="file-row">${i + 1}. ${escapeHtml(f.name)} (${(f.size / 1024 / 1024).toFixed(1)} MB)</span>`).join("");
+  }
   // 부드럽게 컨트롤로 스크롤
   controls.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
 }
 
 dropzone.addEventListener("click", () => fileInput.click());
@@ -234,7 +260,7 @@ dropzone.addEventListener("keydown", (e) => {
   if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
 });
 pickBtn.addEventListener("click", (e) => { e.stopPropagation(); fileInput.click(); });
-fileInput.addEventListener("change", () => handleFile(fileInput.files[0]));
+fileInput.addEventListener("change", () => handleFiles(Array.from(fileInput.files || [])));
 
 ["dragenter", "dragover"].forEach((evt) =>
   dropzone.addEventListener(evt, (e) => {
@@ -249,8 +275,8 @@ fileInput.addEventListener("change", () => handleFile(fileInput.files[0]));
   })
 );
 dropzone.addEventListener("drop", (e) => {
-  const f = e.dataTransfer?.files?.[0];
-  if (f) handleFile(f);
+  const list = Array.from(e.dataTransfer?.files || []);
+  if (list.length) handleFiles(list);
 });
 
 // BGM 파일 선택
@@ -275,8 +301,8 @@ bgmClearBtn.addEventListener("click", () => {
 window.addEventListener("dragover", (e) => e.preventDefault());
 window.addEventListener("drop", (e) => {
   e.preventDefault();
-  const f = e.dataTransfer?.files?.[0];
-  if (f && f.type.startsWith("video/")) handleFile(f);
+  const list = Array.from(e.dataTransfer?.files || []).filter((f) => f.type?.startsWith("video/"));
+  if (list.length) handleFiles(list);
 });
 
 // 백엔드 URL 미설정 시 토글 비활성
@@ -294,6 +320,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
 resetBtn.addEventListener("click", () => {
   pickedFile = null;
+  pickedFiles = [];
   fileInput.value = "";
   controls.hidden = true;
   progress.hidden = true;
@@ -309,7 +336,7 @@ resetBtn.addEventListener("click", () => {
   setPreviewMode("edited");
   document.querySelector(".dz-title").textContent = "여기로 영상을 드래그하세요";
   document.querySelector(".dz-sub").innerHTML =
-    '또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm';
+    '또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm · 여러 개 가능';
   // 새 pickBtn 이벤트 재바인딩
   document.getElementById("pickBtn").addEventListener("click", (e) => {
     e.stopPropagation(); fileInput.click();
@@ -381,7 +408,15 @@ async function runWithFallback({ userSafe = false } = {}) {
 
 // ── 백엔드 파이프라인 ────────────────────────────────────────────────────────
 async function runServerPipeline() {
-  if (!pickedFile) return;
+  if (pickedFiles.length === 0) return;
+  if (pickedFiles.length > 1) {
+    // 백엔드는 단일 영상만 받음. 다중 영상은 브라우저에서 먼저 병합해야 하지만
+    // 그 단계가 무거워 고속 모드의 의미가 사라지므로, 명확히 안내 후 차단.
+    throw new Error(
+      "다중 영상 자동 병합은 브라우저 모드만 지원합니다. " +
+      "고속 모드를 끄거나, 영상을 먼저 외부에서 합쳐서 한 파일로 올려주세요."
+    );
+  }
   runBtn.disabled = true;
   resultSection.hidden = true;
   progress.hidden = false;
@@ -467,6 +502,7 @@ async function runServerPipeline() {
     ratio: state.ratio,
     speed: state.speed,
     sizeMB: blob.size / 1024 / 1024,
+    inputCount: pickedFiles.length,
   });
 
   // 썸네일은 결과 mp4 가 작아서 ffmpeg.wasm 로 빠르게 추출 가능 — 일단 스킵하거나 결과에서 직접 추출
@@ -486,7 +522,7 @@ async function runServerPipeline() {
 // engine: "mt" (default, 멀티스레드 core-mt) 또는 "st" (싱글스레드 core, fallback)
 // safeMode: true 면 오디오 트랙 자체를 버려서(-an) 오디오 필터 deadlock 회피
 async function runPipeline({ engine = "mt", safeMode = false } = {}) {
-  if (!pickedFile) return;
+  if (pickedFiles.length === 0) return;
   runBtn.disabled = true;
   resultSection.hidden = true;
   progress.hidden = false;
@@ -498,25 +534,35 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
   setBar(0);
 
   const ff = await ensureFFmpeg(engine);
-  const inName = "input" + extOf(pickedFile.name);
   const outName = "output.mp4";
 
   setStep("probe");
   setStatus("길이 확인 중...");
   // 1단계: 브라우저 메타데이터로 즉시 길이 읽기 시도 (대부분의 코덱에서 즉시 끝남)
-  pickedDuration = await measureDurationFromFile(pickedFile);
+  // 다중 파일이면 합산.
+  let browserDur = 0;
+  for (const f of pickedFiles) browserDur += await measureDurationFromFile(f);
+  pickedDuration = browserDur;
   if (pickedDuration > 0) {
-    appendLog(`duration (browser) = ${pickedDuration.toFixed(2)}s`);
+    appendLog(`duration (browser, ${pickedFiles.length}개 합산) = ${pickedDuration.toFixed(2)}s`);
   }
 
-  setStatus("파일 읽는 중...");
-  const inputBytes = await readFileBytes(pickedFile);
-  appendLog(`read ${inputBytes.byteLength} bytes from ${pickedFile.name}`);
-  if (inputBytes.byteLength === 0) {
-    throw new Error("파일이 비어 있거나 읽기에 실패했습니다.");
+  // 단일 파일이면 곧바로 input 으로 적재. 여러 개면 Stage 0 (병합) 거쳐 merged.mp4 생성.
+  let inName;
+  if (pickedFiles.length === 1) {
+    inName = "input" + extOf(pickedFiles[0].name);
+    setStatus("파일 읽는 중...");
+    const inputBytes = await readFileBytes(pickedFiles[0]);
+    appendLog(`read ${inputBytes.byteLength} bytes from ${pickedFiles[0].name}`);
+    if (inputBytes.byteLength === 0) {
+      throw new Error("파일이 비어 있거나 읽기에 실패했습니다.");
+    }
+    setStatus("ffmpeg에 파일 적재 중...");
+    await ff.writeFile(inName, inputBytes);
+  } else {
+    // 여러 영상 → 단일 입력으로 자동 병합 (재인코딩으로 코덱·해상도 통일 후 concat).
+    inName = await mergeInputsToSingle(ff, pickedFiles, { noAudio: safeMode });
   }
-  setStatus("ffmpeg에 파일 적재 중...");
-  await ff.writeFile(inName, inputBytes);
   if (bgmFile) {
     appendLog(`uploading BGM: ${bgmFile.name}`);
     const bgmBytes = await readFileBytes(bgmFile);
@@ -627,6 +673,20 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
   // 통계 (속도 적용 후 길이)
   const rawOutDuration = keeps.reduce((a, k) => a + (k.end - k.start), 0);
   const outDuration = rawOutDuration / state.speed;
+
+  // 출력 길이 sanity check: 자동 컷 결과는 항상 원본 ≤ 원본이어야 함.
+  // 실제 인코딩 결과의 duration 을 측정해 keep 합산값과 0.5초 이상 차이나면 경고.
+  // 길이가 늘어나는 케이스는 거의 항상 키프레임 스냅 / 타임스탬프 버그.
+  try {
+    const measured = await measureDurationFromBlob(blob);
+    appendLog(`output duration check: measured=${measured.toFixed(2)}s · expected=${outDuration.toFixed(2)}s · input=${pickedDuration.toFixed(2)}s`);
+    if (state.speed === 1.0 && measured > pickedDuration + 0.5) {
+      appendLog(`⚠ 출력(${measured.toFixed(2)}s)이 원본(${pickedDuration.toFixed(2)}s)보다 깁니다 — 컷 정확도 버그 가능성. 디버그 로그를 확인해 주세요.`);
+      setStatus(`경고: 출력 길이가 원본보다 깁니다 (${measured.toFixed(1)}s > ${pickedDuration.toFixed(1)}s). 결과는 사용 가능하지만 정확도 점검 필요.`);
+    }
+  } catch (e) {
+    appendLog(`output duration check skipped: ${e?.message || e}`);
+  }
   renderStats({
     inputDuration: pickedDuration,
     outputDuration: outDuration,
@@ -635,6 +695,7 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
     ratio: state.ratio,
     speed: state.speed,
     sizeMB: blob.size / 1024 / 1024,
+    inputCount: pickedFiles.length,
   });
 
   // 썸네일 후보 추출
@@ -755,8 +816,13 @@ function outputFileName(orig) {
 // 길이는 HTML5 video 메타데이터로 즉시 읽음. ffmpeg 디코딩 불필요.
 // 브라우저가 코덱(HEVC 등)을 못 읽으면 ffmpeg fallback.
 function measureDurationFromFile(file) {
+  return measureDurationFromBlob(file);
+}
+
+// File / Blob 둘 다 동일 로직으로 처리한다 (File ⊂ Blob).
+function measureDurationFromBlob(blob) {
   return new Promise((resolve) => {
-    const url = URL.createObjectURL(file);
+    const url = URL.createObjectURL(blob);
     const v = document.createElement("video");
     v.preload = "metadata";
     v.muted = true;
@@ -878,26 +944,79 @@ async function pickHighlightWindow(ff, inName, duration, targetLen) {
 //  B. concat demuxer + -c copy 로 조각들을 하나로 합침 (재인코딩 X)
 //  C. 합쳐진 단일 파일에 ratio/speed/loudnorm/BGM 을 한 번만 적용
 // 각 단계의 ffmpeg 호출은 필터 그래프가 단순해 worker init 병목이 사라진다.
+// Stage 0: 다중 영상 → 통일된 단일 입력. 코덱/해상도가 달라도 concat 가능하도록
+// 각 파일을 ultrafast H.264+AAC 로 정규화 후 concat demuxer 로 결합한다.
+async function mergeInputsToSingle(ff, files, { noAudio = false } = {}) {
+  setStatus(`${files.length}개 영상 병합 중 (1/${files.length} 적재)`);
+  const segs = [];
+  for (let i = 0; i < files.length; i++) {
+    const raw = `raw_${String(i).padStart(4, "0")}${extOf(files[i].name)}`;
+    setStatus(`병합: ${i + 1}/${files.length} 적재 중`);
+    const bytes = await readFileBytes(files[i]);
+    if (bytes.byteLength === 0) throw new Error(`${files[i].name} 파일을 읽을 수 없습니다.`);
+    await ff.writeFile(raw, bytes);
+
+    const norm = `norm_${String(i).padStart(4, "0")}.mp4`;
+    setStatus(`병합: ${i + 1}/${files.length} 정규화 중`);
+    const args = [
+      "-i", raw,
+      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+    ];
+    if (noAudio) {
+      args.push("-an");
+    } else {
+      args.push("-c:a", "aac", "-b:a", "160k", "-ar", "44100");
+    }
+    args.push("-y", norm);
+    await execWithWatchdog(ff, args);
+    try { await ff.deleteFile(raw); } catch {}
+    segs.push(norm);
+  }
+
+  setStatus("병합: concat 결합 중");
+  const list = segs.map((f) => `file '${f}'`).join("\n");
+  await ff.writeFile("merge_list.txt", new TextEncoder().encode(list));
+  const concatArgs = [
+    "-f", "concat", "-safe", "0",
+    "-i", "merge_list.txt",
+    "-c", "copy",
+  ];
+  if (noAudio) concatArgs.push("-an");
+  concatArgs.push("-y", "merged_input.mp4");
+  await execWithWatchdog(ff, concatArgs);
+
+  for (const s of segs) { try { await ff.deleteFile(s); } catch {} }
+  try { await ff.deleteFile("merge_list.txt"); } catch {}
+  appendLog(`merged ${files.length} files → merged_input.mp4`);
+  return "merged_input.mp4";
+}
+
 async function applyCutsAndRatio(ff, inName, outName, keeps, opts, onStage) {
   const { ratio, speed, bgmName, bgmVolDb, loudnorm, noAudio } = opts;
   const ratioFilter = ratioToFilter(ratio);
 
   const segFiles = [];
-  // 단계 A: 컷 분리 (-c copy). 필터·재인코딩 없음 — 가장 안전한 형태.
-  // 안전 모드에선 -an 추가로 오디오 트랙도 버린다.
+  // 단계 A: 컷 분리. -c copy 는 keyframe 스냅 때문에 요청한 -ss 시점보다 앞 키프레임부터
+  // 데이터를 포함시켜 출력이 의도보다 길어지는 버그가 있었다. 작은 ultrafast 재인코딩은
+  // 단일 키프레임에서 시작하는 정확한 컷을 만들고, 필터 그래프도 단순해서 worker hang 우려가 없다.
+  // 안전 모드에선 -an 으로 오디오를 통째로 버린다.
   for (let i = 0; i < keeps.length; i++) {
     onStage?.({ phase: "segment", current: i + 1, total: keeps.length });
     const seg = `seg_${String(i).padStart(4, "0")}.mp4`;
     const { start, end } = keeps[i];
     const segArgs = [
+      // -ss/-to 를 -i 앞에 둬서 빠른 키프레임 시크 후, 재인코딩 시 정확한 시점부터 출력.
       "-ss", start.toFixed(3),
       "-to", end.toFixed(3),
       "-i", inName,
-      "-c", "copy",
-      "-avoid_negative_ts", "make_zero",
+      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
     ];
-    if (noAudio) segArgs.push("-an");
-    segArgs.push("-y", seg);
+    if (noAudio) {
+      segArgs.push("-an");
+    } else {
+      segArgs.push("-c:a", "aac", "-b:a", "160k");
+    }
+    segArgs.push("-avoid_negative_ts", "make_zero", "-y", seg);
     await execWithWatchdog(ff, segArgs);
     segFiles.push(seg);
   }
@@ -1171,14 +1290,19 @@ function doneStep(name) {
   }
 }
 
-function renderStats({ inputDuration, outputDuration, cutTime, cuts, ratio, speed, sizeMB }) {
+function renderStats({ inputDuration, outputDuration, cutTime, cuts, ratio, speed, sizeMB, inputCount }) {
   const fmt = (s) => {
     const m = Math.floor(s / 60);
     const r = Math.round(s - m * 60);
     return m > 0 ? `${m}분 ${r}초` : `${r}초`;
   };
+  // 다중 입력 표시는 입력 영상이 2개 이상일 때만.
+  const inputCountCard = inputCount && inputCount > 1
+    ? `<div><strong>${inputCount}개</strong><span>원본 영상 수</span></div>` : "";
   resultStats.innerHTML = `
-    <div><strong>${fmt(outputDuration)}</strong><span>출력 길이</span></div>
+    ${inputCountCard}
+    <div><strong>${fmt(inputDuration)}</strong><span>원본 길이</span></div>
+    <div><strong>${fmt(outputDuration)}</strong><span>편집본 길이</span></div>
     <div><strong>${fmt(cutTime)}</strong><span>제거된 시간</span></div>
     <div><strong>${cuts}</strong><span>컷 수</span></div>
     <div><strong>${ratio}</strong><span>출력 비율</span></div>
