@@ -1,0 +1,148 @@
+{
+  "name": "YouTube 자동 발행 파이프라인",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "video-ready",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "trigger-webhook",
+      "name": "Webhook: 영상 준비됨",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "video-ready"
+    },
+    {
+      "parameters": {
+        "command": "=python -m auto_editor metadata --input \"{{$json.video_path}}\" --out \"{{$json.workdir}}/metadata.json\" --persona \"{{$json.persona || ''}}\" --whisper-model small --language ko"
+      },
+      "id": "run-metadata",
+      "name": "메타데이터 생성 (Claude)",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "command": "=python -m auto_editor thumbnail --input \"{{$json.video_path}}\" --metadata \"{{$json.workdir}}/metadata.json\" --out \"{{$json.workdir}}/thumbnail.png\""
+      },
+      "id": "run-thumbnail",
+      "name": "썸네일 생성",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "fileSelector": "={{$('Webhook: 영상 준비됨').item.json.workdir}}/metadata.json",
+        "options": {}
+      },
+      "id": "read-metadata",
+      "name": "metadata.json 읽기",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta = JSON.parse(items[0].binary.data.data ? Buffer.from(items[0].binary.data.data, 'base64').toString('utf8') : items[0].json.toString());\nconst webhookData = $('Webhook: 영상 준비됨').item.json;\nreturn [{ json: { ...webhookData, metadata: meta } }];"
+      },
+      "id": "parse-metadata",
+      "name": "메타데이터 파싱",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "channel": "={{$json.slack_channel || '#youtube-publish'}}",
+        "text": "=📹 *영상 준비 완료*: {{$json.video_path.split('/').pop()}}\n\n*제목 후보:*\n{{$json.metadata.titles.map((t,i)=>`${i+1}. ${t}`).join('\\n')}}\n\n*설명 (앞부분):*\n{{$json.metadata.description.substring(0,200)}}...\n\n*태그:* {{$json.metadata.tags.join(', ')}}\n\n승인하려면 ✅, 다시 만들려면 🔄, 취소는 ❌",
+        "otherOptions": {}
+      },
+      "id": "slack-approve",
+      "name": "Slack: 검수 요청",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1440, 300],
+      "notes": "Slack 노드는 자격 증명 설정 필요. 검수 후 다음 노드를 수동 trigger 하거나 reaction 기반 분기로 확장."
+    },
+    {
+      "parameters": {
+        "command": "=python -m auto_editor publish --input \"{{$('Webhook: 영상 준비됨').item.json.video_path}}\" --metadata \"{{$('Webhook: 영상 준비됨').item.json.workdir}}/metadata.json\" --thumbnail \"{{$('Webhook: 영상 준비됨').item.json.workdir}}/thumbnail.png\" --privacy {{$('Webhook: 영상 준비됨').item.json.privacy || 'private'}} --title-index 0"
+      },
+      "id": "run-publish",
+      "name": "YouTube 업로드",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1680, 300],
+      "notes": "ANTHROPIC_API_KEY 와 Google OAuth client_secrets.json 은 n8n 호스트의 working directory 에 있어야 합니다."
+    },
+    {
+      "parameters": {
+        "jsCode": "const stdout = items[0].json.stdout || '';\nconst urlMatch = stdout.match(/https:\\/\\/youtu\\.be\\/[A-Za-z0-9_-]+/);\nreturn [{ json: { url: urlMatch ? urlMatch[0] : null, raw: stdout } }];"
+      },
+      "id": "extract-url",
+      "name": "YouTube URL 추출",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1920, 300]
+    },
+    {
+      "parameters": {
+        "channel": "={{$('Webhook: 영상 준비됨').item.json.slack_channel || '#youtube-publish'}}",
+        "text": "=✅ 업로드 완료: {{$json.url}}",
+        "otherOptions": {}
+      },
+      "id": "slack-done",
+      "name": "Slack: 완료 알림",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2160, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, url: $('YouTube URL 추출').item.json.url }) }}"
+      },
+      "id": "respond",
+      "name": "Webhook 응답",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2400, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: 영상 준비됨": {
+      "main": [[{ "node": "메타데이터 생성 (Claude)", "type": "main", "index": 0 }]]
+    },
+    "메타데이터 생성 (Claude)": {
+      "main": [[{ "node": "썸네일 생성", "type": "main", "index": 0 }]]
+    },
+    "썸네일 생성": {
+      "main": [[{ "node": "metadata.json 읽기", "type": "main", "index": 0 }]]
+    },
+    "metadata.json 읽기": {
+      "main": [[{ "node": "메타데이터 파싱", "type": "main", "index": 0 }]]
+    },
+    "메타데이터 파싱": {
+      "main": [[{ "node": "Slack: 검수 요청", "type": "main", "index": 0 }]]
+    },
+    "Slack: 검수 요청": {
+      "main": [[{ "node": "YouTube 업로드", "type": "main", "index": 0 }]]
+    },
+    "YouTube 업로드": {
+      "main": [[{ "node": "YouTube URL 추출", "type": "main", "index": 0 }]]
+    },
+    "YouTube URL 추출": {
+      "main": [[{ "node": "Slack: 완료 알림", "type": "main", "index": 0 }]]
+    },
+    "Slack: 완료 알림": {
+      "main": [[{ "node": "Webhook 응답", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "youtube" }, { "name": "automation" }]
+}

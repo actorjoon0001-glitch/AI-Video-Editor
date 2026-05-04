@@ -5,3 +5,14 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# Secrets / OAuth
+client_secrets.json
+*_secrets.json
+.auto_editor/
+
+# Generated artifacts
+metadata.json
+thumbnail.png
+auto_out/
+*.work/
