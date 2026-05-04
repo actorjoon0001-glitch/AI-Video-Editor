@@ -458,64 +458,44 @@ async function runPipeline() {
     bgmVolDb: parseFloat($("bgmVol").value),
     loudnorm: $("loudnorm").checked,
   };
-  // 인코딩 진행률 = 출력 영상의 인코딩된 시간 / 출력 예상 길이
-  const expectedOut = (pickedDuration - cutTotal) / state.speed;
   const encodeStart = Date.now();
-  let encodeTimer = null;
-  let lastEncodeTime = 0;
-  // progress 이벤트의 time 필드 (마이크로초). ffmpeg.wasm 0.12 의 주된 진행 신호.
-  const encodeProgressEventHandler = ({ time }) => {
-    if (typeof time === "number") {
-      const t = time / 1_000_000;
-      if (t > lastEncodeTime) lastEncodeTime = t;
-    }
+
+  // 단계별 진행: A(컷 분리 N개) · B(concat) · C(효과 + 인코딩).
+  // SDK progress 이벤트(0~1) 만 사용 — -progress pipe:2 / -stats_period 제거.
+  let stage = { phase: "segment", current: 0, total: keeps.length };
+  let stageProgress = 0; // 현재 단계 내 진행 (0~1)
+  const onStage = (s) => { stage = s; stageProgress = 0; };
+  const onSdkProgress = ({ progress: p }) => {
+    if (typeof p === "number" && p >= 0) stageProgress = Math.min(1, p);
   };
-  // 보조: stderr log 라인 파싱.
-  // -progress pipe:2 사용 시 "out_time_us=4500000" / "out_time=00:00:04.500" 형식도 들어옴.
-  let lastActivityHint = "";
-  const encodeProgressLogHandler = ({ message }) => {
-    let m;
-    if ((m = message.match(/^out_time_us=(\d+)/))) {
-      const t = parseInt(m[1], 10) / 1_000_000;
-      if (t > lastEncodeTime) lastEncodeTime = t;
-    } else if ((m = message.match(/out_time=(\d+):(\d+):(\d+\.?\d*)/))) {
-      const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
-      if (t > lastEncodeTime) lastEncodeTime = t;
-    } else if ((m = message.match(/time=(\d+):(\d+):(\d+\.?\d*)/))) {
-      const t = (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
-      if (t > lastEncodeTime) lastEncodeTime = t;
-    }
-    // 첫 프레임 전엔 활동 표시용으로 의미있는 라인 캡처
-    if (lastEncodeTime <= 0 && /^(Stream|Output|Input|frame=)/i.test(message.trim())) {
-      lastActivityHint = message.trim().slice(0, 80);
-    }
-  };
-  ff.on("progress", encodeProgressEventHandler);
-  ff.on("log", encodeProgressLogHandler);
-  // 1초마다 경과 시간 + 인코딩 진행률 업데이트
-  encodeTimer = setInterval(() => {
+  ff.on("progress", onSdkProgress);
+
+  // 단계별 가중치(전체 100% 중) — 효과 단계가 가장 무거움.
+  const W = { segment: 30, concat: 5, effects: 65 };
+  const encodeTimer = setInterval(() => {
     const elapsed = (Date.now() - encodeStart) / 1000;
-    if (lastEncodeTime <= 0) {
-      // ffmpeg 가 아직 첫 프레임을 출력하지 않은 초기 단계 (HEVC 디코딩·필터 셋업 등)
-      setBar(2);
-      const hint = lastActivityHint ? ` · ${lastActivityHint}` : "";
-      setStatus(`필터 그래프 초기화 중... · 경과 ${formatHMS(elapsed)}${hint}`);
-      return;
+    let pct = 0;
+    let label = "";
+    if (stage.phase === "segment") {
+      const segDone = (stage.current - 1 + stageProgress) / Math.max(1, stage.total);
+      pct = W.segment * segDone;
+      label = `컷 분리 중 ${stage.current}/${stage.total}`;
+    } else if (stage.phase === "concat") {
+      pct = W.segment + W.concat * stageProgress;
+      label = "조각 합치는 중";
+    } else if (stage.phase === "effects") {
+      pct = W.segment + W.concat + W.effects * stageProgress;
+      label = "비율·속도·음량 적용 중";
     }
-    const pct = expectedOut > 0 ? Math.min(99, (lastEncodeTime / expectedOut) * 100) : 0;
-    setBar(pct);
-    setStatus(
-      `컷·인코딩 중 — ${formatHMS(lastEncodeTime)} / ${formatHMS(expectedOut)} ` +
-      `(${pct.toFixed(0)}%) · 경과 ${formatHMS(elapsed)}`
-    );
+    setBar(Math.min(99, pct));
+    setStatus(`${label} · 경과 ${formatHMS(elapsed)}`);
   }, 500);
 
   try {
-    await applyCutsAndRatio(ff, inName, outName, keeps, encodeOpts);
+    await applyCutsAndRatio(ff, inName, outName, keeps, encodeOpts, onStage);
   } finally {
     clearInterval(encodeTimer);
-    ff.off("progress", encodeProgressEventHandler);
-    ff.off("log", encodeProgressLogHandler);
+    ff.off("progress", onSdkProgress);
   }
   setBar(100);
   doneStep("encode");
@@ -777,62 +757,128 @@ async function pickHighlightWindow(ff, inName, duration, targetLen) {
   return [{ start, end }];
 }
 
-async function applyCutsAndRatio(ff, inName, outName, keeps, opts) {
+// 거대한 단일 filter_complex 는 ffmpeg.wasm core-mt 에서 keep 수가 늘어나면
+// 필터 그래프 init 단계에서 worker 가 멈추는 경향이 있다. 작은 파일·소수 컷에서도
+// 재현됨. 그래서 3단계로 나눈다:
+//  A. 각 keep 을 -c copy 로 분리해 짧은 mp4 조각으로 export (재인코딩 X)
+//  B. concat demuxer + -c copy 로 조각들을 하나로 합침 (재인코딩 X)
+//  C. 합쳐진 단일 파일에 ratio/speed/loudnorm/BGM 을 한 번만 적용
+// 각 단계의 ffmpeg 호출은 필터 그래프가 단순해 worker init 병목이 사라진다.
+async function applyCutsAndRatio(ff, inName, outName, keeps, opts, onStage) {
   const { ratio, speed, bgmName, bgmVolDb, loudnorm } = opts;
   const ratioFilter = ratioToFilter(ratio);
-  const speedV = `setpts=${(1 / speed).toFixed(4)}*PTS`;
-  const speedA = atempoChain(speed);
 
-  // 1단계: 각 keep 구간을 trim 후 concat → [vmid][amid]
-  const parts = [];
+  const segFiles = [];
+  // 단계 A: 컷 분리 (-c copy)
   for (let i = 0; i < keeps.length; i++) {
+    onStage?.({ phase: "segment", current: i + 1, total: keeps.length });
+    const seg = `seg_${String(i).padStart(4, "0")}.mp4`;
     const { start, end } = keeps[i];
-    parts.push(
-      `[0:v]trim=start=${start.toFixed(3)}:end=${end.toFixed(3)},setpts=PTS-STARTPTS,${ratioFilter}[v${i}];` +
-      `[0:a]atrim=start=${start.toFixed(3)}:end=${end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
-    );
-  }
-  const concatInputs = keeps.map((_, i) => `[v${i}][a${i}]`).join("");
-  let filter = parts.join(";") +
-    `;${concatInputs}concat=n=${keeps.length}:v=1:a=1[vcat][acat]`;
-
-  // 2단계: 속도
-  filter += `;[vcat]${speedV}[vsp];[acat]${speedA}[asp]`;
-  let vOut = "[vsp]", aOut = "[asp]";
-
-  // 3단계: 음량 정규화 (메인 보이스에 적용)
-  if (loudnorm) {
-    filter += `;${aOut}loudnorm=I=-16:LRA=11:TP=-1.5[anorm]`;
-    aOut = "[anorm]";
+    // -ss/-to 를 -i 앞에 둬서 keyframe 스냅 + 빠른 시크.
+    // -avoid_negative_ts make_zero 로 세그먼트 PTS 를 0 부터 다시 시작.
+    await execWithWatchdog(ff, [
+      "-ss", start.toFixed(3),
+      "-to", end.toFixed(3),
+      "-i", inName,
+      "-c", "copy",
+      "-avoid_negative_ts", "make_zero",
+      "-y", seg,
+    ]);
+    segFiles.push(seg);
   }
 
-  // 4단계: BGM 믹스 + 사이드체인 더킹
-  // sidechaincompress 로 음성 세기에 맞춰 BGM을 자동 감쇠.
-  if (bgmName) {
-    // BGM 볼륨 조정 후 사이드체인: voice 신호로 BGM 컴프레서 트리거 → 듀얼 amerge
-    filter +=
-      `;[1:a]volume=${bgmVolDb}dB,aloop=loop=-1:size=2e9[bgmraw]` +
-      `;${aOut}asplit=2[voice][voice2]` +
-      `;[bgmraw][voice2]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=250[bgmducked]` +
-      `;[voice][bgmducked]amix=inputs=2:duration=first:dropout_transition=0[afinal]`;
-    aOut = "[afinal]";
-  }
+  // 단계 B: concat demuxer 로 합치기
+  onStage?.({ phase: "concat" });
+  const list = segFiles.map((f) => `file '${f}'`).join("\n");
+  await ff.writeFile("concat_list.txt", new TextEncoder().encode(list));
+  await execWithWatchdog(ff, [
+    "-f", "concat",
+    "-safe", "0",
+    "-i", "concat_list.txt",
+    "-c", "copy",
+    "-y", "joined.mp4",
+  ]);
 
-  const args = [
-    "-i", inName,
-    ...(bgmName ? ["-i", bgmName] : []),
-    "-filter_complex", filter,
-    "-map", vOut, "-map", aOut,
+  // 단계 C: 효과 적용 (ratio/speed/loudnorm/BGM)
+  onStage?.({ phase: "effects" });
+  const speedV = speed === 1.0 ? null : `setpts=${(1 / speed).toFixed(4)}*PTS`;
+  const speedA = speed === 1.0 ? null : atempoChain(speed);
+  let vChain = ratioFilter;
+  if (speedV) vChain += `,${speedV}`;
+  let aChain = "";
+  if (speedA && speedA !== "anull") aChain = speedA;
+  if (loudnorm) aChain = (aChain ? aChain + "," : "") + "loudnorm=I=-16:LRA=11:TP=-1.5";
+
+  let effectsArgs;
+  if (!bgmName) {
+    // 단순한 -vf / -af 경로. filter_complex 회피.
+    effectsArgs = ["-i", "joined.mp4", "-vf", vChain];
+    if (aChain) effectsArgs.push("-af", aChain);
+  } else {
+    // BGM + 사이드체인 더킹 — 이때만 filter_complex 사용 (입력 2개 + 그래프 분기)
+    let voicePrefix = "[0:a]";
+    if (aChain) voicePrefix += aChain + ",";
+    const filter =
+      `[0:v]${vChain}[vout];` +
+      `${voicePrefix}asplit=2[voice][voice2];` +
+      `[1:a]volume=${bgmVolDb}dB,aloop=loop=-1:size=2e9[bgmraw];` +
+      `[bgmraw][voice2]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=250[bgmducked];` +
+      `[voice][bgmducked]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
+    effectsArgs = [
+      "-i", "joined.mp4",
+      "-i", bgmName,
+      "-filter_complex", filter,
+      "-map", "[vout]", "-map", "[aout]",
+      "-shortest",
+    ];
+  }
+  effectsArgs.push(
     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
     "-c:a", "aac", "-b:a", "160k",
     "-movflags", "+faststart",
-    "-shortest",
-    // 명시적 progress 출력을 stderr 로 → SDK 의 progress 이벤트가 확실히 발화
-    "-progress", "pipe:2",
-    "-stats_period", "0.5",
-    outName,
-  ];
-  await ff.exec(args);
+    "-y", outName,
+  );
+  await execWithWatchdog(ff, effectsArgs);
+
+  // 정리
+  for (const f of segFiles) { try { await ff.deleteFile(f); } catch {} }
+  try { await ff.deleteFile("concat_list.txt"); } catch {}
+  try { await ff.deleteFile("joined.mp4"); } catch {}
+}
+
+// 20초 동안 log/progress 가 없으면 worker hang 으로 보고 ffmpeg.wasm 인스턴스를
+// 강제 종료. 다음 호출에서 ensureFFmpeg() 가 새 인스턴스를 만든다.
+const HANG_TIMEOUT_MS = 20_000;
+async function execWithWatchdog(ff, args) {
+  let lastActivity = Date.now();
+  const tap = () => { lastActivity = Date.now(); };
+  ff.on("log", tap);
+  ff.on("progress", tap);
+  let killed = false;
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastActivity > HANG_TIMEOUT_MS) {
+      killed = true;
+      clearInterval(watchdog);
+      try { ff.terminate?.(); } catch {}
+      ffmpeg = null; // 다음 시도가 깨끗하게 다시 로드
+    }
+  }, 1000);
+  try {
+    await ff.exec(args);
+  } catch (e) {
+    if (killed) {
+      throw new Error(
+        "브라우저 ffmpeg 가 20초간 진행이 없어 중단됐습니다. " +
+        "세부 설정의 '고속 모드'(외부 서버) 를 켜고 다시 시도해 주세요. " +
+        "긴 영상이거나 BGM·loudnorm 조합이면 브라우저 인코딩이 부담입니다."
+      );
+    }
+    throw e;
+  } finally {
+    clearInterval(watchdog);
+    ff.off("log", tap);
+    ff.off("progress", tap);
+  }
 }
 
 // atempo 는 0.5~2.0 범위만 허용 → 큰 배율은 체인.
