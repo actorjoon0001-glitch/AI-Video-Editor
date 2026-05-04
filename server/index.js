@@ -27,6 +27,11 @@ const ALLOWED_ORIGINS = (
 const TMP = process.env.TMP_DIR || "/tmp/aive";
 await mkdir(TMP, { recursive: true });
 
+// Python 인터프리터 절대 경로. Dockerfile 이 venv 를 /opt/venv 에 만들고
+// 거기에 faster-whisper 를 설치하므로 시스템 python3 가 아니라 이 경로를 쓴다.
+// Render 의 런타임 PATH 가 이미지 ENV 와 다르게 적용되는 케이스 회피용.
+const PYTHON_BIN = process.env.PYTHON_BIN || "/opt/venv/bin/python3";
+
 const RESULT_TTL_MS = 60 * 60 * 1000; // 결과 파일 1시간 후 삭제
 
 // ── App ──────────────────────────────────────────────────────────────────────
@@ -49,12 +54,46 @@ const upload = multer({
 
 app.get("/", (req, res) => res.type("text/plain").send("AI Video Editor backend"));
 
+// faster-whisper 가용성 — 서버 부팅 시점에 한 번 체크하고 캐시.
+// 자막 작업이 실제로 돌 수 있는지 (백엔드 측의) 사전 검증 용도.
+let whisperReady = null;        // null = 점검 전 / true = OK / false = 없음
+let whisperError = null;        // 실패 시 stderr 일부
+
+async function checkWhisperImport() {
+  return new Promise((resolve) => {
+    const py = spawn(PYTHON_BIN, [
+      "-c",
+      "from faster_whisper import WhisperModel; print('OK')",
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    py.stdout.on("data", (d) => { stdout += d.toString(); });
+    py.stderr.on("data", (d) => { stderr += d.toString(); });
+    py.on("error", (e) => resolve({ ok: false, error: String(e?.message || e) }));
+    py.on("exit", (code) => {
+      if (code === 0 && stdout.includes("OK")) return resolve({ ok: true });
+      resolve({ ok: false, error: (stderr || stdout || "exit " + code).slice(-1500) });
+    });
+  });
+}
+
+// 부팅 후 한 번 체크 — Render 시작 로그에 결과 기록.
+checkWhisperImport().then((r) => {
+  whisperReady = r.ok;
+  whisperError = r.ok ? null : r.error;
+  if (r.ok) console.log(`Whisper OK (PYTHON_BIN=${PYTHON_BIN})`);
+  else console.error(`Whisper import failed (PYTHON_BIN=${PYTHON_BIN}):\n${r.error}`);
+});
+
 // 헬스체크. /healthz 는 인프라용, /api/health 는 프론트엔드가 라우트 가용성을
 // 확인하기 위해 호출. routes 배열로 어떤 엔드포인트가 살아있는지 명시한다.
 function healthBody() {
   return {
     ok: true,
     version: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
+    pythonBin: PYTHON_BIN,
+    whisper: whisperReady,
+    whisperError: whisperReady === false ? (whisperError || "").slice(-500) : null,
+    whisperModel: process.env.WHISPER_MODEL || "tiny",
     routes: [
       { method: "POST", path: "/api/process" },
       { method: "GET",  path: "/api/result/:id" },
@@ -481,7 +520,7 @@ function runTranscribe(input, { language, model, fillerMode }) {
     if (fillerMode && fillerMode !== "off") {
       args.push("--filler-mode", fillerMode);
     }
-    const py = spawn("python3", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const py = spawn(PYTHON_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     py.stdout.on("data", (d) => { stdout += d.toString(); });

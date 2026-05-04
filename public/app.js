@@ -90,18 +90,19 @@ let lastSubtitleStatus = null; // null | { ok: true, count, ms } | { ok: false, 
 // 자막 파이프라인 단계별 상태 (진단 패널용). key 별로 status + detail 보관.
 // status: "pending" | "running" | "ok" | "warn" | "error"
 const SUB_STEP_ORDER = [
-  ["option",       "1. 자동 자막 옵션"],
-  ["api_base",     "2. API_BASE_URL"],
-  ["health",       "3. /api/health 응답"],
-  ["jobs_route",   "4. /api/transcribe/jobs 라우트 등록"],
-  ["job_register", "5. POST /api/transcribe/jobs"],
-  ["whisper",      "6. Whisper 처리 (폴링)"],
-  ["srt_text",     "7. SRT 텍스트 길이"],
-  ["vtt_text",     "8. VTT 텍스트 길이"],
-  ["blob",         "9. Blob URL 생성"],
-  ["buttons",      "10. SRT/VTT 버튼 활성화"],
-  ["track",        "11. <video> track src 연결"],
-  ["burn",         "12. 자막 번인 (옵션)"],
+  ["option",        "1. 자동 자막 옵션"],
+  ["api_base",      "2. API_BASE_URL"],
+  ["health",        "3. /api/health 응답"],
+  ["jobs_route",    "4. /api/transcribe/jobs 라우트 등록"],
+  ["whisper_install", "5. 백엔드 faster-whisper 설치"],
+  ["job_register",  "6. POST /api/transcribe/jobs"],
+  ["whisper",       "7. Whisper 처리 (폴링)"],
+  ["srt_text",      "8. SRT 텍스트 길이"],
+  ["vtt_text",      "9. VTT 텍스트 길이"],
+  ["blob",          "10. Blob URL 생성"],
+  ["buttons",       "11. SRT/VTT 버튼 활성화"],
+  ["track",         "12. <video> track src 연결"],
+  ["burn",          "13. 자막 번인 (옵션)"],
 ];
 const subtitleSteps = new Map();
 let subtitleDebugBanner = "";
@@ -1118,7 +1119,30 @@ async function maybeGenerateSubtitles(resultBlob) {
     setSubtitleStep("jobs_route", "warn", "legacy /healthz 응답 — routes 검증 불가");
   }
 
-  // 5–6) 작업 등록 + Whisper 폴링
+  // 5) 백엔드 faster-whisper 설치 여부 — health.whisper 가 false 이면 미리 차단
+  if (typeof health.whisper === "boolean") {
+    if (health.whisper) {
+      setSubtitleStep("whisper_install", "ok", `Python: ${health.pythonBin || "?"} · 모델: ${health.whisperModel || "?"}`);
+    } else {
+      const errSnippet = (health.whisperError || "").slice(-200);
+      setSubtitleStep("whisper_install", "error",
+        `Python(${health.pythonBin || "?"}) 에서 faster-whisper import 실패. ${errSnippet}`);
+      setSubtitleBanner(
+        "<strong>백엔드에 faster-whisper 가 설치돼 있지 않습니다.</strong><br>" +
+        "Render Dockerfile 빌드 단계에서 <code>pip install faster-whisper</code> 가 실패했거나 venv 경로 불일치. " +
+        "Render 대시보드 → <code>Manual Deploy → Clear build cache & deploy</code> 권장."
+      );
+      const reason = "백엔드 faster-whisper 미설치 — Dockerfile 빌드 확인 필요";
+      appendLog("자막 차단: " + reason);
+      lastSubtitleStatus = { ok: false, reason };
+      syncSubtitleButtons("백엔드 faster-whisper 미설치");
+      return;
+    }
+  } else {
+    setSubtitleStep("whisper_install", "warn", "health 응답에 whisper 필드가 없음 (옛 백엔드 가능성)");
+  }
+
+  // 6–7) 작업 등록 + Whisper 폴링
   setSubtitleStep("job_register", "running", `POST ${BACKEND_URL}/api/transcribe/jobs`);
   setStatus("자동 자막: 작업 등록 중...");
   let result;
