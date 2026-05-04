@@ -188,8 +188,13 @@
             <input type="checkbox" id="serverMode" />
             <span>고속 모드 — 외부 서버에서 인코딩 (5~10배 빠름, HEVC OK)</span>
           </label>
+          <label class="toggle">
+            <input type="checkbox" id="queueMode" />
+            <span>큐 모드 — 백엔드가 단계별 자동 처리 (긴 영상도 timeout 없음)</span>
+          </label>
           <p class="hint-row" id="serverModeHint">
-            * 자막/번인 + 고속 모드는 백엔드 서버를 거칩니다 (HTTPS 전송, 1시간 내 자동 삭제).
+            * 큐 모드: 무음 감지는 브라우저, 그 이후 (인코딩/자막/썸네일)는 백엔드 단계별 처리.
+            한 단계 실패해도 다른 단계는 계속 — 자막만 따로 "다시 생성" 가능.
           </p>
         </div>
 
@@ -288,6 +293,12 @@
           <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트 내보내기</button>
           <a id="srtDownloadBtn" class="btn disabled" download="subtitles.srt" aria-disabled="true" role="button">SRT 자막</a>
           <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT 자막</a>
+        </div>
+
+        <div class="job-pipeline" id="jobPipelineBlock" hidden>
+          <h4 class="thumbs-title">큐 모드 작업 진행 <span class="thumbs-hint">백엔드 단계별 처리</span></h4>
+          <ol class="job-stages" id="jobStages"></ol>
+          <div class="row" id="jobActions"></div>
         </div>
 
         <div class="subtitle-debug" id="subtitleDebugBlock" hidden>
