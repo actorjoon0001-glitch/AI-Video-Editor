@@ -531,11 +531,41 @@ section { scroll-margin-top: 80px; }
 /* Thumbnails */
 .thumbs-block,
 .edit-plan,
-.subtitle-debug {
+.subtitle-debug,
+.job-pipeline {
   margin-top: 24px;
   padding-top: 20px;
   border-top: 1px solid var(--border-soft);
 }
+
+.job-stages {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  display: grid;
+  gap: 6px;
+}
+.job-stage {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.job-stage .icon { text-align: center; font-size: 14px; }
+.job-stage .label { font-weight: 500; }
+.job-stage .detail { display: block; color: var(--muted); font-size: 11.5px; margin-top: 2px; word-break: break-all; }
+.job-stage .actions .btn { padding: 6px 10px; font-size: 12px; }
+.job-stage.queued .icon  { color: #6b7280; }
+.job-stage.running .icon { color: #fbbf24; }
+.job-stage.done .icon    { color: #34d399; }
+.job-stage.failed .icon  { color: #f87171; }
+.job-stage.skipped .icon { color: #6b7280; }
+.job-stage.failed { border-color: rgba(248, 113, 113, 0.4); }
 
 /* 자막 진단 패널 — 단계별 상태 + 사유 */
 .sub-banner {

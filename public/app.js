@@ -391,13 +391,19 @@ resetBtn.addEventListener("click", () => {
 });
 
 runBtn.addEventListener("click", () => {
+  const useQueue = $("queueMode")?.checked && BACKEND_URL;
   const useServer = $("serverMode")?.checked && BACKEND_URL;
-  // 사용자가 명시적으로 안전 모드를 켰으면 fallback 체인 건너뛰고 바로 안전 모드.
   const userSafe = $("safeMode")?.checked === true;
-  (useServer
-    ? runServerPipeline()
-    : runWithFallback({ userSafe })
-  ).catch(onError);
+  // 큐 모드가 우선. 그 다음 고속(server) 모드. 둘 다 아니면 브라우저 fallback 체인.
+  let promise;
+  if (useQueue) {
+    promise = runQueueModePipeline();
+  } else if (useServer) {
+    promise = runServerPipeline();
+  } else {
+    promise = runWithFallback({ userSafe });
+  }
+  promise.catch(onError);
 });
 
 // fallback 체인:
@@ -1354,6 +1360,263 @@ function attachVttTrack(vttUrl) {
     if (tries++ < 10) setTimeout(tick, 100);
   };
   tick();
+}
+
+// ── 큐 모드 파이프라인 ───────────────────────────────────────────────────────
+// 무음 감지만 브라우저에서 빠르게 끝낸 뒤, 영상 + keeps + 옵션을 백엔드 /api/jobs
+// 로 한 번에 보낸다. 인코딩·자막·썸네일은 백엔드가 단계별로 돌리고, 프론트는 3초
+// 폴링으로 진행 상태를 다단계 패널에 그린다. 한 단계 실패해도 나머지는 진행.
+const STAGE_LABELS = [
+  ["edit",       "1. 편집 (cut + ratio + speed + loudnorm)"],
+  ["transcribe", "2. 자막 (Whisper)"],
+  ["burn",       "3. 자막 번인"],
+  ["thumbnail",  "4. 썸네일 추출"],
+  ["metadata",   "5. 메타데이터 (제목/설명/태그)"],
+  ["upload",     "6. YouTube 업로드"],
+];
+const JOB_STAGE_ICON = {
+  queued: "·", running: "⏳", done: "✓", failed: "✗", skipped: "⊘",
+};
+
+async function runQueueModePipeline() {
+  if (pickedFiles.length === 0) return;
+  if (pickedFiles.length > 1) {
+    throw new Error(
+      "큐 모드는 단일 영상만 지원합니다. 다중 영상은 일반 모드에서 자동 병합 후 시도하세요."
+    );
+  }
+  if (!BACKEND_URL) throw new Error("백엔드 URL 미설정");
+
+  runBtn.disabled = true;
+  resultSection.hidden = true;
+  progress.hidden = false;
+  logEl.textContent = "";
+  resetSteps();
+  setBar(0);
+  setStatus("큐 모드: 무음 감지 중 (브라우저)...");
+
+  // 1) 브라우저에서 무음 감지 → keeps 산출
+  const sourceFile = pickedFiles[0];
+  const noiseDb = parseFloat($("silenceDb").value);
+  const minSilence = parseFloat($("minSilence").value);
+  const padding = parseFloat($("padding").value);
+  const duration = await measureDurationFromFile(sourceFile);
+  if (duration <= 0) throw new Error("브라우저가 영상 길이를 못 읽었습니다.");
+  let keeps;
+  if (state.mode === "short") {
+    const targetLen = parseFloat($("shortLen").value);
+    const w = await pickHighlightWindowWebAudio(sourceFile, duration, targetLen).catch(() => null);
+    keeps = w ? [w] : [{ start: 0, end: Math.min(duration, targetLen) }];
+  } else {
+    const silences = await detectSilencesWebAudio(sourceFile, noiseDb, minSilence);
+    keeps = invertSilences(duration, silences, padding);
+  }
+  if (keeps.length === 0) throw new Error("남은 구간이 없습니다. 임계값을 완화해 보세요.");
+  appendLog(`큐 모드: keeps=${keeps.length}, duration=${duration.toFixed(2)}s`);
+  setBar(10);
+
+  // 2) /api/jobs 로 업로드
+  setStatus("큐 모드: 작업 등록 중 (영상 업로드)...");
+  const fd = new FormData();
+  fd.append("video", sourceFile);
+  fd.append("options", JSON.stringify({
+    keeps,
+    ratio: state.ratio,
+    speed: state.speed,
+    loudnorm: $("loudnorm").checked,
+    transcribe: $("autoSubtitles")?.checked === true,
+    thumbnails: true,
+    fillerMode: state.filler || "off",
+    language: "ko",
+    model: "tiny",
+  }));
+  const startResp = await fetch(`${BACKEND_URL}/api/jobs`, { method: "POST", body: fd });
+  if (!startResp.ok) {
+    const t = await startResp.text().catch(() => "");
+    throw new Error(`작업 등록 실패: HTTP ${startResp.status} ${t.slice(0, 200)}`);
+  }
+  const { jobId, pollIntervalMs = 3000 } = await startResp.json();
+  appendLog(`작업 등록: ${jobId}`);
+
+  // 3) 폴링 — 결과 패널을 미리 보여서 진행 상태 노출.
+  resultSection.hidden = false;
+  $("jobPipelineBlock").hidden = false;
+  // 전 단계 패널 초기화
+  renderJobPipeline(makeInitialJobState(jobId));
+
+  const POLL_MS = Math.max(1500, pollIntervalMs);
+  const MAX_TOTAL_MS = 30 * 60 * 1000; // 30분 (Render Free cold start 여유)
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < MAX_TOTAL_MS) {
+    await new Promise((r) => setTimeout(r, POLL_MS));
+    let job;
+    try {
+      const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`);
+      if (!r.ok) {
+        if (r.status === 404) throw new Error("작업이 만료됐거나 없습니다.");
+        appendLog(`상태 조회 일시 실패 (${r.status}) — 재시도`);
+        continue;
+      }
+      job = await r.json();
+    } catch (e) {
+      console.warn("polling 일시 실패:", e);
+      continue;
+    }
+    renderJobPipeline(job);
+    setStatus(`큐 모드: ${job.status}${terminalLabel(job)}`);
+    if (job.status === "done" || job.status === "partial" || job.status === "failed") {
+      // 인코딩 결과를 다운로드 링크/미리보기로 연결
+      await wireQueueResults(job);
+      runBtn.disabled = false;
+      return;
+    }
+  }
+  throw new Error("큐 모드 timeout (30분 초과). 백엔드 로그 확인 필요.");
+}
+
+function makeInitialJobState(jobId) {
+  const stages = {};
+  for (const [name] of STAGE_LABELS) stages[name] = { status: "queued" };
+  return { jobId, status: "queued", stages };
+}
+
+function terminalLabel(job) {
+  const s = job.status;
+  if (s === "done") return " — 모든 단계 완료";
+  if (s === "partial") return " — 일부 단계 실패 (다른 단계는 사용 가능)";
+  if (s === "failed") return " — 실패";
+  return "";
+}
+
+function renderJobPipeline(job) {
+  const ol = document.getElementById("jobStages");
+  if (!ol) return;
+  ol.innerHTML = STAGE_LABELS.map(([key, label]) => {
+    const s = job.stages?.[key] || { status: "queued" };
+    const icon = JOB_STAGE_ICON[s.status] || "·";
+    const detail = jobStageDetailText(key, s);
+    const detailHtml = detail ? `<span class="detail">${escapeHtml(detail)}</span>` : "";
+    const retryBtn = s.status === "failed" && (key === "transcribe" || key === "thumbnail")
+      ? `<button type="button" class="btn" data-retry="${key}">다시 시도</button>` : "";
+    return `<li class="job-stage ${s.status}">
+      <span class="icon">${icon}</span>
+      <span><span class="label">${label}</span>${detailHtml}</span>
+      <span class="actions">${retryBtn}</span>
+    </li>`;
+  }).join("");
+  // 다시 시도 버튼 핸들러
+  ol.querySelectorAll("[data-retry]").forEach((btn) => {
+    btn.addEventListener("click", () => retryJobStage(job.jobId, btn.dataset.retry));
+  });
+}
+
+function jobStageDetailText(key, s) {
+  if (s.error) return `에러: ${s.error}`;
+  if (s.note) return s.note;
+  if (s.status === "done" && s.result) {
+    if (key === "edit") {
+      const mb = s.result.sizeBytes ? ` · ${(s.result.sizeBytes / 1024 / 1024).toFixed(1)} MB` : "";
+      const t = s.result.durationMs ? ` · ${(s.result.durationMs / 1000).toFixed(1)}s` : "";
+      return `완료${mb}${t}`;
+    }
+    if (key === "transcribe") {
+      return `${s.result.segmentCount || 0}줄 · ${s.result.language || "?"} · ${((s.result.durationMs || 0) / 1000).toFixed(1)}s`;
+    }
+    if (key === "thumbnail") {
+      return `${s.result.urls?.length || 0}장 추출`;
+    }
+  }
+  return "";
+}
+
+async function retryJobStage(jobId, stage) {
+  setStatus(`${stage} 단계 재시도 중...`);
+  try {
+    const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}/stages/${stage}/retry`, { method: "POST" });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`HTTP ${r.status}: ${t.slice(0, 200)}`);
+    }
+    appendLog(`${stage} 재시도 등록`);
+    // 폴링은 메인 루프가 이미 돌고 있을 수도 있으나 종료된 경우엔 재개
+    pollUntilTerminal(jobId).catch(onError);
+  } catch (e) {
+    appendLog(`재시도 실패: ${e?.message || e}`);
+  }
+}
+
+async function pollUntilTerminal(jobId) {
+  const POLL_MS = 3000;
+  const MAX = 30 * 60 * 1000;
+  const t0 = Date.now();
+  while (Date.now() - t0 < MAX) {
+    await new Promise((r) => setTimeout(r, POLL_MS));
+    const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`);
+    if (!r.ok) continue;
+    const job = await r.json();
+    renderJobPipeline(job);
+    if (job.status === "done" || job.status === "partial" || job.status === "failed") {
+      await wireQueueResults(job);
+      return;
+    }
+  }
+}
+
+// 큐 모드 결과를 기존 결과 UI 에 연결: 편집본을 미리보기 비디오에, SRT/VTT 를
+// 다운로드 버튼에, 썸네일을 썸네일 그리드에.
+async function wireQueueResults(job) {
+  const editUrl = job.stages.edit?.result?.url;
+  if (editUrl) {
+    const fullUrl = BACKEND_URL + editUrl;
+    if (outputUrl) URL.revokeObjectURL(outputUrl);
+    // 백엔드 파일은 blob URL 이 아니라 직접 URL — preview 도 그대로 사용 가능.
+    outputUrl = fullUrl;
+    resultVideo.src = fullUrl;
+    resultVideo.load();
+    const dl = $("downloadBtn");
+    dl.href = fullUrl;
+    dl.download = "edited.mp4";
+    dl.classList.remove("disabled");
+  }
+  // 자막
+  const tr = job.stages.transcribe;
+  if (tr?.status === "done" && tr.result) {
+    if (tr.result.srtUrl) {
+      const srtBtn = $("srtDownloadBtn");
+      srtBtn.href = BACKEND_URL + tr.result.srtUrl;
+      srtBtn.classList.remove("disabled");
+      srtBtn.removeAttribute("aria-disabled");
+    }
+    if (tr.result.vttUrl) {
+      const vttBtn = $("vttDownloadBtn");
+      const vttUrl = BACKEND_URL + tr.result.vttUrl;
+      vttBtn.href = vttUrl;
+      vttBtn.classList.remove("disabled");
+      vttBtn.removeAttribute("aria-disabled");
+      // 미리보기 플레이어에 track 부착
+      attachVttTrack(vttUrl);
+    }
+  }
+  // 썸네일
+  const th = job.stages.thumbnail;
+  if (th?.status === "done" && th.result?.urls) {
+    thumbsGrid.innerHTML = "";
+    thumbUrls.forEach((u) => URL.revokeObjectURL(u));
+    thumbUrls = [];
+    for (const u of th.result.urls) {
+      const img = document.createElement("img");
+      img.src = BACKEND_URL + u;
+      img.alt = "썸네일 후보";
+      img.addEventListener("click", () => {
+        const a = document.createElement("a");
+        a.href = BACKEND_URL + u;
+        a.download = u.split("/").pop() || "thumb.jpg";
+        a.click();
+      });
+      thumbsGrid.appendChild(img);
+    }
+    thumbsBlock.hidden = false;
+  }
 }
 
 async function processOnBackend(file, opts, onProgress) {

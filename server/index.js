@@ -101,6 +101,10 @@ function healthBody() {
       { method: "POST", path: "/api/transcribe/jobs" },
       { method: "GET",  path: "/api/transcribe/jobs/:id" },
       { method: "POST", path: "/api/burn-subtitles" },
+      { method: "POST", path: "/api/jobs" },
+      { method: "GET",  path: "/api/jobs/:id" },
+      { method: "POST", path: "/api/jobs/:id/stages/:stage/retry" },
+      { method: "GET",  path: "/api/jobs/:id/files/:name" },
       { method: "GET",  path: "/api/health" },
       { method: "GET",  path: "/healthz" },
     ],
@@ -386,6 +390,354 @@ function friendlyTranscribeError(e) {
     return "백엔드 프로세스가 OOM 으로 강제 종료됐습니다 (exit 137). 더 작은 모델 또는 더 짧은 영상 시도.";
   }
   return raw || "자막 생성 실패 (원인 불명).";
+}
+
+// ── /api/jobs — 다단계 작업 파이프라인 ──────────────────────────────────────
+// 클라이언트는 영상 + 옵션만 올리면 백엔드가 edit / transcribe / burn /
+// thumbnail / metadata / upload 를 순차 처리. 한 단계가 실패해도 비치명적
+// 단계는 다음 단계로 진행 (partial success). GET 로 폴링, 단계별 retry 지원.
+
+const STAGE_NAMES = ["edit", "transcribe", "burn", "thumbnail", "metadata", "upload"];
+
+// 핵심 단계 — 실패하면 후속 stage 들 의미 없으니 전체 실패로.
+const CRITICAL_STAGES = new Set(["edit"]);
+
+// 아직 구현 안 된 stage — 자동으로 skipped 로 표시 (후속 PR 에서 채움).
+const STUB_STAGES = new Set(["burn", "metadata", "upload"]);
+
+const pipelineJobs = new Map();   // id → job state
+const PIPELINE_JOB_TTL_MS = 60 * 60 * 1000; // 1h
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of pipelineJobs.entries()) {
+    const t = job.completedAt || job.createdAt;
+    if (now - t > PIPELINE_JOB_TTL_MS) {
+      pipelineJobs.delete(id);
+      // 산출물도 같이 정리
+      for (const f of job.artifacts || []) {
+        unlink(f).catch(() => {});
+      }
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+function newPipelineJob(id, options) {
+  const stages = {};
+  for (const name of STAGE_NAMES) {
+    stages[name] = { status: STUB_STAGES.has(name) ? "skipped" : "queued" };
+    if (STUB_STAGES.has(name)) {
+      stages[name].note = "구현 예정 (후속 PR)";
+    }
+  }
+  return {
+    id,
+    options,
+    status: "queued",
+    stages,
+    artifacts: [],   // 정리할 임시 파일 경로 모음
+    createdAt: Date.now(),
+  };
+}
+
+function computeJobStatus(job) {
+  const states = STAGE_NAMES.map((n) => job.stages[n].status);
+  if (states.some((s) => s === "running" || s === "queued")) return "running";
+  const failed = states.filter((s) => s === "failed").length;
+  const done = states.filter((s) => s === "done").length;
+  if (failed === 0) return "done";
+  if (done === 0) return "failed";
+  return "partial";
+}
+
+function jobResponse(job) {
+  // url 등 외부 참조 가능 부분만 직렬화. internal path 는 숨김.
+  const stages = {};
+  for (const [name, s] of Object.entries(job.stages)) {
+    const out = { status: s.status };
+    if (s.error) out.error = s.error;
+    if (s.note) out.note = s.note;
+    if (s.startedAt) out.startedAt = s.startedAt;
+    if (s.completedAt) out.completedAt = s.completedAt;
+    if (s.result) out.result = sanitizeStageResult(name, s.result);
+    stages[name] = out;
+  }
+  return {
+    jobId: job.id,
+    status: computeJobStatus(job),
+    options: job.options,
+    stages,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    completedAt: job.completedAt,
+  };
+}
+
+function sanitizeStageResult(name, result) {
+  // 외부에 노출 가능한 필드만 골라서 반환. 디스크 path 같은 건 url 로만.
+  if (name === "edit") {
+    return {
+      url: result.url,
+      sizeBytes: result.sizeBytes,
+      durationMs: result.durationMs,
+    };
+  }
+  if (name === "transcribe") {
+    return {
+      srtUrl: result.srtUrl,
+      vttUrl: result.vttUrl,
+      segmentCount: result.segments?.length || 0,
+      language: result.language,
+      durationMs: result.durationMs,
+      editPlan: result.editPlan || null,
+    };
+  }
+  if (name === "thumbnail") {
+    return { urls: result.urls };
+  }
+  return result;
+}
+
+app.post("/api/jobs", upload.single("video"), async (req, res) => {
+  const id = randomUUID();
+  const inputPath = req.file?.path;
+  if (!inputPath) {
+    return res.status(400).json({ error: "video file required" });
+  }
+  let options;
+  try {
+    options = JSON.parse(req.body.options || "{}");
+  } catch {
+    return res.status(400).json({ error: "invalid options JSON" });
+  }
+  const safeOpts = sanitizeJobOptions(options);
+  const job = newPipelineJob(id, safeOpts);
+  pipelineJobs.set(id, job);
+
+  res.status(202).json({
+    jobId: id,
+    statusUrl: `/api/jobs/${id}`,
+    pollIntervalMs: 3000,
+  });
+
+  // 백그라운드 실행
+  runJobPipeline(id, inputPath).catch((e) => {
+    console.error(`[job ${id}] dispatcher crash:`, e);
+  });
+});
+
+app.get("/api/jobs/:id", (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const job = pipelineJobs.get(id);
+  if (!job) {
+    return res.status(404).json({
+      error: "작업을 찾을 수 없거나 만료됐습니다 (1시간 보관). 다시 업로드해 주세요.",
+    });
+  }
+  res.json(jobResponse(job));
+});
+
+app.post("/api/jobs/:id/stages/:stage/retry", async (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const stage = String(req.params.stage);
+  const job = pipelineJobs.get(id);
+  if (!job) return res.status(404).json({ error: "job not found" });
+  if (!STAGE_NAMES.includes(stage)) return res.status(400).json({ error: "unknown stage" });
+  if (STUB_STAGES.has(stage)) return res.status(400).json({ error: "stage not implemented yet" });
+
+  // edit 결과 파일이 있어야 후속 stage 재시도 가능
+  if (stage !== "edit" && (job.stages.edit?.status !== "done")) {
+    return res.status(400).json({ error: "edit stage 가 done 이어야 후속 stage 재시도 가능" });
+  }
+
+  job.stages[stage] = { status: "queued" };
+  res.status(202).json({ ok: true, statusUrl: `/api/jobs/${id}` });
+
+  // 백그라운드: 단일 stage 만 재실행
+  retryJobStage(id, stage).catch((e) => console.error(`[job ${id}] retry crash:`, e));
+});
+
+app.get("/api/jobs/:id/files/:name", (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const name = String(req.params.name).replace(/[^a-zA-Z0-9._-]/g, "");
+  const job = pipelineJobs.get(id);
+  if (!job) return res.status(404).json({ error: "job not found" });
+  const file = path.join(TMP, `${id}.${name}`);
+  if (!existsSync(file)) return res.status(404).json({ error: "file not found" });
+  res.sendFile(file);
+});
+
+function sanitizeJobOptions(opts) {
+  const keeps = Array.isArray(opts.keeps) ? opts.keeps : [];
+  return {
+    keeps: keeps.map((k) => ({
+      start: Math.max(0, Number(k.start) || 0),
+      end: Math.max(0, Number(k.end) || 0),
+    })).filter((k) => k.end > k.start),
+    ratio: ["16:9", "9:16", "1:1"].includes(opts.ratio) ? opts.ratio : "16:9",
+    speed: clamp(Number(opts.speed) || 1.0, 0.5, 2.0),
+    loudnorm: opts.loudnorm !== false,
+    transcribe: opts.transcribe !== false,
+    thumbnails: opts.thumbnails !== false,
+    thumbnailCount: clamp(parseInt(opts.thumbnailCount, 10) || 6, 1, 12),
+    language: sanitizeLang(opts.language),
+    model: sanitizeModel(opts.model),
+    fillerMode: sanitizeFillerMode(opts.fillerMode),
+  };
+}
+
+async function runJobPipeline(id, inputPath) {
+  const job = pipelineJobs.get(id);
+  if (!job) return;
+  job.status = "running";
+  job.startedAt = Date.now();
+
+  const editedPath = path.join(TMP, `${id}.edited.mp4`);
+  job.artifacts.push(editedPath);
+
+  // ── edit ──
+  await runStage(job, "edit", async () => {
+    if (job.options.keeps.length === 0) {
+      throw new Error("keeps 가 비어 있습니다 — 프론트에서 무음 감지 결과를 같이 보내주세요.");
+    }
+    const t0 = Date.now();
+    await processVideo(inputPath, editedPath, job.options);
+    const sizeBytes = (await stat(editedPath)).size;
+    return {
+      _path: editedPath,
+      url: `/api/jobs/${id}/files/edited.mp4`,
+      sizeBytes,
+      durationMs: Date.now() - t0,
+    };
+  });
+
+  if (job.stages.edit.status !== "done") {
+    job.status = computeJobStatus(job);
+    job.completedAt = Date.now();
+    try { await unlink(inputPath); } catch {}
+    return;
+  }
+
+  // 입력 원본 정리. 이후 stage 들은 editedPath 만 본다.
+  try { await unlink(inputPath); } catch {}
+
+  // ── transcribe ── (비치명적)
+  if (job.options.transcribe) {
+    await runStage(job, "transcribe", () => transcribeStageFor(job, editedPath));
+  } else {
+    job.stages.transcribe = { status: "skipped", note: "옵션 OFF" };
+  }
+
+  // ── thumbnail ── (비치명적)
+  if (job.options.thumbnails) {
+    await runStage(job, "thumbnail", () => thumbnailStageFor(job, editedPath));
+  } else {
+    job.stages.thumbnail = { status: "skipped", note: "옵션 OFF" };
+  }
+
+  // burn / metadata / upload — STUB_STAGES 라 newPipelineJob 에서 이미 skipped 로 세팅됨
+
+  job.status = computeJobStatus(job);
+  job.completedAt = Date.now();
+  console.log(`[job ${id}] complete: ${job.status}`);
+}
+
+async function retryJobStage(id, stage) {
+  const job = pipelineJobs.get(id);
+  if (!job) return;
+  const editedPath = path.join(TMP, `${id}.edited.mp4`);
+  if (stage === "transcribe") {
+    await runStage(job, "transcribe", () => transcribeStageFor(job, editedPath));
+  } else if (stage === "thumbnail") {
+    await runStage(job, "thumbnail", () => thumbnailStageFor(job, editedPath));
+  } else if (stage === "edit") {
+    return; // edit retry 는 input 원본이 필요한데 정리됐으므로 미지원 (재업로드 필요)
+  }
+  job.status = computeJobStatus(job);
+}
+
+async function runStage(job, name, fn) {
+  const t0 = Date.now();
+  job.stages[name] = { status: "running", startedAt: t0 };
+  try {
+    const result = await fn();
+    job.stages[name] = {
+      status: "done",
+      result,
+      startedAt: t0,
+      completedAt: Date.now(),
+    };
+    console.log(`[job ${job.id}] stage ${name} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.error(`[job ${job.id}] stage ${name} failed:`, e);
+    job.stages[name] = {
+      status: "failed",
+      error: friendlyTranscribeError(e),
+      startedAt: t0,
+      completedAt: Date.now(),
+    };
+  }
+}
+
+async function transcribeStageFor(job, editedPath) {
+  const result = await runTranscribe(editedPath, {
+    language: job.options.language,
+    model: job.options.model,
+    fillerMode: job.options.fillerMode,
+  });
+  // SRT/VTT 를 디스크에 떨어뜨리고 url 로 노출
+  const srtPath = path.join(TMP, `${job.id}.subtitles.srt`);
+  const vttPath = path.join(TMP, `${job.id}.subtitles.vtt`);
+  const { writeFile } = await import("fs/promises");
+  if (result.srt) await writeFile(srtPath, result.srt, "utf8");
+  if (result.vtt) await writeFile(vttPath, result.vtt, "utf8");
+  job.artifacts.push(srtPath, vttPath);
+  return {
+    ...result,
+    srtUrl: result.srt ? `/api/jobs/${job.id}/files/subtitles.srt` : null,
+    vttUrl: result.vtt ? `/api/jobs/${job.id}/files/subtitles.vtt` : null,
+  };
+}
+
+async function thumbnailStageFor(job, editedPath) {
+  const count = job.options.thumbnailCount || 6;
+  // 영상 길이를 빠르게 ffprobe 로 (ffmpeg 호출 파싱 대신 ffprobe 정확).
+  const dur = await probeDurationSec(editedPath);
+  const urls = [];
+  for (let i = 0; i < count; i++) {
+    // 시작/끝 10% 회피 후 균등 분포
+    const t = dur * 0.1 + (dur * 0.8 * (i + 0.5) / count);
+    const out = path.join(TMP, `${job.id}.thumb_${i}.jpg`);
+    await runFFmpeg([
+      "-ss", t.toFixed(2),
+      "-i", editedPath,
+      "-frames:v", "1",
+      "-q:v", "3",
+      "-vf", "scale=480:-2",
+      "-y", out,
+    ]);
+    job.artifacts.push(out);
+    urls.push(`/api/jobs/${job.id}/files/thumb_${i}.jpg`);
+  }
+  return { urls };
+}
+
+function probeDurationSec(file) {
+  return new Promise((resolve, reject) => {
+    const p = spawn("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      file,
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    p.stdout.on("data", (d) => { stdout += d.toString(); });
+    p.stderr.on("data", (d) => { stderr += d.toString(); });
+    p.on("error", reject);
+    p.on("exit", (code) => {
+      if (code === 0) resolve(parseFloat(stdout.trim()) || 0);
+      else reject(new Error(`ffprobe exit ${code}: ${stderr.slice(-200)}`));
+    });
+  });
 }
 
 app.listen(PORT, () => {
