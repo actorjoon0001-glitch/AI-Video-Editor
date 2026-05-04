@@ -193,8 +193,8 @@
           </p>
         </div>
 
-        <details class="advanced">
-          <summary>고급 설정</summary>
+        <details class="settings-card" open>
+          <summary>컷 편집 설정</summary>
           <div class="row">
             <label>무음 임계 dB
               <input type="range" id="silenceDb" min="-50" max="-20" step="1" value="-32" />
@@ -213,6 +213,10 @@
               <span id="shortLenVal">45 s</span>
             </label>
           </div>
+        </details>
+
+        <details class="settings-card" open>
+          <summary>오디오 / BGM 설정</summary>
           <label class="toggle">
             <input type="checkbox" id="loudnorm" checked />
             <span>음량 자동 정규화 (방송 표준 -16 LUFS)</span>
@@ -234,7 +238,10 @@
             </div>
             <p class="bgm-hint">BGM 추가 시 음성 구간에서 자동으로 음악이 작아집니다 (사이드체인 더킹).</p>
           </div>
+        </details>
 
+        <details class="settings-card" open>
+          <summary>안전 모드</summary>
           <label class="toggle">
             <input type="checkbox" id="safeMode" />
             <span>안전 모드 — 오디오 제거 + 효과 최소 (멈춤이 잦을 때만)</span>
