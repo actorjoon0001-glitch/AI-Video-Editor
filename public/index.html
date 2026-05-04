@@ -218,6 +218,16 @@
           <p class="bgm-hint" style="margin-top:8px">
             * 비디오만 컷·비율 변환합니다. atempo / loudnorm / BGM 비활성. 기본 fallback 체인이 모두 실패할 때 쓰는 마지막 수단.
           </p>
+          <div class="preset-row" style="margin-top:14px">
+            <span class="preset-label">필러 제거</span>
+            <button type="button" class="chip active" data-filler="off">OFF</button>
+            <button type="button" class="chip" data-filler="conservative">보수적</button>
+            <button type="button" class="chip" data-filler="aggressive">강하게</button>
+          </div>
+          <p class="bgm-hint" style="margin-top:6px">
+            * "어/음/엄/아" 같은 추임새를 word-level Whisper 로 찾아 무음 컷과 함께 제거합니다.
+            "강하게" 는 "그/그러니까/이제/약간/뭐/그냥" 까지 포함. 백엔드 호출 필요 (영상 전체 1회 업로드).
+          </p>
           <label class="toggle">
             <input type="checkbox" id="autoSubtitles" />
             <span>자동 자막 생성 — 편집 후 백엔드 Whisper 로 전사</span>
@@ -269,6 +279,15 @@
           <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트 내보내기</button>
           <a id="srtDownloadBtn" class="btn" download="subtitles.srt" hidden>SRT 자막</a>
           <a id="vttDownloadBtn" class="btn" download="subtitles.vtt" hidden>VTT 자막</a>
+        </div>
+
+        <div class="edit-plan" id="editPlanBlock" hidden>
+          <h4 class="thumbs-title">편집 계획 <span class="thumbs-hint">Whisper 분석 결과</span></h4>
+          <div class="edit-plan-summary" id="editPlanSummary"></div>
+          <details class="edit-plan-details">
+            <summary>상세 보기</summary>
+            <div id="editPlanDetails"></div>
+          </details>
         </div>
 
         <div class="thumbs-block" id="thumbsBlock" hidden>
