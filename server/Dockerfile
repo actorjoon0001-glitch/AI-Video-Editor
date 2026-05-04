@@ -24,8 +24,14 @@ ENV PYTHON_BIN="/opt/venv/bin/python3"
 # pip 업그레이드 → faster-whisper 설치 → 즉시 import 검증.
 # 빌드 단계에서 import 가 실패하면 도커 빌드가 즉시 중단되므로 옛 컨테이너가
 # 살아남을 일이 없다.
+#
+# requests 를 명시적으로 같이 설치한다 — faster-whisper 1.0.3 의 utils.py 가
+# 모듈 최상단에서 `import requests` 를 하지만, 자기 install_requires 에는 넣지
+# 않았다. 옛 huggingface-hub 가 transitive 로 끌어오던 시절엔 우연히 동작했지만,
+# 최신 huggingface-hub(1.x) 는 httpx 로 옮겨가서 requests 를 안 끌어오니까
+# `ModuleNotFoundError: No module named 'requests'` 가 import 시점에 터진다.
 RUN /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
- && /opt/venv/bin/pip install --no-cache-dir faster-whisper==1.0.3 \
+ && /opt/venv/bin/pip install --no-cache-dir faster-whisper==1.0.3 requests \
  && /opt/venv/bin/python3 -c "from faster_whisper import WhisperModel; print('faster-whisper import OK')"
 
 # 모델은 lazy download — small(~250MB) 프리다운로드는 Render Free 빌드/메모리에
