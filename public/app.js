@@ -832,29 +832,80 @@ async function detectSilencesWebAudio(file, noiseDb, minSilence) {
 // fillerMode 옵션과 함께 호출해 word-level + editPlan 을 받는다.
 async function fetchEditPlan(file, fillerMode) {
   if (!BACKEND_URL) throw new Error("백엔드 URL 미설정");
-  // 같은 헬스체크 캐시를 공유 — 자막 + 필러가 둘 다 켜져도 health 는 한 번만.
+  // 헬스체크 결과를 자막/필러 둘 다 공유 — 한 세션에 한 번만.
   const health = await checkBackendHealth();
-  if (!health.ok) {
-    throw new Error(`자막/필러 서버 연결 실패: ${health.error}`);
-  }
+  if (!health.ok) throw new Error(`자막/필러 서버 연결 실패: ${health.error}`);
+  // 비동기 jobs 패턴 + 폴링. 진행 안내는 인자로 받은 onProgress.
+  return runTranscribeJob(file, {
+    fillerMode,
+    onProgress: (msg) => setStatus(msg),
+  });
+}
+
+// 백엔드 비동기 transcribe job 등록 후 폴링.
+// 동기 /api/transcribe 가 Render Free 의 응답 timeout(30~60s)에 자주 끊어져서,
+// POST /api/transcribe/jobs → GET /api/transcribe/jobs/:id 패턴으로 전환.
+async function runTranscribeJob(file, { fillerMode = "off", model, onProgress } = {}) {
+  if (!BACKEND_URL) throw new Error("백엔드 URL 미설정");
+
+  // 1) 작업 등록 (multipart 업로드)
   const fd = new FormData();
   fd.append("video", file);
   fd.append("language", "ko");
-  fd.append("model", "small");
-  fd.append("fillerMode", fillerMode);
-  const r = await fetch(`${BACKEND_URL}/api/transcribe`, { method: "POST", body: fd });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    if (r.status === 404 && isRouteMissingResponse(t)) {
+  if (model) fd.append("model", model);
+  if (fillerMode && fillerMode !== "off") fd.append("fillerMode", fillerMode);
+
+  const startResp = await fetch(`${BACKEND_URL}/api/transcribe/jobs`, {
+    method: "POST",
+    body: fd,
+  });
+  if (!startResp.ok) {
+    const t = await startResp.text().catch(() => "");
+    if (startResp.status === 404 && isRouteMissingResponse(t)) {
       backendHealthCache = null;
       throw new Error(
-        "자막 서버 연결 실패: 백엔드 API URL 또는 배포 상태를 확인하세요. " +
-        "(/api/transcribe 라우트 없음 — Render 재배포 필요)"
+        "자막 서버 연결 실패: /api/transcribe/jobs 라우트 없음. " +
+        "백엔드 API URL 또는 배포 상태를 확인하세요. (Render 재배포 필요)"
       );
     }
-    throw new Error(`HTTP ${r.status}: ${t.slice(0, 200)}`);
+    throw new Error(`자막 작업 등록 실패: HTTP ${startResp.status} ${t.slice(0, 200)}`);
   }
-  return r.json();
+  const { jobId, pollIntervalMs = 2500 } = await startResp.json();
+  appendLog(`자막 작업 등록: ${jobId}`);
+
+  // 2) 폴링. 최대 5분 (영상 길이/모델에 따라 조정 가능).
+  const POLL_MS = Math.max(1500, pollIntervalMs);
+  const MAX_TOTAL_MS = 5 * 60 * 1000;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < MAX_TOTAL_MS) {
+    await new Promise((res) => setTimeout(res, POLL_MS));
+    let st;
+    try {
+      const sr = await fetch(`${BACKEND_URL}/api/transcribe/jobs/${jobId}`);
+      if (!sr.ok) {
+        if (sr.status === 404) {
+          throw new Error("자막 작업이 만료됐거나 존재하지 않습니다. 다시 시도해 주세요.");
+        }
+        throw new Error(`상태 조회 실패: HTTP ${sr.status}`);
+      }
+      st = await sr.json();
+    } catch (e) {
+      // 일시적 네트워크 오류 → 다음 polling 으로 넘어감 (절반은 견디고 절반은 throw)
+      console.warn("polling 일시 실패:", e);
+      continue;
+    }
+    if (st.status === "done") {
+      appendLog(`자막 완료: ${st.result?.segments?.length || 0}줄 · ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+      return st.result;
+    }
+    if (st.status === "error") {
+      throw new Error(st.error || "자막 생성 실패");
+    }
+    // pending / running
+    const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(0);
+    onProgress?.(`자막 생성 중 · 경과 ${elapsedSec}s · 모델 ${st.model || "?"}`);
+  }
+  throw new Error("자막 생성 timeout (5분 초과). 영상이 너무 길거나 모델이 너무 큽니다. 더 짧은 영상 또는 tiny 모델로 시도하세요.");
 }
 
 // 무음 컷 (silences) 과 필러 컷 (fillerCuts) 을 합쳐 시간순 정렬·중복 병합.
@@ -964,7 +1015,7 @@ async function maybeGenerateSubtitles(resultBlob) {
     return;
   }
 
-  // 사전 헬스체크. 라우트가 없으면 무거운 영상 업로드를 시작하지 않는다.
+  // 사전 헬스체크. /api/transcribe/jobs 라우트가 없으면 무거운 업로드를 시작하지 않는다.
   setStatus("자동 자막: 백엔드 헬스체크 중...");
   const health = await checkBackendHealth();
   if (!health.ok) {
@@ -974,41 +1025,26 @@ async function maybeGenerateSubtitles(resultBlob) {
     syncSubtitleButtons("백엔드 연결 실패 (배포 상태 확인 필요)");
     return;
   }
-  // routes 가 노출되면 transcribe 가 등록돼 있는지 직접 확인.
   if (Array.isArray(health.routes)) {
-    const has = health.routes.some((r) => r.path === "/api/transcribe" && r.method === "POST");
+    const has = health.routes.some(
+      (r) => r.path === "/api/transcribe/jobs" && r.method === "POST"
+    );
     if (!has) {
-      const msg = "자막 서버는 살아있지만 /api/transcribe 라우트가 없음. " +
+      const msg = "자막 서버는 살아있지만 /api/transcribe/jobs 라우트가 없음. " +
         "백엔드(Render) 가 옛 컨테이너로 돌고 있을 가능성 — 강제 재배포 필요.";
       appendLog(msg);
       setStatus(msg);
-      syncSubtitleButtons("/api/transcribe 라우트 없음 (백엔드 재배포 필요)");
+      syncSubtitleButtons("자막 jobs 라우트 없음 (백엔드 재배포 필요)");
       return;
     }
   }
 
-  setStatus("자동 자막 생성 중 (백엔드 Whisper)...");
+  setStatus("자동 자막: 작업 등록 중...");
   let result;
   try {
-    const fd = new FormData();
-    fd.append("video", resultBlob, "edited.mp4");
-    fd.append("language", "ko");
-    fd.append("model", "small");
-    const r = await fetch(`${BACKEND_URL}/api/transcribe`, { method: "POST", body: fd });
-    if (!r.ok) {
-      const errText = await r.text().catch(() => "");
-      // Express 가 라우트 미존재 시 "Cannot POST /api/transcribe" HTML 을 돌려줌.
-      // 그 텍스트를 그대로 노출하지 않고 한국어 안내로 바꿔준다.
-      if (r.status === 404 && isRouteMissingResponse(errText)) {
-        backendHealthCache = null; // 다음 시도 때 다시 확인
-        throw new Error(
-          "자막 서버 연결 실패: 백엔드 API URL 또는 배포 상태를 확인하세요. " +
-          "(/api/transcribe 라우트가 등록되지 않음 — Render 재배포 필요)"
-        );
-      }
-      throw new Error(`HTTP ${r.status}: ${errText.slice(0, 300)}`);
-    }
-    result = await r.json();
+    result = await runTranscribeJob(resultBlob, {
+      onProgress: (msg) => setStatus(msg),
+    });
   } catch (e) {
     console.error("자동 자막 실패:", e);
     appendLog(`자동 자막 실패: ${e?.message || e}`);
