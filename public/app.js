@@ -34,7 +34,11 @@ const BACKEND_URL = localStorage.getItem("backendUrl") || DEFAULT_BACKEND_URL;
 
 // jsDelivr 는 cross-origin 리소스에 적절한 CORP 헤더를 일관되게 보냄.
 // unpkg 보다 ffmpeg.wasm 로드 호환성이 높음.
-const FFMPEG_CORE_BASE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/umd";
+// mt = multi-thread (기본, SharedArrayBuffer 필요), st = single-thread (fallback).
+const FFMPEG_CORE_MT = "https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.6/dist/umd";
+const FFMPEG_CORE_ST = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd";
+// 하위 호환 (이미 다른 곳에서 참조될 수 있어 alias 유지)
+const FFMPEG_CORE_BASE = FFMPEG_CORE_MT;
 
 // ── DOM ──────────────────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -63,6 +67,7 @@ const bgmStatusEl = $("bgmStatus");
 
 // ── State ────────────────────────────────────────────────────────────────────
 let ffmpeg = null;
+let ffmpegEngine = null; // "mt" | "st"
 let pickedFile = null;
 let pickedDuration = 0;
 let lastKeeps = [];
@@ -133,37 +138,51 @@ function applyPreset(name) {
 }
 
 // ── ffmpeg.wasm 로드 ─────────────────────────────────────────────────────────
-async function ensureFFmpeg() {
-  if (ffmpeg) return ffmpeg;
-  if (!window.crossOriginIsolated) {
-    throw new Error(
-      "이 페이지가 cross-origin isolated 상태가 아닙니다. " +
-      "Netlify 배포본에서 시도해 주세요. (로컬 정적 서버는 COOP/COEP 헤더가 필요)"
-    );
+async function ensureFFmpeg(engine = "mt") {
+  if (ffmpeg && ffmpegEngine === engine) return ffmpeg;
+  // 다른 엔진 요청 시 기존 인스턴스 폐기
+  if (ffmpeg) {
+    try { ffmpeg.terminate?.(); } catch {}
+    ffmpeg = null;
+    ffmpegEngine = null;
+  }
+  // mt 는 cross-origin isolated 필수, st 는 불필요. 페이지가 isolated 면 mt 부터 시도.
+  if (engine === "mt" && !window.crossOriginIsolated) {
+    // 페이지가 isolated 가 아니면 자동으로 st 로 강등
+    engine = "st";
   }
   setStep("load");
-  setStatus("ffmpeg 엔진 로드 중... (최초 1회, ~30MB)");
+  setStatus(`ffmpeg 엔진 로드 중... (${engine === "mt" ? "멀티스레드" : "싱글스레드"}, 최초 1회 ~30MB)`);
   const instance = new FFmpeg();
   instance.on("log", ({ message }) => appendLog(message));
-  // 주의: 전역 progress 핸들러를 두지 않는다. 인코딩 단계에서 직접 시간 기반으로 추적.
-  // ffmpeg.wasm 의 progress 이벤트는 복잡한 필터 그래프에서 0↔1 을 오가며 튀는 경향이 있어
-  // 우리의 time= 파싱 진행률과 충돌해 바가 갑자기 0% 로 보이는 문제 유발.
+  const base = engine === "mt" ? FFMPEG_CORE_MT : FFMPEG_CORE_ST;
   try {
-    const [coreURL, wasmURL, workerURL] = await Promise.all([
-      toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
-      toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
-      toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.worker.js`, "text/javascript"),
-    ]);
-    await instance.load({ coreURL, wasmURL, workerURL });
+    if (engine === "mt") {
+      const [coreURL, wasmURL, workerURL] = await Promise.all([
+        toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript"),
+        toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm"),
+        toBlobURL(`${base}/ffmpeg-core.worker.js`, "text/javascript"),
+      ]);
+      await instance.load({ coreURL, wasmURL, workerURL });
+    } else {
+      // 싱글스레드 코어는 worker 없이 로드. 더 느리지만 deadlock 가능성 낮음.
+      const [coreURL, wasmURL] = await Promise.all([
+        toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript"),
+        toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm"),
+      ]);
+      await instance.load({ coreURL, wasmURL });
+    }
   } catch (e) {
     // 로드 실패 시 다음 시도가 깨끗하게 다시 시작하도록 인스턴스 폐기
     ffmpeg = null;
+    ffmpegEngine = null;
     throw new Error(
       "ffmpeg 엔진 로드 실패: " + (e?.message || e) +
       "\n네트워크 또는 CDN 차단(광고 차단기/회사 방화벽) 가능성. 새로고침 후 다시 시도해 주세요."
     );
   }
   ffmpeg = instance;
+  ffmpegEngine = engine;
   doneStep("load");
   return ffmpeg;
 }
@@ -271,8 +290,65 @@ resetBtn.addEventListener("click", () => {
 
 runBtn.addEventListener("click", () => {
   const useServer = $("serverMode")?.checked && BACKEND_URL;
-  (useServer ? runServerPipeline() : runPipeline()).catch(onError);
+  // 사용자가 명시적으로 안전 모드를 켰으면 fallback 체인 건너뛰고 바로 안전 모드.
+  const userSafe = $("safeMode")?.checked === true;
+  (useServer
+    ? runServerPipeline()
+    : runWithFallback({ userSafe })
+  ).catch(onError);
 });
+
+// fallback 체인:
+//   1) core-mt (멀티스레드, 빠름) → 20초 hang 시
+//   2) core (싱글스레드, 안정) → 20초 hang 시
+//   3) 안전 모드(-an + 효과 최소) 로 core-mt 재시도 → hang 시
+//   4) Render 백엔드 fallback
+// 사용자가 처음부터 안전 모드를 켰으면 1·2·3 단계 중 안전 모드만 시도 후 4로 직행.
+async function runWithFallback({ userSafe = false } = {}) {
+  if (userSafe) {
+    appendLog("[fallback] 사용자 지정 안전 모드 (오디오 제거)로 시도");
+    try {
+      await runPipeline({ engine: "mt", safeMode: true });
+      return;
+    } catch (e) {
+      if (!(e instanceof EngineHangError)) throw e;
+      appendLog(`[fallback] 안전 모드 멈춤 → 백엔드로 전환`);
+      if (BACKEND_URL) return runServerPipeline();
+      throw new Error("브라우저 모드가 모두 멈췄고 백엔드 URL 도 없습니다.");
+    }
+  }
+
+  // 1) core-mt
+  try {
+    await runPipeline({ engine: "mt", safeMode: false });
+    return;
+  } catch (e) {
+    if (!(e instanceof EngineHangError)) throw e;
+    appendLog(`[fallback] ${e.engine} 멈춤 → 싱글스레드 코어로 재시도`);
+  }
+
+  // 2) core (single-thread)
+  try {
+    await runPipeline({ engine: "st", safeMode: false });
+    return;
+  } catch (e) {
+    if (!(e instanceof EngineHangError)) throw e;
+    appendLog(`[fallback] 싱글스레드도 멈춤 → 안전 모드(오디오 제거)로 재시도`);
+  }
+
+  // 3) 안전 모드 + mt
+  try {
+    await runPipeline({ engine: "mt", safeMode: true });
+    return;
+  } catch (e) {
+    if (!(e instanceof EngineHangError)) throw e;
+    appendLog(`[fallback] 안전 모드도 멈춤 → 백엔드로 전환`);
+  }
+
+  // 4) backend
+  if (BACKEND_URL) return runServerPipeline();
+  throw new Error("브라우저 모드 3단계가 모두 멈췄고 백엔드 URL 도 없습니다.");
+}
 
 // ── 백엔드 파이프라인 ────────────────────────────────────────────────────────
 async function runServerPipeline() {
@@ -378,16 +454,21 @@ async function runServerPipeline() {
 }
 
 // ── 파이프라인 ───────────────────────────────────────────────────────────────
-async function runPipeline() {
+// engine: "mt" (default, 멀티스레드 core-mt) 또는 "st" (싱글스레드 core, fallback)
+// safeMode: true 면 오디오 트랙 자체를 버려서(-an) 오디오 필터 deadlock 회피
+async function runPipeline({ engine = "mt", safeMode = false } = {}) {
   if (!pickedFile) return;
   runBtn.disabled = true;
   resultSection.hidden = true;
   progress.hidden = false;
-  logEl.textContent = "";
-  resetSteps();
+  // 첫 시도가 아니면 로그를 비우지 않고 누적 → fallback 시 디버깅에 유용
+  if (engine === "mt" && !safeMode) {
+    logEl.textContent = "";
+    resetSteps();
+  }
   setBar(0);
 
-  const ff = await ensureFFmpeg();
+  const ff = await ensureFFmpeg(engine);
   const inName = "input" + extOf(pickedFile.name);
   const outName = "output.mp4";
 
@@ -451,12 +532,16 @@ async function runPipeline() {
   // 컷 + 비율 + 속도 + BGM + 정규화
   setStep("encode");
   const cutTotal = pickedDuration - keeps.reduce((a, k) => a + (k.end - k.start), 0);
+  // 안전 모드: 오디오 deadlock 의 흔한 원인(atempo·loudnorm·sidechain·BGM)을
+  // 한 번에 끈다. -an 까지 적용되면 오디오 트랙이 아예 없어져 worker 가 막힐
+  // 여지가 사실상 사라진다.
   const encodeOpts = {
     ratio: state.ratio,
-    speed: state.speed,
-    bgmName: bgmFile ? "bgm" + extOf(bgmFile.name) : null,
+    speed: safeMode ? 1.0 : state.speed,
+    bgmName: safeMode ? null : (bgmFile ? "bgm" + extOf(bgmFile.name) : null),
     bgmVolDb: parseFloat($("bgmVol").value),
-    loudnorm: $("loudnorm").checked,
+    loudnorm: safeMode ? false : $("loudnorm").checked,
+    noAudio: safeMode, // 안전 모드 = 오디오 완전 제거
   };
   const encodeStart = Date.now();
 
@@ -765,25 +850,26 @@ async function pickHighlightWindow(ff, inName, duration, targetLen) {
 //  C. 합쳐진 단일 파일에 ratio/speed/loudnorm/BGM 을 한 번만 적용
 // 각 단계의 ffmpeg 호출은 필터 그래프가 단순해 worker init 병목이 사라진다.
 async function applyCutsAndRatio(ff, inName, outName, keeps, opts, onStage) {
-  const { ratio, speed, bgmName, bgmVolDb, loudnorm } = opts;
+  const { ratio, speed, bgmName, bgmVolDb, loudnorm, noAudio } = opts;
   const ratioFilter = ratioToFilter(ratio);
 
   const segFiles = [];
-  // 단계 A: 컷 분리 (-c copy)
+  // 단계 A: 컷 분리 (-c copy). 필터·재인코딩 없음 — 가장 안전한 형태.
+  // 안전 모드에선 -an 추가로 오디오 트랙도 버린다.
   for (let i = 0; i < keeps.length; i++) {
     onStage?.({ phase: "segment", current: i + 1, total: keeps.length });
     const seg = `seg_${String(i).padStart(4, "0")}.mp4`;
     const { start, end } = keeps[i];
-    // -ss/-to 를 -i 앞에 둬서 keyframe 스냅 + 빠른 시크.
-    // -avoid_negative_ts make_zero 로 세그먼트 PTS 를 0 부터 다시 시작.
-    await execWithWatchdog(ff, [
+    const segArgs = [
       "-ss", start.toFixed(3),
       "-to", end.toFixed(3),
       "-i", inName,
       "-c", "copy",
       "-avoid_negative_ts", "make_zero",
-      "-y", seg,
-    ]);
+    ];
+    if (noAudio) segArgs.push("-an");
+    segArgs.push("-y", seg);
+    await execWithWatchdog(ff, segArgs);
     segFiles.push(seg);
   }
 
@@ -791,27 +877,35 @@ async function applyCutsAndRatio(ff, inName, outName, keeps, opts, onStage) {
   onStage?.({ phase: "concat" });
   const list = segFiles.map((f) => `file '${f}'`).join("\n");
   await ff.writeFile("concat_list.txt", new TextEncoder().encode(list));
-  await execWithWatchdog(ff, [
+  const concatArgs = [
     "-f", "concat",
     "-safe", "0",
     "-i", "concat_list.txt",
     "-c", "copy",
-    "-y", "joined.mp4",
-  ]);
+  ];
+  if (noAudio) concatArgs.push("-an");
+  concatArgs.push("-y", "joined.mp4");
+  await execWithWatchdog(ff, concatArgs);
 
   // 단계 C: 효과 적용 (ratio/speed/loudnorm/BGM)
   onStage?.({ phase: "effects" });
   const speedV = speed === 1.0 ? null : `setpts=${(1 / speed).toFixed(4)}*PTS`;
-  const speedA = speed === 1.0 ? null : atempoChain(speed);
+  // 오디오 체인은 noAudio 이면 모두 무시.
+  const speedA = (noAudio || speed === 1.0) ? null : atempoChain(speed);
   let vChain = ratioFilter;
   if (speedV) vChain += `,${speedV}`;
   let aChain = "";
-  if (speedA && speedA !== "anull") aChain = speedA;
-  if (loudnorm) aChain = (aChain ? aChain + "," : "") + "loudnorm=I=-16:LRA=11:TP=-1.5";
+  if (!noAudio) {
+    if (speedA && speedA !== "anull") aChain = speedA;
+    if (loudnorm) aChain = (aChain ? aChain + "," : "") + "loudnorm=I=-16:LRA=11:TP=-1.5";
+  }
 
   let effectsArgs;
-  if (!bgmName) {
-    // 단순한 -vf / -af 경로. filter_complex 회피.
+  if (noAudio) {
+    // 안전 모드: 비디오만 처리, 오디오 트랙 없음. 가장 단순한 경로.
+    effectsArgs = ["-i", "joined.mp4", "-vf", vChain, "-an"];
+  } else if (!bgmName) {
+    // 일반 경로: -vf / -af 단순 사용. filter_complex 회피.
     effectsArgs = ["-i", "joined.mp4", "-vf", vChain];
     if (aChain) effectsArgs.push("-af", aChain);
   } else {
@@ -834,10 +928,9 @@ async function applyCutsAndRatio(ff, inName, outName, keeps, opts, onStage) {
   }
   effectsArgs.push(
     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-    "-c:a", "aac", "-b:a", "160k",
-    "-movflags", "+faststart",
-    "-y", outName,
   );
+  if (!noAudio) effectsArgs.push("-c:a", "aac", "-b:a", "160k");
+  effectsArgs.push("-movflags", "+faststart", "-y", outName);
   await execWithWatchdog(ff, effectsArgs);
 
   // 정리
@@ -849,6 +942,16 @@ async function applyCutsAndRatio(ff, inName, outName, keeps, opts, onStage) {
 // 20초 동안 log/progress 가 없으면 worker hang 으로 보고 ffmpeg.wasm 인스턴스를
 // 강제 종료. 다음 호출에서 ensureFFmpeg() 가 새 인스턴스를 만든다.
 const HANG_TIMEOUT_MS = 20_000;
+
+// fallback chain (mt → st → backend) 가 잡을 수 있는 전용 에러.
+class EngineHangError extends Error {
+  constructor(engine) {
+    super(`ffmpeg ${engine} engine hung for ${HANG_TIMEOUT_MS / 1000}s`);
+    this.name = "EngineHangError";
+    this.engine = engine;
+  }
+}
+
 async function execWithWatchdog(ff, args) {
   let lastActivity = Date.now();
   const tap = () => { lastActivity = Date.now(); };
@@ -860,19 +963,18 @@ async function execWithWatchdog(ff, args) {
       killed = true;
       clearInterval(watchdog);
       try { ff.terminate?.(); } catch {}
-      ffmpeg = null; // 다음 시도가 깨끗하게 다시 로드
+      const hungEngine = ffmpegEngine;
+      ffmpeg = null;
+      ffmpegEngine = null;
+      // exec 의 promise 가 자체적으로 reject 되는데, killed 플래그로 식별 후
+      // EngineHangError 로 다시 throw 한다.
+      ff._hungEngine = hungEngine; // catch 에서 참조
     }
   }, 1000);
   try {
     await ff.exec(args);
   } catch (e) {
-    if (killed) {
-      throw new Error(
-        "브라우저 ffmpeg 가 20초간 진행이 없어 중단됐습니다. " +
-        "세부 설정의 '고속 모드'(외부 서버) 를 켜고 다시 시도해 주세요. " +
-        "긴 영상이거나 BGM·loudnorm 조합이면 브라우저 인코딩이 부담입니다."
-      );
-    }
+    if (killed) throw new EngineHangError(ff._hungEngine || "unknown");
     throw e;
   } finally {
     clearInterval(watchdog);

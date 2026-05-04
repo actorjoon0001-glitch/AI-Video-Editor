@@ -211,6 +211,13 @@
           <p class="bgm-hint" id="serverModeHint" style="margin-top:8px">
             * 영상이 일시적으로 서버를 거칩니다 (HTTPS 전송, 처리 직후 1시간 내 자동 삭제). 백엔드 URL 설정 필요.
           </p>
+          <label class="toggle">
+            <input type="checkbox" id="safeMode" />
+            <span>안전 모드 — 오디오 제거 + 효과 최소 (멈춤이 잦을 때)</span>
+          </label>
+          <p class="bgm-hint" style="margin-top:8px">
+            * 비디오만 컷·비율 변환합니다. atempo / loudnorm / BGM 비활성. 기본 fallback 체인이 모두 실패할 때 쓰는 마지막 수단.
+          </p>
         </details>
 
         <div class="row btn-row">
