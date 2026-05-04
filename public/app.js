@@ -78,11 +78,12 @@ let originalUrl = null;
 let previewMode = "edited"; // "edited" | "original"
 let bgmFile = null;
 let thumbUrls = [];
-// 자막 관련 (SRT/VTT 본문 + Blob URL). 미리보기 <track> + 다운로드 링크에 공유.
-let subtitleSrt = "";
-let subtitleVtt = "";
-let subtitleVttUrl = null;
+// 자막 상태. <track> 부착 + 다운로드 버튼 + 디버그용 JSON 전체를 한 곳에서 관리.
+let subtitleSrtText = "";
+let subtitleVttText = "";
+let subtitleJson = null;     // /api/transcribe 응답 전체 (segments / words / language ...)
 let subtitleSrtUrl = null;
+let subtitleVttUrl = null;
 
 const state = {
   preset: "standard",
@@ -238,9 +239,10 @@ function handleFiles(files) {
     setStatus("영상 파일이 아닙니다.");
     return;
   }
-  // 이전 선택의 미리보기 URL 정리 (메모리 누수 방지).
+  // 이전 선택의 미리보기 URL + 자막 상태 정리 (메모리 누수 방지).
   if (originalUrl) { URL.revokeObjectURL(originalUrl); originalUrl = null; }
   if (outputUrl) { URL.revokeObjectURL(outputUrl); outputUrl = null; }
+  resetSubtitleState();
 
   pickedFiles = accepted;
   pickedFile = accepted[0]; // 단일 호환 별칭 — 파이프라인은 pickedFiles 를 본다.
@@ -904,9 +906,13 @@ function renderEditPlan() {
 async function maybeGenerateSubtitles(resultBlob) {
   resetSubtitleState();
   const enabled = $("autoSubtitles")?.checked === true;
-  if (!enabled) return;
+  if (!enabled) {
+    syncSubtitleButtons(); // 비활성 상태 그대로 유지
+    return;
+  }
   if (!BACKEND_URL) {
     appendLog("자동 자막: 백엔드 URL 이 설정돼 있지 않아 건너뜀");
+    syncSubtitleButtons("백엔드 URL 미설정");
     return;
   }
 
@@ -924,47 +930,52 @@ async function maybeGenerateSubtitles(resultBlob) {
     }
     result = await r.json();
   } catch (e) {
+    console.error("자동 자막 실패:", e);
     appendLog(`자동 자막 실패: ${e?.message || e}`);
     setStatus(`자막 생성 실패 (영상은 정상 출력됨): ${e?.message || e}`);
+    syncSubtitleButtons(`실패: ${e?.message || e}`);
     return;
   }
 
-  subtitleSrt = result.srt || "";
-  subtitleVtt = result.vtt || "";
-  appendLog(`자막 ${result.segments?.length || 0}줄 · ${(result.durationMs / 1000).toFixed(1)}s`);
+  // /api/transcribe 응답 검증 + 상태 저장
+  subtitleJson = result;
+  subtitleSrtText = (result.srt || "").trim();
+  subtitleVttText = (result.vtt || "").trim();
+  appendLog(
+    `자막 ${result.segments?.length || 0}줄 · ` +
+    `SRT ${subtitleSrtText.length}바이트 · VTT ${subtitleVttText.length}바이트 · ` +
+    `${((result.durationMs || 0) / 1000).toFixed(1)}s`
+  );
 
-  // 다운로드 링크
-  if (subtitleSrt) {
-    if (subtitleSrtUrl) URL.revokeObjectURL(subtitleSrtUrl);
-    subtitleSrtUrl = URL.createObjectURL(new Blob([subtitleSrt], { type: "text/plain;charset=utf-8" }));
-    const a = $("srtDownloadBtn");
-    a.href = subtitleSrtUrl;
-    a.hidden = false;
+  // SRT Blob URL — application/x-subrip 가 정확. 일부 브라우저는 알 수 없는 MIME 일 때
+  // download attr 를 무시하므로 명시적으로 지정.
+  if (subtitleSrtText.length > 0) {
+    subtitleSrtUrl = URL.createObjectURL(
+      new Blob([subtitleSrtText], { type: "application/x-subrip;charset=utf-8" })
+    );
   }
-  if (subtitleVtt) {
-    if (subtitleVttUrl) URL.revokeObjectURL(subtitleVttUrl);
-    subtitleVttUrl = URL.createObjectURL(new Blob([subtitleVtt], { type: "text/vtt;charset=utf-8" }));
-    const a = $("vttDownloadBtn");
-    a.href = subtitleVttUrl;
-    a.hidden = false;
+  if (subtitleVttText.length > 0) {
+    subtitleVttUrl = URL.createObjectURL(
+      new Blob([subtitleVttText], { type: "text/vtt;charset=utf-8" })
+    );
     attachVttTrack(subtitleVttUrl);
   }
+  syncSubtitleButtons();
 
   // 번인 옵션
   const burn = $("burnSubtitles")?.checked === true;
-  if (burn && subtitleSrt) {
+  if (burn && subtitleSrtText.length > 0) {
     setStatus("자막 번인 중 (백엔드 ffmpeg)...");
     try {
       const fd = new FormData();
       fd.append("video", resultBlob, "edited.mp4");
-      fd.append("srt", subtitleSrt);
+      fd.append("srt", subtitleSrtText);
       const r = await fetch(`${BACKEND_URL}/api/burn-subtitles`, { method: "POST", body: fd });
       if (!r.ok) {
         const errText = await r.text().catch(() => "");
         throw new Error(`HTTP ${r.status}: ${errText.slice(0, 300)}`);
       }
       const burnedBlob = await r.blob();
-      // 결과 영상을 번인본으로 교체
       if (outputUrl) URL.revokeObjectURL(outputUrl);
       outputUrl = URL.createObjectURL(burnedBlob);
       setPreviewMode("edited");
@@ -973,38 +984,109 @@ async function maybeGenerateSubtitles(resultBlob) {
       dl.download = (dl.download || "edited.mp4").replace(/\.mp4$/, "-subtitled.mp4");
       appendLog("번인 완료 — 편집본을 자막 합성본으로 교체");
     } catch (e) {
+      console.error("번인 실패:", e);
       appendLog(`번인 실패 (자막은 정상 생성됨): ${e?.message || e}`);
     }
   }
 }
 
-function resetSubtitleState() {
-  subtitleSrt = "";
-  subtitleVtt = "";
-  if (subtitleSrtUrl) { URL.revokeObjectURL(subtitleSrtUrl); subtitleSrtUrl = null; }
-  if (subtitleVttUrl) { URL.revokeObjectURL(subtitleVttUrl); subtitleVttUrl = null; }
-  const srtBtn = $("srtDownloadBtn"); if (srtBtn) srtBtn.hidden = true;
-  const vttBtn = $("vttDownloadBtn"); if (vttBtn) vttBtn.hidden = true;
-  // 비디오 element 의 기존 track 제거
-  resultVideo.querySelectorAll("track").forEach((t) => t.remove());
+// 버튼 표시 상태 동기화. 항상 보이지만 자막이 없을 때는 disabled.
+// 클릭은 별도 핸들러(setupSubtitleButtonClicks) 가 잡는다 — href + download 만으로는
+// 일부 케이스에서 동작하지 않는 것을 본 적이 있어 명시적 a.click() 트리거를 추가.
+function syncSubtitleButtons(reasonNote) {
+  const set = (btnId, url, defaultName) => {
+    const a = $(btnId);
+    if (!a) return;
+    a.hidden = false; // 항상 노출. 비활성은 클래스로.
+    if (url) {
+      a.href = url;
+      a.setAttribute("download", defaultName);
+      a.classList.remove("disabled");
+      a.setAttribute("aria-disabled", "false");
+      a.removeAttribute("title");
+    } else {
+      a.removeAttribute("href");
+      a.classList.add("disabled");
+      a.setAttribute("aria-disabled", "true");
+      a.title = reasonNote || "자막 생성 안 됨 (자동 자막 ON 후 다시 시도)";
+    }
+  };
+  set("srtDownloadBtn", subtitleSrtUrl, "subtitles.srt");
+  set("vttDownloadBtn", subtitleVttUrl, "subtitles.vtt");
 }
 
+// 페이지 로드 시 한 번만 등록. <a download> 만으로 동작이 안 보이는 환경(예: SW 가
+// 같은 출처 fetch 를 가로챈 페이지)에서 명시적으로 a.click() 을 다시 호출하거나
+// 동적으로 일회용 anchor 를 만들어 다운로드를 강제한다.
+function setupSubtitleButtonClicks() {
+  const handler = (kind) => (e) => {
+    const url = kind === "srt" ? subtitleSrtUrl : subtitleVttUrl;
+    if (!url) {
+      e.preventDefault();
+      console.warn(`${kind.toUpperCase()} 자막이 아직 생성되지 않음`);
+      return;
+    }
+    // 기본 동작이 막히는 환경 대비 — 일회용 anchor 로 강제 다운로드.
+    e.preventDefault();
+    const tmp = document.createElement("a");
+    tmp.href = url;
+    tmp.download = kind === "srt" ? "subtitles.srt" : "subtitles.vtt";
+    tmp.rel = "noopener";
+    document.body.appendChild(tmp);
+    tmp.click();
+    setTimeout(() => tmp.remove(), 0);
+  };
+  $("srtDownloadBtn")?.addEventListener("click", handler("srt"));
+  $("vttDownloadBtn")?.addEventListener("click", handler("vtt"));
+}
+setupSubtitleButtonClicks();
+// 초기 진입 시점에 비활성 상태로 표시.
+syncSubtitleButtons();
+
+function resetSubtitleState() {
+  subtitleSrtText = "";
+  subtitleVttText = "";
+  subtitleJson = null;
+  if (subtitleSrtUrl) { URL.revokeObjectURL(subtitleSrtUrl); subtitleSrtUrl = null; }
+  if (subtitleVttUrl) { URL.revokeObjectURL(subtitleVttUrl); subtitleVttUrl = null; }
+  // 비디오 element 의 기존 track 제거
+  resultVideo.querySelectorAll("track").forEach((t) => t.remove());
+  syncSubtitleButtons();
+}
+
+// VTT track 부착. <video crossorigin="anonymous"> + blob: URL 조합에서 일부 브라우저가
+// 늦게 추가된 track 의 mode 를 "hidden" 으로 두고 안 그리는 케이스가 있어, load 이벤트
+// + textTracks 폴링을 모두 건다. 또한 video 가 이미 src 를 가진 상태에서 track 만 붙이면
+// 무시되는 경우가 있어 video.load() 로 강제 재해석.
 function attachVttTrack(vttUrl) {
   resultVideo.querySelectorAll("track").forEach((t) => t.remove());
   const track = document.createElement("track");
   track.kind = "subtitles";
-  track.label = "자동 자막 (한국어)";
+  track.label = "한국어";
   track.srclang = "ko";
   track.src = vttUrl;
   track.default = true;
+  // load 이벤트 시 강제로 showing 으로 설정 (default 무시되는 브라우저 대응)
+  track.addEventListener("load", () => {
+    if (track.track) track.track.mode = "showing";
+  });
   resultVideo.appendChild(track);
-  // 일부 브라우저는 default 만으로 활성화되지 않음 → 직접 활성.
-  setTimeout(() => {
+  // 비디오에 이미 src 가 적용된 상태라면 재해석 트리거 (현재 위치 보존).
+  const t = resultVideo.currentTime;
+  resultVideo.load();
+  if (Number.isFinite(t) && t > 0) {
+    resultVideo.addEventListener("loadedmetadata", () => { resultVideo.currentTime = t; }, { once: true });
+  }
+  // 백업: 짧은 폴링으로 1초 안에 mode=showing 강제.
+  let tries = 0;
+  const tick = () => {
     const tracks = resultVideo.textTracks;
     for (let i = 0; i < tracks.length; i++) {
-      tracks[i].mode = "showing";
+      if (tracks[i].mode !== "showing") tracks[i].mode = "showing";
     }
-  }, 100);
+    if (tries++ < 10) setTimeout(tick, 100);
+  };
+  tick();
 }
 
 async function processOnBackend(file, opts, onProgress) {
