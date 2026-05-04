@@ -1,17 +1,25 @@
-# AI Video Editor (CapCut 연동)
+# AI Video Editor — YouTube 자동 발행 파이프라인
 
-YouTube 업로드용 영상 자동 편집기. 영상 소스를 입력하면 무음 구간을 자동으로 잘라내고, 자막을 생성한 뒤 **CapCut 드래프트 파일**로 저장합니다. CapCut에서 그 드래프트를 열어 최종 조정만 하면 됩니다.
+영상 한 개를 던지면 **컷 편집 → 자막 → 제목/설명/태그 → 썸네일 → YouTube 업로드** 까지
+끝내는 도구 모음입니다.
 
-## 동작 원리
+## 두 가지 사용 모드
+
+### A. 브라우저 에디터 (`public/`)
+드래그 앤 드롭으로 무음 컷 + 비율 변환 + 썸네일 추출. 브라우저 안에서만 동작 (업로드 없음).
+ffmpeg.wasm 기반. 결과물을 mp4 로 받아서 다음 단계로.
+
+### B. CLI 파이프라인 (`auto_editor/`)
+헤드리스 자동화용. Whisper 자막 → Claude 메타데이터 → 썸네일 합성 → YouTube 업로드.
+n8n 으로 묶어 무인 발행 가능 (`n8n/youtube-pipeline.json`).
 
 ```
-입력 영상  ─► 무음 분석 (ffmpeg silencedetect)
-            ─► 음성 인식 (faster-whisper)
-            ─► CapCut 드래프트 생성 (draft_content.json)
-            ─► CapCut에서 열기 → 컷/자막 자동 적용된 상태
+원본 영상  ─►  prep        (무음 컷 + 자막 → CapCut 드래프트)
+            ─►  CapCut에서 마무리 export → 최종 mp4
+            ─►  metadata    (Claude → 제목/설명/태그/썸네일 카피)
+            ─►  thumbnail   (영상 프레임 + 카피 → PNG 1280x720)
+            ─►  publish     (YouTube Data API v3 업로드)
 ```
-
-CapCut의 드래프트 폴더에 직접 써 넣으므로, CapCut 앱을 켜면 새 프로젝트로 바로 보입니다.
 
 ## 설치
 
@@ -21,44 +29,86 @@ source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-ffmpeg가 시스템에 설치되어 있어야 합니다.
+ffmpeg / ffprobe 는 시스템에 설치돼 있어야 합니다.
 - macOS: `brew install ffmpeg`
 - Windows: <https://ffmpeg.org/download.html>
 
-## 사용법
+### 필요한 키
+
+| 무엇 | 어디 | 환경 변수 / 파일 |
+|---|---|---|
+| Claude API | <https://console.anthropic.com> | `ANTHROPIC_API_KEY` |
+| YouTube 업로드 | Google Cloud Console → OAuth 2.0 Client ID (Desktop) | `client_secrets.json` |
+
+## 명령 한눈에 보기
 
 ```bash
-python -m auto_editor edit \
-    --input ./my_clip.mp4 \
-    --project-name "내 유튜브 영상" \
-    --silence-db -32 \
-    --min-silence 0.6 \
-    --whisper-model small \
-    --language ko
+# 1단계: 원본 영상 → CapCut 드래프트 (무음 컷 + 자막)
+python -m auto_editor prep --input ./raw.mp4 --project-name "ep-12"
+
+# (CapCut에서 미세 조정 후 export → ./final.mp4)
+
+# 2단계: 메타데이터 생성
+export ANTHROPIC_API_KEY=sk-ant-...
+python -m auto_editor metadata \
+    --input ./final.mp4 \
+    --persona "B2B SaaS 마케팅, 차분하고 실용적" \
+    --out ./metadata.json
+
+# 3단계: 썸네일 생성
+python -m auto_editor thumbnail \
+    --input ./final.mp4 \
+    --metadata ./metadata.json \
+    --out ./thumbnail.png
+
+# 4단계: YouTube 업로드 (첫 실행 시 브라우저로 OAuth 인증)
+python -m auto_editor publish \
+    --input ./final.mp4 \
+    --metadata ./metadata.json \
+    --thumbnail ./thumbnail.png \
+    --privacy private
 ```
 
-옵션:
+또는 2~4단계를 한 번에:
 
-| 옵션 | 기본값 | 설명 |
-|---|---|---|
-| `--input` | (필수) | 영상 파일 경로 (여러 개 가능) |
-| `--project-name` | `auto_edit` | CapCut 프로젝트 이름 |
-| `--silence-db` | `-32` | 이 dB보다 작으면 무음으로 판정 |
-| `--min-silence` | `0.6` | 최소 무음 길이(초). 이보다 짧으면 컷 안 함 |
-| `--padding` | `0.1` | 컷 경계에 남기는 여유 시간(초) |
-| `--whisper-model` | `small` | tiny / base / small / medium / large |
-| `--language` | `ko` | 자막 언어 |
-| `--no-subtitles` | | 자막 생성 건너뛰기 |
-| `--no-cut` | | 무음 컷 건너뛰기 |
-| `--draft-dir` | (자동 탐지) | CapCut 드래프트 폴더 경로 |
+```bash
+python -m auto_editor auto \
+    --input ./final.mp4 \
+    --workdir ./out \
+    --persona "B2B SaaS 마케팅, 차분하고 실용적" \
+    --privacy unlisted
+```
 
-## CapCut 드래프트 폴더 위치
+## n8n 연동
 
-자동 탐지가 실패하면 `--draft-dir`로 직접 지정하세요.
+`n8n/youtube-pipeline.json` 을 n8n 에 import 하면 webhook 으로 자동 발행 흐름이 만들어집니다.
+세부 사항은 [n8n/README.md](./n8n/README.md).
+
+## 폴더 구조
+
+```
+auto_editor/         # 헤드리스 CLI 파이프라인
+  pipeline.py        # prep: 컷 + 자막 → CapCut 드래프트
+  silence.py         # ffmpeg silencedetect
+  transcribe.py      # faster-whisper 전사
+  capcut_draft.py    # draft_content.json 생성
+  metadata.py        # Claude로 제목/설명/태그 생성
+  thumbnail.py       # 영상 프레임 + 카피 합성
+  youtube_upload.py  # YouTube Data API v3 업로드
+  cli.py             # argparse subcommands
+public/              # 브라우저 에디터 (ffmpeg.wasm)
+n8n/                 # 자동화 워크플로 JSON
+```
+
+## CapCut 드래프트 폴더 자동 탐지
+
+자동 탐지가 실패하면 `--draft-dir` 로 직접 지정하세요.
 
 - **Windows**: `%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft`
 - **macOS**: `~/Movies/CapCut/User Data/Projects/com.lveditor.draft`
 
-## 마무리
+## 보안 주의
 
-CapCut에서 프로젝트를 열면 컷과 자막이 적용된 상태로 보입니다. BGM, 트랜지션, 썸네일은 기존처럼 CapCut에서 직접 입히면 됩니다.
+- `client_secrets.json`, `~/.auto_editor/youtube_token.json`, `metadata.json` 의 채널 페르소나
+  등은 절대 커밋하지 마세요. `.gitignore` 에 등록되어 있습니다.
+- `ANTHROPIC_API_KEY` 는 환경 변수로만 전달.
