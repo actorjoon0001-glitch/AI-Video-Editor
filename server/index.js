@@ -1,17 +1,22 @@
 // Express server that runs ffmpeg native for fast video editing.
 // Endpoints:
-//   POST /api/process  — upload video + options(JSON), returns { id, url }
-//   GET  /api/result/:id — download/stream the processed mp4
-//   GET  /healthz      — liveness check
+//   POST /api/process         — upload video + options(JSON), returns { id, url }
+//   GET  /api/result/:id      — download/stream the processed mp4
+//   POST /api/transcribe      — upload video, return { srt, vtt, text, segments, ... }
+//   POST /api/burn-subtitles  — upload video + srt, return mp4 with hardcoded subs
+//   GET  /healthz             — liveness check
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { mkdir, unlink, stat } from "fs/promises";
+import { mkdir, unlink, stat, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 8080;
 const ALLOWED_ORIGINS = (
@@ -117,6 +122,84 @@ app.get("/api/result/:id", (req, res) => {
   res.download(file, "edited.mp4");
 });
 
+// ── /api/transcribe — Whisper 자막 생성 ─────────────────────────────────────
+// Body: multipart/form-data { video, language?, model? }
+// Resp: { srt, vtt, text, segments, language, duration, durationMs }
+app.post("/api/transcribe", upload.single("video"), async (req, res) => {
+  const id = randomUUID();
+  const inputPath = req.file?.path;
+  try {
+    if (!inputPath) return res.status(400).json({ error: "video file required" });
+    const language = sanitizeLang(req.body.language);
+    const model = sanitizeModel(req.body.model || process.env.WHISPER_MODEL || "small");
+    console.log(`[${id}] transcribe: lang=${language} model=${model}`);
+    const t0 = Date.now();
+    const result = await runTranscribe(inputPath, { language, model });
+    const elapsed = Date.now() - t0;
+    console.log(`[${id}] transcribe done in ${(elapsed / 1000).toFixed(1)}s, ${result.segments?.length || 0} segments`);
+    res.json({ ...result, durationMs: elapsed });
+  } catch (e) {
+    console.error(`[${id}] transcribe failed:`, e);
+    res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    if (inputPath) { try { await unlink(inputPath); } catch {} }
+  }
+});
+
+// ── /api/burn-subtitles — SRT 를 영상에 영구 합성 ──────────────────────────
+// Body: multipart/form-data { video, srt }
+// Resp: streams mp4 (Content-Type: video/mp4)
+app.post(
+  "/api/burn-subtitles",
+  upload.fields([{ name: "video", maxCount: 1 }, { name: "srt", maxCount: 1 }]),
+  async (req, res) => {
+    const id = randomUUID();
+    const videoPath = req.files?.video?.[0]?.path;
+    const srtUploadPath = req.files?.srt?.[0]?.path;
+    const srtPath = path.join(TMP, `${id}.srt`);
+    const outputPath = path.join(TMP, `${id}.burned.mp4`);
+    try {
+      if (!videoPath) return res.status(400).json({ error: "video file required" });
+      // SRT 는 multipart 파일이거나 form 필드 둘 다 허용. 가능하면 form 필드 우선.
+      let srt = req.body.srt;
+      if (!srt && srtUploadPath) {
+        const { readFile } = await import("fs/promises");
+        srt = await readFile(srtUploadPath, "utf8");
+      }
+      if (!srt || typeof srt !== "string" || srt.length === 0) {
+        return res.status(400).json({ error: "srt content required" });
+      }
+      await writeFile(srtPath, srt, "utf8");
+
+      // libass 가 SRT 파일을 직접 읽도록 subtitles 필터 사용. 이스케이프된 절대 경로.
+      const escapedSrt = srtPath.replace(/\\/g, "/").replace(/:/g, "\\:");
+      const args = [
+        "-i", videoPath,
+        "-vf", `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=20,Outline=2,Shadow=0,MarginV=40'`,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        "-y", outputPath,
+      ];
+      console.log(`[${id}] burn-subtitles: ${srt.length} chars SRT`);
+      const t0 = Date.now();
+      await runFFmpeg(args);
+      console.log(`[${id}] burn done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      res.download(outputPath, "subtitled.mp4", async (err) => {
+        // 응답 끝나면 정리
+        try { await unlink(outputPath); } catch {}
+      });
+    } catch (e) {
+      console.error(`[${id}] burn failed:`, e);
+      res.status(500).json({ error: String(e?.message || e) });
+    } finally {
+      if (videoPath) { try { await unlink(videoPath); } catch {} }
+      if (srtUploadPath) { try { await unlink(srtUploadPath); } catch {} }
+      try { await unlink(srtPath); } catch {}
+    }
+  }
+);
+
 app.listen(PORT, () => {
   console.log(`AI Video Editor backend listening on :${PORT}`);
   console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
@@ -208,4 +291,56 @@ function runFFmpeg(args) {
 
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
+}
+
+// ── Whisper 자막 ────────────────────────────────────────────────────────────
+const ALLOWED_LANGS = new Set([
+  "ko", "en", "ja", "zh", "es", "fr", "de", "it", "pt", "ru", "vi", "th", "id", "auto",
+]);
+const ALLOWED_MODELS = new Set([
+  "tiny", "base", "small", "medium", "large", "large-v2", "large-v3",
+]);
+
+function sanitizeLang(v) {
+  const s = String(v || "ko").toLowerCase();
+  return ALLOWED_LANGS.has(s) ? s : "ko";
+}
+function sanitizeModel(v) {
+  const s = String(v || "small").toLowerCase();
+  return ALLOWED_MODELS.has(s) ? s : "small";
+}
+
+// transcribe.py 를 별도 프로세스로 실행해 stdout JSON 파싱.
+// stdout 은 깨끗한 JSON 만 반환하도록 transcribe.py 가 보장한다.
+function runTranscribe(input, { language, model }) {
+  return new Promise((resolve, reject) => {
+    const py = spawn(
+      "python3",
+      [
+        path.join(__dirname, "transcribe.py"),
+        "--input", input,
+        "--language", language,
+        "--model", model,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    let stdout = "";
+    let stderr = "";
+    py.stdout.on("data", (d) => { stdout += d.toString(); });
+    py.stderr.on("data", (d) => {
+      stderr += d.toString();
+      if (stderr.length > 200_000) stderr = stderr.slice(-100_000);
+    });
+    py.on("error", reject);
+    py.on("exit", (code) => {
+      if (code !== 0) {
+        return reject(new Error(`transcribe exit ${code}: ${stderr.slice(-1500)}`));
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        reject(new Error(`transcribe JSON parse error: ${e.message}; stderr=${stderr.slice(-500)}`));
+      }
+    });
+  });
 }

@@ -78,6 +78,11 @@ let originalUrl = null;
 let previewMode = "edited"; // "edited" | "original"
 let bgmFile = null;
 let thumbUrls = [];
+// 자막 관련 (SRT/VTT 본문 + Blob URL). 미리보기 <track> + 다운로드 링크에 공유.
+let subtitleSrt = "";
+let subtitleVtt = "";
+let subtitleVttUrl = null;
+let subtitleSrtUrl = null;
 
 const state = {
   preset: "standard",
@@ -137,6 +142,13 @@ function setPreviewMode(mode) {
     btn.classList.toggle("active", active);
     btn.setAttribute("aria-selected", active ? "true" : "false");
   });
+  // 자막은 편집본 timeline 기준이므로 원본 탭에선 표시하지 않는다.
+  // edited 탭에 다시 들어오면 vttUrl 로 track 재부착.
+  if (mode === "original") {
+    resultVideo.querySelectorAll("track").forEach((t) => t.remove());
+  } else if (subtitleVttUrl) {
+    attachVttTrack(subtitleVttUrl);
+  }
 }
 document.querySelectorAll(".preview-tabs [data-preview]").forEach((btn) => {
   btn.addEventListener("click", () => setPreviewMode(btn.dataset.preview));
@@ -334,6 +346,7 @@ resetBtn.addEventListener("click", () => {
   resultVideo.removeAttribute("src");
   resultVideo.load();
   setPreviewMode("edited");
+  resetSubtitleState();
   document.querySelector(".dz-title").textContent = "여기로 영상을 드래그하세요";
   document.querySelector(".dz-sub").innerHTML =
     '또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm · 여러 개 가능';
@@ -510,6 +523,9 @@ async function runServerPipeline() {
   setStatus("썸네일 추출 (선택)");
   doneStep("thumbs");
   thumbsBlock.hidden = true;
+
+  // 자동 자막 (옵션, 백엔드 호출). 서버 모드도 같은 엔드포인트 사용.
+  await maybeGenerateSubtitles(blob);
 
   setBar(100);
   setStatus(`완료! 총 ${((Date.now() - reqStart) / 1000).toFixed(1)}초`);
@@ -704,6 +720,10 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
   await extractThumbnails(ff, outName, outDuration, 6);
   doneStep("thumbs");
 
+  // 자동 자막 (옵션, 백엔드 호출).
+  // 인코딩 끝난 결과 mp4 를 그대로 백엔드에 보내 Whisper 로 전사.
+  await maybeGenerateSubtitles(blob);
+
   setBar(100);
   setStatus("완료!");
   resultSection.hidden = false;
@@ -767,6 +787,115 @@ async function detectSilencesWebAudio(file, noiseDb, minSilence) {
 }
 
 // ── 백엔드 처리 흐름 (/api/process 업로드) ───────────────────────────────────
+// ── 자동 자막 (백엔드 Whisper) ─────────────────────────────────────────────
+// 인코딩 끝난 결과 blob 을 백엔드 /api/transcribe 로 전송 → SRT/VTT 받음.
+// "자막 번인" 옵션이면 SRT 와 함께 /api/burn-subtitles 호출 → 번인된 mp4 로 교체.
+async function maybeGenerateSubtitles(resultBlob) {
+  resetSubtitleState();
+  const enabled = $("autoSubtitles")?.checked === true;
+  if (!enabled) return;
+  if (!BACKEND_URL) {
+    appendLog("자동 자막: 백엔드 URL 이 설정돼 있지 않아 건너뜀");
+    return;
+  }
+
+  setStatus("자동 자막 생성 중 (백엔드 Whisper)...");
+  let result;
+  try {
+    const fd = new FormData();
+    fd.append("video", resultBlob, "edited.mp4");
+    fd.append("language", "ko");
+    fd.append("model", "small");
+    const r = await fetch(`${BACKEND_URL}/api/transcribe`, { method: "POST", body: fd });
+    if (!r.ok) {
+      const errText = await r.text().catch(() => "");
+      throw new Error(`HTTP ${r.status}: ${errText.slice(0, 300)}`);
+    }
+    result = await r.json();
+  } catch (e) {
+    appendLog(`자동 자막 실패: ${e?.message || e}`);
+    setStatus(`자막 생성 실패 (영상은 정상 출력됨): ${e?.message || e}`);
+    return;
+  }
+
+  subtitleSrt = result.srt || "";
+  subtitleVtt = result.vtt || "";
+  appendLog(`자막 ${result.segments?.length || 0}줄 · ${(result.durationMs / 1000).toFixed(1)}s`);
+
+  // 다운로드 링크
+  if (subtitleSrt) {
+    if (subtitleSrtUrl) URL.revokeObjectURL(subtitleSrtUrl);
+    subtitleSrtUrl = URL.createObjectURL(new Blob([subtitleSrt], { type: "text/plain;charset=utf-8" }));
+    const a = $("srtDownloadBtn");
+    a.href = subtitleSrtUrl;
+    a.hidden = false;
+  }
+  if (subtitleVtt) {
+    if (subtitleVttUrl) URL.revokeObjectURL(subtitleVttUrl);
+    subtitleVttUrl = URL.createObjectURL(new Blob([subtitleVtt], { type: "text/vtt;charset=utf-8" }));
+    const a = $("vttDownloadBtn");
+    a.href = subtitleVttUrl;
+    a.hidden = false;
+    attachVttTrack(subtitleVttUrl);
+  }
+
+  // 번인 옵션
+  const burn = $("burnSubtitles")?.checked === true;
+  if (burn && subtitleSrt) {
+    setStatus("자막 번인 중 (백엔드 ffmpeg)...");
+    try {
+      const fd = new FormData();
+      fd.append("video", resultBlob, "edited.mp4");
+      fd.append("srt", subtitleSrt);
+      const r = await fetch(`${BACKEND_URL}/api/burn-subtitles`, { method: "POST", body: fd });
+      if (!r.ok) {
+        const errText = await r.text().catch(() => "");
+        throw new Error(`HTTP ${r.status}: ${errText.slice(0, 300)}`);
+      }
+      const burnedBlob = await r.blob();
+      // 결과 영상을 번인본으로 교체
+      if (outputUrl) URL.revokeObjectURL(outputUrl);
+      outputUrl = URL.createObjectURL(burnedBlob);
+      setPreviewMode("edited");
+      const dl = $("downloadBtn");
+      dl.href = outputUrl;
+      dl.download = (dl.download || "edited.mp4").replace(/\.mp4$/, "-subtitled.mp4");
+      appendLog("번인 완료 — 편집본을 자막 합성본으로 교체");
+    } catch (e) {
+      appendLog(`번인 실패 (자막은 정상 생성됨): ${e?.message || e}`);
+    }
+  }
+}
+
+function resetSubtitleState() {
+  subtitleSrt = "";
+  subtitleVtt = "";
+  if (subtitleSrtUrl) { URL.revokeObjectURL(subtitleSrtUrl); subtitleSrtUrl = null; }
+  if (subtitleVttUrl) { URL.revokeObjectURL(subtitleVttUrl); subtitleVttUrl = null; }
+  const srtBtn = $("srtDownloadBtn"); if (srtBtn) srtBtn.hidden = true;
+  const vttBtn = $("vttDownloadBtn"); if (vttBtn) vttBtn.hidden = true;
+  // 비디오 element 의 기존 track 제거
+  resultVideo.querySelectorAll("track").forEach((t) => t.remove());
+}
+
+function attachVttTrack(vttUrl) {
+  resultVideo.querySelectorAll("track").forEach((t) => t.remove());
+  const track = document.createElement("track");
+  track.kind = "subtitles";
+  track.label = "자동 자막 (한국어)";
+  track.srclang = "ko";
+  track.src = vttUrl;
+  track.default = true;
+  resultVideo.appendChild(track);
+  // 일부 브라우저는 default 만으로 활성화되지 않음 → 직접 활성.
+  setTimeout(() => {
+    const tracks = resultVideo.textTracks;
+    for (let i = 0; i < tracks.length; i++) {
+      tracks[i].mode = "showing";
+    }
+  }, 100);
+}
+
 async function processOnBackend(file, opts, onProgress) {
   if (!BACKEND_URL) throw new Error("백엔드 URL 이 설정되지 않았습니다.");
 
