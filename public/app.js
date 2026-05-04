@@ -84,6 +84,8 @@ let subtitleVttText = "";
 let subtitleJson = null;     // /api/transcribe 응답 전체 (segments / words / language ...)
 let subtitleSrtUrl = null;
 let subtitleVttUrl = null;
+// 백엔드 헬스체크 캐시 — 한 세션 내 중복 호출 방지.
+let backendHealthCache = null; // { ok, routes, checkedAt } | { ok: false, error }
 
 const state = {
   preset: "standard",
@@ -830,6 +832,11 @@ async function detectSilencesWebAudio(file, noiseDb, minSilence) {
 // fillerMode 옵션과 함께 호출해 word-level + editPlan 을 받는다.
 async function fetchEditPlan(file, fillerMode) {
   if (!BACKEND_URL) throw new Error("백엔드 URL 미설정");
+  // 같은 헬스체크 캐시를 공유 — 자막 + 필러가 둘 다 켜져도 health 는 한 번만.
+  const health = await checkBackendHealth();
+  if (!health.ok) {
+    throw new Error(`자막/필러 서버 연결 실패: ${health.error}`);
+  }
   const fd = new FormData();
   fd.append("video", file);
   fd.append("language", "ko");
@@ -838,6 +845,13 @@ async function fetchEditPlan(file, fillerMode) {
   const r = await fetch(`${BACKEND_URL}/api/transcribe`, { method: "POST", body: fd });
   if (!r.ok) {
     const t = await r.text().catch(() => "");
+    if (r.status === 404 && isRouteMissingResponse(t)) {
+      backendHealthCache = null;
+      throw new Error(
+        "자막 서버 연결 실패: 백엔드 API URL 또는 배포 상태를 확인하세요. " +
+        "(/api/transcribe 라우트 없음 — Render 재배포 필요)"
+      );
+    }
     throw new Error(`HTTP ${r.status}: ${t.slice(0, 200)}`);
   }
   return r.json();
@@ -903,6 +917,40 @@ function renderEditPlan() {
   block.hidden = false;
 }
 
+// 백엔드 라우트 가용성 확인. /api/health 가 routes 배열을 돌려주므로 그걸 보고
+// transcribe 가 살아있는지까지 검증한다. 한 세션에 한 번만 호출 (캐시).
+async function checkBackendHealth() {
+  if (backendHealthCache) return backendHealthCache;
+  if (!BACKEND_URL) {
+    backendHealthCache = { ok: false, error: "백엔드 URL 이 설정돼 있지 않습니다." };
+    return backendHealthCache;
+  }
+  try {
+    const r = await fetch(`${BACKEND_URL}/api/health`, { method: "GET" });
+    if (!r.ok) {
+      // /api/health 가 없으면 /healthz fallback 시도 (구버전 호환).
+      const r2 = await fetch(`${BACKEND_URL}/healthz`).catch(() => null);
+      if (r2?.ok) {
+        backendHealthCache = { ok: true, routes: null, legacy: true };
+        return backendHealthCache;
+      }
+      backendHealthCache = { ok: false, error: `백엔드 헬스체크 실패 (HTTP ${r.status}). 배포 상태 확인 필요.` };
+      return backendHealthCache;
+    }
+    const body = await r.json();
+    backendHealthCache = { ok: true, routes: body.routes || null, version: body.version };
+    return backendHealthCache;
+  } catch (e) {
+    backendHealthCache = { ok: false, error: `백엔드 연결 실패: ${e?.message || e}` };
+    return backendHealthCache;
+  }
+}
+
+// 백엔드 응답이 Express 의 "Cannot POST /api/X" HTML 인지 판별 — 라우트 미존재 시그널.
+function isRouteMissingResponse(text) {
+  return /Cannot (POST|GET) \//.test(text || "");
+}
+
 async function maybeGenerateSubtitles(resultBlob) {
   resetSubtitleState();
   const enabled = $("autoSubtitles")?.checked === true;
@@ -916,6 +964,29 @@ async function maybeGenerateSubtitles(resultBlob) {
     return;
   }
 
+  // 사전 헬스체크. 라우트가 없으면 무거운 영상 업로드를 시작하지 않는다.
+  setStatus("자동 자막: 백엔드 헬스체크 중...");
+  const health = await checkBackendHealth();
+  if (!health.ok) {
+    const msg = `자막 서버 연결 실패: ${health.error || "알 수 없음"}`;
+    appendLog(msg);
+    setStatus(msg);
+    syncSubtitleButtons("백엔드 연결 실패 (배포 상태 확인 필요)");
+    return;
+  }
+  // routes 가 노출되면 transcribe 가 등록돼 있는지 직접 확인.
+  if (Array.isArray(health.routes)) {
+    const has = health.routes.some((r) => r.path === "/api/transcribe" && r.method === "POST");
+    if (!has) {
+      const msg = "자막 서버는 살아있지만 /api/transcribe 라우트가 없음. " +
+        "백엔드(Render) 가 옛 컨테이너로 돌고 있을 가능성 — 강제 재배포 필요.";
+      appendLog(msg);
+      setStatus(msg);
+      syncSubtitleButtons("/api/transcribe 라우트 없음 (백엔드 재배포 필요)");
+      return;
+    }
+  }
+
   setStatus("자동 자막 생성 중 (백엔드 Whisper)...");
   let result;
   try {
@@ -926,6 +997,15 @@ async function maybeGenerateSubtitles(resultBlob) {
     const r = await fetch(`${BACKEND_URL}/api/transcribe`, { method: "POST", body: fd });
     if (!r.ok) {
       const errText = await r.text().catch(() => "");
+      // Express 가 라우트 미존재 시 "Cannot POST /api/transcribe" HTML 을 돌려줌.
+      // 그 텍스트를 그대로 노출하지 않고 한국어 안내로 바꿔준다.
+      if (r.status === 404 && isRouteMissingResponse(errText)) {
+        backendHealthCache = null; // 다음 시도 때 다시 확인
+        throw new Error(
+          "자막 서버 연결 실패: 백엔드 API URL 또는 배포 상태를 확인하세요. " +
+          "(/api/transcribe 라우트가 등록되지 않음 — Render 재배포 필요)"
+        );
+      }
       throw new Error(`HTTP ${r.status}: ${errText.slice(0, 300)}`);
     }
     result = await r.json();

@@ -48,7 +48,26 @@ const upload = multer({
 });
 
 app.get("/", (req, res) => res.type("text/plain").send("AI Video Editor backend"));
-app.get("/healthz", (req, res) => res.json({ ok: true }));
+
+// 헬스체크. /healthz 는 인프라용, /api/health 는 프론트엔드가 라우트 가용성을
+// 확인하기 위해 호출. routes 배열로 어떤 엔드포인트가 살아있는지 명시한다.
+function healthBody() {
+  return {
+    ok: true,
+    version: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
+    routes: [
+      { method: "POST", path: "/api/process" },
+      { method: "GET",  path: "/api/result/:id" },
+      { method: "POST", path: "/api/transcribe" },
+      { method: "POST", path: "/api/burn-subtitles" },
+      { method: "GET",  path: "/api/health" },
+      { method: "GET",  path: "/healthz" },
+    ],
+    allowedOrigins: ALLOWED_ORIGINS,
+  };
+}
+app.get("/healthz", (req, res) => res.json(healthBody()));
+app.get("/api/health", (req, res) => res.json(healthBody()));
 
 app.post("/api/process", upload.single("video"), async (req, res) => {
   const id = randomUUID();
