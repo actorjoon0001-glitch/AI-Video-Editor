@@ -507,8 +507,9 @@ function ratioToFilter(ratio) {
   // 입력 해상도와 무관하게 중심 크롭 후 목표 비율 컨테이너로 스케일.
   // setsar=1 로 픽셀 정사각형 보장.
   if (ratio === "16:9") {
-    // 가로영상 그대로 1280x720 표준
-    return "scale='if(gt(a,16/9),1280,-2)':'if(gt(a,16/9),-2,720)',crop=1280:720,setsar=1";
+    // 입력 종횡비와 무관하게 1280x720 을 덮도록 스케일 후 중앙 크롭.
+    // (세로·4:3 입력에서도 crop 이 프레임을 넘지 않도록 cover 방식 사용)
+    return "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1";
   }
   if (ratio === "9:16") {
     // 세로 720x1280 — 가로영상이면 중앙 크롭
