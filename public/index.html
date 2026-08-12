@@ -3,131 +3,35 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>AI Video Editor · 끌어다 놓으면 편집이 끝납니다</title>
-  <meta name="description" content="영상을 드래그하면 AI가 무음을 잘라내고 비율을 맞춰 완성본을 보여줍니다. 브라우저에서 바로 작동, 업로드 없음." />
+  <title>편집 작업대</title>
+  <meta name="robots" content="noindex, nofollow" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <nav class="nav">
-    <div class="nav-inner">
-      <a href="#" class="brand">
-        <span class="logo-dot"></span>
-        AI Video Editor
-      </a>
-      <div class="nav-links">
-        <a href="#features">기능</a>
-        <a href="#how">사용법</a>
-        <a href="#faq">FAQ</a>
-        <a href="#app" class="btn btn-sm primary">지금 편집</a>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <span class="brand"><span class="logo-dot"></span>편집 작업대</span>
+      <div class="status-pills" id="statusPills">
+        <span class="pill" id="pillBackend" data-state="unknown">백엔드 확인 중</span>
+        <span class="pill" id="pillWhisper" data-state="unknown">자막</span>
+        <span class="pill" id="pillMeta" data-state="unknown">메타데이터</span>
+        <span class="pill" id="pillYoutube" data-state="unknown">YouTube</span>
       </div>
+      <button type="button" id="backendToggle" class="btn btn-sm ghost">백엔드 설정</button>
     </div>
-  </nav>
+    <div class="backend-panel" id="backendPanel" hidden>
+      <label>백엔드 URL
+        <input type="url" id="backendUrlInput" placeholder="https://ai-video-editor-api.onrender.com" />
+      </label>
+      <button type="button" id="backendSaveBtn" class="btn primary btn-sm">저장 후 새로고침</button>
+      <button type="button" id="backendResetBtn" class="btn ghost btn-sm">기본값</button>
+      <p class="hint-row" id="backendPanelHint"></p>
+    </div>
+  </header>
 
-  <main>
-    <section class="hero">
-      <span class="badge">브라우저에서 바로 · 업로드 없음</span>
-      <h1>
-        영상을 끌어다 놓으면,<br/>
-        <span class="grad">AI가 편집을 끝냅니다.</span>
-      </h1>
-      <p class="lead">
-        무음 구간을 자동으로 잘라내고, 원하는 비율(쇼츠·롱폼)로 맞춰
-        완성본을 <strong>그 자리에서 미리보기</strong>합니다. 영상은 서버로 가지 않고
-        여러분의 브라우저 안에서만 처리됩니다.
-      </p>
-      <div class="hero-cta">
-        <a href="#app" class="btn primary lg">영상 끌어다 놓기 →</a>
-        <a href="#how" class="btn lg ghost">3단계 작동 보기</a>
-      </div>
-      <div class="hero-stats">
-        <div><strong>0원</strong><span>무료 · 회원가입 불필요</span></div>
-        <div><strong>~30s</strong><span>1분 영상 평균 처리</span></div>
-        <div><strong>100%</strong><span>로컬 처리 · 업로드 없음</span></div>
-      </div>
-    </section>
-
-    <section id="features" class="features">
-      <h2 class="section-title">무엇이 자동으로 됩니까</h2>
-      <p class="section-sub">크리에이터가 매번 손으로 하던 반복 작업을 한 번에.</p>
-      <div class="grid">
-        <article class="card">
-          <div class="card-icon">⏭</div>
-          <h3>무음 자동 컷</h3>
-          <p>임계 dB·최소 무음 길이를 슬라이더로 조절. 말 사이 정적이 길수록 자동으로 잘라냅니다.</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">📐</div>
-          <h3>비율 자동 변환</h3>
-          <p>16:9 롱폼, 9:16 쇼츠, 1:1 SNS — 한 번 클릭으로 출력 비율을 맞춥니다.</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">⚡</div>
-          <h3>편집 프리셋</h3>
-          <p>빠른 컷 / 표준 / 꼼꼼히 — 영상 종류에 맞춰 한 번에 설정합니다.</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">🎬</div>
-          <h3>숏폼 자동 추출</h3>
-          <p>긴 영상에서 음량이 가장 활발한 구간을 찾아 30~60초 클립으로 뽑아냅니다.</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">⏩</div>
-          <h3>점프컷 가속</h3>
-          <p>잘라내고 남은 구간을 1.0~1.5배로 빠르게 — 같은 분량이라도 훨씬 압축된 느낌.</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">🎵</div>
-          <h3>BGM + 자동 더킹</h3>
-          <p>음악을 깔면 음성 구간에서 자동으로 음량이 줄어듭니다 (사이드체인 컴프레서).</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">🖼️</div>
-          <h3>썸네일 후보 추출</h3>
-          <p>완성본에서 6장의 프레임을 자동으로 뽑아 썸네일 후보로 보여줍니다.</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">🔊</div>
-          <h3>음량 자동 정규화</h3>
-          <p>방송 표준(-16 LUFS)에 맞춰 음량을 일정하게 — 다른 영상과 섞일 때도 균일.</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">📥</div>
-          <h3>CapCut 드래프트</h3>
-          <p>편집 결과를 CapCut 드래프트(<code>draft_content.json</code>)로 내보내 마무리합니다.</p>
-        </article>
-        <article class="card">
-          <div class="card-icon">🔒</div>
-          <h3>완전 로컬 처리</h3>
-          <p>영상은 외부 서버로 전송되지 않습니다. 모든 처리가 여러분의 브라우저에서 끝납니다.</p>
-        </article>
-      </div>
-    </section>
-
-    <section id="how" class="how">
-      <h2 class="section-title">3단계로 끝</h2>
-      <ol class="steps">
-        <li>
-          <div class="step-num">1</div>
-          <h3>영상을 드래그</h3>
-          <p>mp4·mov·webm 파일을 페이지에 끌어다 놓습니다.</p>
-        </li>
-        <li>
-          <div class="step-num">2</div>
-          <h3>AI가 분석·편집</h3>
-          <p>무음 감지 → 컷 → 비율 맞춤까지 자동으로 진행됩니다.</p>
-        </li>
-        <li>
-          <div class="step-num">3</div>
-          <h3>완성본 확인 후 다운로드</h3>
-          <p>결과를 바로 재생해보고, 마음에 들면 mp4 또는 CapCut 드래프트로 저장합니다.</p>
-        </li>
-      </ol>
-    </section>
-
-    <section id="app" class="app">
-      <h2 class="section-title">지금 바로 편집하기</h2>
-      <p class="section-sub">권장 길이 5분 이내 · 처음 실행 시 ffmpeg 엔진 다운로드(~30MB)가 한 번 발생합니다.</p>
-
+  <main class="wb">
+    <!-- ── 왼쪽: 소스 + 설정 ─────────────────────────────────────────────── -->
+    <aside class="wb-col wb-left">
       <div id="dropzone" class="dropzone" tabindex="0" aria-label="영상 파일 드롭 영역">
         <div class="dz-inner">
           <div class="dz-icon">⬇</div>
@@ -137,7 +41,12 @@
         </div>
       </div>
 
-      <section class="controls" id="controls" hidden>
+      <section class="controls" id="controls">
+        <div class="run-row">
+          <button type="button" id="runBtn" class="btn primary lg">자동 편집 시작</button>
+          <button type="button" id="resetBtn" class="btn">초기화</button>
+        </div>
+
         <div class="preset-row">
           <span class="preset-label">프리셋</span>
           <button type="button" class="chip" data-preset="fast">빠른 컷</button>
@@ -146,65 +55,56 @@
         </div>
         <div class="preset-row">
           <span class="preset-label">출력 비율</span>
-          <button type="button" class="chip active" data-ratio="16:9">16:9 롱폼</button>
-          <button type="button" class="chip" data-ratio="9:16">9:16 쇼츠</button>
-          <button type="button" class="chip" data-ratio="1:1">1:1 SNS</button>
+          <button type="button" class="chip active" data-ratio="16:9">16:9</button>
+          <button type="button" class="chip" data-ratio="9:16">9:16</button>
+          <button type="button" class="chip" data-ratio="1:1">1:1</button>
         </div>
         <div class="preset-row">
           <span class="preset-label">모드</span>
-          <button type="button" class="chip active" data-mode="full">전체 영상 컷</button>
-          <button type="button" class="chip" data-mode="short">숏폼 자동 추출</button>
+          <button type="button" class="chip active" data-mode="full">전체 컷</button>
+          <button type="button" class="chip" data-mode="short">숏폼 추출</button>
         </div>
         <div class="preset-row">
           <span class="preset-label">재생 속도</span>
-          <button type="button" class="chip active" data-speed="1.0">1.0x 자연</button>
+          <button type="button" class="chip active" data-speed="1.0">1.0x</button>
           <button type="button" class="chip" data-speed="1.1">1.1x</button>
-          <button type="button" class="chip" data-speed="1.25">1.25x 점프컷</button>
+          <button type="button" class="chip" data-speed="1.25">1.25x</button>
           <button type="button" class="chip" data-speed="1.5">1.5x</button>
         </div>
-
-        <!-- 핵심 옵션: 항상 노출 (자막 / 필러 제거 / 고속 모드 / 자막 번인). -->
         <div class="preset-row">
           <span class="preset-label">필러 제거</span>
           <button type="button" class="chip active" data-filler="off">OFF</button>
           <button type="button" class="chip" data-filler="conservative">보수적</button>
           <button type="button" class="chip" data-filler="aggressive">강하게</button>
         </div>
-        <p class="hint-row">
-          * "어/음/엄/아" 같은 추임새를 word-level Whisper 로 찾아 무음 컷과 함께 제거.
-          "강하게" 는 "그/그러니까/이제/약간/뭐/그냥" 까지. 백엔드 1회 호출.
-        </p>
 
         <div class="primary-toggles">
           <label class="toggle">
+            <input type="checkbox" id="queueMode" checked />
+            <span>큐 모드 — 백엔드 단계별 처리 (기본)</span>
+          </label>
+          <label class="toggle">
             <input type="checkbox" id="autoSubtitles" checked />
-            <span>자동 자막 생성 — 편집 후 Whisper 전사 (SRT/VTT 다운로드 + 미리보기)</span>
+            <span>자동 자막 (Whisper)</span>
           </label>
           <label class="toggle">
             <input type="checkbox" id="burnSubtitles" />
-            <span>자막 번인 — 편집본에 자막 영구 합성 (자동 자막 켜야 동작)</span>
+            <span>자막 번인</span>
           </label>
           <label class="toggle">
             <input type="checkbox" id="serverMode" />
-            <span>고속 모드 — 외부 서버에서 인코딩 (5~10배 빠름, HEVC OK)</span>
+            <span>고속 모드 — 단일 요청 인코딩 (큐 모드 OFF일 때만)</span>
           </label>
-          <label class="toggle">
-            <input type="checkbox" id="queueMode" />
-            <span>큐 모드 — 백엔드가 단계별 자동 처리 (긴 영상도 timeout 없음)</span>
-          </label>
-          <p class="hint-row" id="serverModeHint">
-            * 큐 모드: 무음 감지는 브라우저, 그 이후 (인코딩/자막/번인/썸네일/메타데이터/업로드)는
-            백엔드 단계별 처리. 한 단계 실패해도 다른 단계는 계속 — 단계별로 따로 "다시 시도" 가능.
-          </p>
+          <p class="hint-row" id="serverModeHint"></p>
         </div>
 
         <details class="settings-card" id="queueStagesCard" hidden open>
-          <summary>큐 모드 후속 단계</summary>
+          <summary>메타데이터 · 업로드</summary>
           <label class="toggle">
             <input type="checkbox" id="genMetadata" />
-            <span>메타데이터 생성 — 자막에서 제목 후보 5개 / 설명문 / 태그 / 썸네일 카피</span>
+            <span>메타데이터 생성 — 제목 후보 / 설명 / 태그 / 썸네일 카피</span>
           </label>
-          <label>채널 페르소나 (선택)
+          <label>채널 페르소나
             <input type="text" id="metaPersona" maxlength="200"
                    placeholder="예: 20~30대 대상, 담백하고 정보 위주인 리뷰 채널" />
           </label>
@@ -212,23 +112,20 @@
 
           <label class="toggle">
             <input type="checkbox" id="ytUpload" />
-            <span>YouTube 자동 업로드 — 메타데이터의 1순위 제목으로 게시</span>
+            <span>YouTube 자동 업로드 — 1순위 제목으로 게시</span>
           </label>
           <label>공개 범위
             <select id="ytPrivacy">
-              <option value="private" selected>비공개 (private)</option>
-              <option value="unlisted">일부 공개 (unlisted)</option>
-              <option value="public">전체 공개 (public)</option>
+              <option value="private" selected>비공개</option>
+              <option value="unlisted">일부 공개</option>
+              <option value="public">전체 공개</option>
             </select>
           </label>
-          <p class="hint-row" id="ytHint">
-            * 업로드는 서버에 YouTube 자격 증명이 설정돼 있어야 동작합니다. 기본값은 비공개이며,
-            메타데이터 단계가 성공해야 (제목이 있어야) 업로드합니다.
-          </p>
+          <p class="hint-row" id="ytHint"></p>
         </details>
 
-        <details class="settings-card" open>
-          <summary>컷 편집 설정</summary>
+        <details class="settings-card">
+          <summary>컷 편집 세부</summary>
           <div class="row">
             <label>무음 임계 dB
               <input type="range" id="silenceDb" min="-50" max="-20" step="1" value="-32" />
@@ -249,20 +146,19 @@
           </div>
         </details>
 
-        <details class="settings-card" open>
-          <summary>오디오 / BGM 설정</summary>
+        <details class="settings-card">
+          <summary>오디오 · BGM</summary>
           <label class="toggle">
             <input type="checkbox" id="loudnorm" checked />
-            <span>음량 자동 정규화 (방송 표준 -16 LUFS)</span>
+            <span>음량 자동 정규화 (-16 LUFS)</span>
           </label>
-
           <div class="bgm-area">
             <div class="bgm-head">
-              <span class="bgm-label">배경음악 <em>선택사항</em></span>
+              <span class="bgm-label">배경음악</span>
               <span id="bgmStatus" class="bgm-status">없음</span>
             </div>
             <div class="row bgm-row">
-              <button type="button" id="bgmPickBtn" class="btn">BGM 파일 선택</button>
+              <button type="button" id="bgmPickBtn" class="btn">BGM 선택</button>
               <button type="button" id="bgmClearBtn" class="btn ghost" hidden>제거</button>
               <input id="bgmInput" type="file" accept="audio/*" hidden />
               <label class="bgm-volume">BGM 볼륨
@@ -270,27 +166,18 @@
                 <span id="bgmVolVal">-14 dB</span>
               </label>
             </div>
-            <p class="bgm-hint">BGM 추가 시 음성 구간에서 자동으로 음악이 작아집니다 (사이드체인 더킹).</p>
+            <p class="bgm-hint">음성 구간에서 자동으로 음악이 작아집니다 (사이드체인 더킹).</p>
           </div>
-        </details>
-
-        <details class="settings-card" open>
-          <summary>안전 모드</summary>
-          <label class="toggle">
+          <label class="toggle" style="margin-top:14px">
             <input type="checkbox" id="safeMode" />
-            <span>안전 모드 — 오디오 제거 + 효과 최소 (멈춤이 잦을 때만)</span>
+            <span>안전 모드 — 오디오 제거 + 효과 최소 (브라우저 처리가 멈출 때만)</span>
           </label>
-          <p class="bgm-hint" style="margin-top:8px">
-            * atempo / loudnorm / BGM 강제 비활성. 기본 fallback 체인이 모두 실패할 때만 사용.
-          </p>
         </details>
-
-        <div class="row btn-row">
-          <button type="button" id="runBtn" class="btn primary lg">자동 편집 시작</button>
-          <button type="button" id="resetBtn" class="btn">다른 영상</button>
-        </div>
       </section>
+    </aside>
 
+    <!-- ── 오른쪽: 진행 + 결과 ───────────────────────────────────────────── -->
+    <section class="wb-col wb-right">
       <section class="progress" id="progress" hidden>
         <ol class="stepper" id="stepper">
           <li data-step="load">엔진 로드</li>
@@ -307,6 +194,10 @@
         </details>
       </section>
 
+      <div class="idle-note" id="idleNote">
+        <p>영상을 올리고 <strong>자동 편집 시작</strong>을 누르면 여기에 진행 상황과 결과가 표시됩니다.</p>
+      </div>
+
       <section class="result" id="result" hidden>
         <div class="result-head">
           <h3 class="result-title">완성본</h3>
@@ -319,10 +210,10 @@
         <div class="result-stats" id="resultStats"></div>
         <div class="row">
           <a id="downloadBtn" class="btn primary" download="edited.mp4">mp4 다운로드</a>
-          <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트 내보내기</button>
-          <a id="srtDownloadBtn" class="btn disabled" download="subtitles.srt" aria-disabled="true" role="button">SRT 자막</a>
-          <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT 자막</a>
-          <a id="burnedDownloadBtn" class="btn disabled" download="subtitled.mp4" aria-disabled="true" role="button" hidden>자막 번인본 mp4</a>
+          <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트</button>
+          <a id="srtDownloadBtn" class="btn disabled" download="subtitles.srt" aria-disabled="true" role="button">SRT</a>
+          <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT</a>
+          <a id="burnedDownloadBtn" class="btn disabled" download="subtitled.mp4" aria-disabled="true" role="button" hidden>자막 번인본</a>
         </div>
 
         <div class="meta-block" id="metaBlock" hidden>
@@ -351,7 +242,7 @@
         </div>
 
         <div class="job-pipeline" id="jobPipelineBlock" hidden>
-          <h4 class="thumbs-title">큐 모드 작업 진행 <span class="thumbs-hint">백엔드 단계별 처리</span></h4>
+          <h4 class="thumbs-title">단계별 진행 <span class="thumbs-hint">백엔드 큐 모드</span></h4>
           <ol class="job-stages" id="jobStages"></ol>
           <div class="row" id="jobActions"></div>
         </div>
@@ -377,42 +268,6 @@
         </div>
       </section>
     </section>
-
-    <section id="faq" class="faq">
-      <h2 class="section-title">자주 묻는 질문</h2>
-      <details class="qa">
-        <summary>영상이 외부 서버로 전송되나요?</summary>
-        <p>아니요. 모든 처리는 여러분의 브라우저 안에서만 이뤄집니다. 영상 파일은 서버로 업로드되지 않습니다.</p>
-      </details>
-      <details class="qa">
-        <summary>어떤 형식의 영상을 지원하나요?</summary>
-        <p>mp4, mov, webm 등 일반적인 컨테이너를 지원합니다. 출력은 mp4(H.264 + AAC)로 고정입니다.</p>
-      </details>
-      <details class="qa">
-        <summary>긴 영상도 가능한가요?</summary>
-        <p>브라우저 메모리 한계상 5분 내외 영상에 가장 적합합니다. 그 이상은 처리가 느리거나 실패할 수 있어요.</p>
-      </details>
-      <details class="qa">
-        <summary>"숏폼 자동 추출"은 어떻게 동작하나요?</summary>
-        <p>오디오 에너지 분석을 통해 가장 활발한 구간을 찾고, 설정한 길이(15~90초)만큼 잘라 9:16 비율로 변환합니다.</p>
-      </details>
-      <details class="qa">
-        <summary>BGM은 어떻게 자동으로 작아지나요?</summary>
-        <p>음성 신호를 키로 한 사이드체인 컴프레서를 적용합니다. 말이 나올 때 음악이 살짝 줄고, 말이 끝나면 다시 올라오는 자연스러운 더킹이 자동으로 적용됩니다.</p>
-      </details>
-      <details class="qa">
-        <summary>점프컷 가속은 무엇인가요?</summary>
-        <p>잘라낸 뒤 남은 영상 전체를 1.1~1.5배로 빠르게 재생합니다. 음성도 피치 변화 없이 자연스럽게 빨라져서 시청 시간을 줄이는 효과가 있어요.</p>
-      </details>
-      <details class="qa">
-        <summary>CapCut 드래프트는 어떻게 사용하나요?</summary>
-        <p>내보낸 <code>draft_content.json</code>을 CapCut 드래프트 폴더에 두면 CapCut에서 컷이 적용된 프로젝트가 보입니다. 거기서 BGM·트랜지션을 마무리하시면 됩니다.</p>
-      </details>
-    </section>
-
-    <footer class="footer">
-      <p>Built with Claude Code · Powered by ffmpeg.wasm · Deployed on Netlify</p>
-    </footer>
   </main>
 
   <script>

@@ -348,8 +348,18 @@ window.addEventListener("drop", (e) => {
   if (list.length) handleFiles(list);
 });
 
+// app.js 는 부트스트랩이 동적으로 주입하므로 DOMContentLoaded 가 이미 지나간
+// 뒤에 실행되는 경우가 많다. 그때는 즉시 실행해야 초기화가 누락되지 않는다.
+function onReady(fn) {
+  if (document.readyState === "loading") {
+    window.addEventListener("DOMContentLoaded", fn, { once: true });
+  } else {
+    fn();
+  }
+}
+
 // 백엔드 URL 미설정 시 토글 비활성
-window.addEventListener("DOMContentLoaded", () => {
+onReady(() => {
   const cb = $("serverMode");
   const hint = $("serverModeHint");
   if (!cb) return;
@@ -372,6 +382,12 @@ function wireQueueStageOptions() {
   let capsLoaded = false;
   const sync = async () => {
     card.hidden = !queue.checked;
+    // 큐 모드가 우선순위를 가지므로 고속 모드는 의미가 없다 — 비활성 표시.
+    const server = $("serverMode");
+    if (server && BACKEND_URL) {
+      server.disabled = queue.checked;
+      if (queue.checked) server.checked = false;
+    }
     if (!queue.checked || capsLoaded) return;
     capsLoaded = true;
     const health = await checkBackendHealth();
@@ -404,9 +420,10 @@ resetBtn.addEventListener("click", () => {
   pickedFile = null;
   pickedFiles = [];
   fileInput.value = "";
-  controls.hidden = true;
+  // 개인용 작업대 — 설정 패널은 항상 열어둔다 (파일 없이도 미리 조정 가능).
   progress.hidden = true;
   resultSection.hidden = true;
+  const note = $("idleNote"); if (note) note.hidden = false;
   thumbsBlock.hidden = true;
   thumbUrls.forEach((u) => URL.revokeObjectURL(u));
   thumbUrls = [];
@@ -434,6 +451,13 @@ resetBtn.addEventListener("click", () => {
 });
 
 runBtn.addEventListener("click", () => {
+  if (pickedFiles.length === 0) {
+    setStatus("영상을 먼저 올려주세요.");
+    dropzone.classList.add("drag");
+    setTimeout(() => dropzone.classList.remove("drag"), 600);
+    return;
+  }
+  const note = $("idleNote"); if (note) note.hidden = true;
   const useQueue = $("queueMode")?.checked && BACKEND_URL;
   const useServer = $("serverMode")?.checked && BACKEND_URL;
   const userSafe = $("safeMode")?.checked === true;
@@ -1079,6 +1103,7 @@ async function checkBackendHealth() {
     const body = await r.json();
     backendHealthCache = {
       ok: true, routes: body.routes || null, version: body.version,
+      whisper: body.whisper,
       // 큐 모드 후속 단계 가용성 (구버전 백엔드면 undefined).
       metadataProvider: body.metadataProvider || null,
       youtube: body.youtube === true,
@@ -1751,6 +1776,143 @@ function renderMetadata(metaStage, uploadStage) {
     }
   }
 }
+
+// ── 개인용 설정 저장 ────────────────────────────────────────────────────────
+// 혼자 쓰는 도구라 매번 같은 값을 다시 고르는 게 제일 번거롭다. 체크박스/슬라이더/
+// 칩 선택/텍스트 입력을 전부 localStorage 에 넣고 다음 방문에 그대로 복원한다.
+const PREFS_KEY = "aive.prefs.v1";
+const PREF_CHECKBOXES = [
+  "queueMode", "autoSubtitles", "burnSubtitles", "serverMode",
+  "genMetadata", "ytUpload", "loudnorm", "safeMode",
+];
+const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol"];
+const PREF_TEXTS = ["metaPersona", "ytPrivacy"];
+const PREF_CHIPS = ["preset", "ratio", "mode", "speed", "filler"];
+
+function readPrefs() {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; }
+}
+
+function savePrefs() {
+  const p = {};
+  for (const id of PREF_CHECKBOXES) if ($(id)) p[id] = $(id).checked;
+  for (const id of PREF_RANGES) if ($(id)) p[id] = $(id).value;
+  for (const id of PREF_TEXTS) if ($(id)) p[id] = $(id).value;
+  for (const attr of PREF_CHIPS) {
+    const active = document.querySelector(`[data-${attr}].active`);
+    if (active) p[`chip.${attr}`] = active.dataset[attr];
+  }
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch {}
+}
+
+function restorePrefs() {
+  const p = readPrefs();
+  for (const id of [...PREF_CHECKBOXES]) {
+    if (p[id] !== undefined && $(id)) $(id).checked = p[id];
+  }
+  for (const id of [...PREF_RANGES, ...PREF_TEXTS]) {
+    if (p[id] !== undefined && $(id)) $(id).value = p[id];
+  }
+  // 슬라이더 라벨 재동기화
+  for (const [src, label, fmt] of sliders) {
+    const s = $(src), l = $(label);
+    if (s && l) l.textContent = fmt(s.value);
+  }
+  // 칩은 click() 으로 복원해야 state 와 preset 부수효과까지 같이 반영된다.
+  // preset 은 슬라이더를 덮어쓰므로 복원 순서에서 제외 (저장된 슬라이더 값 우선).
+  for (const attr of PREF_CHIPS) {
+    if (attr === "preset") continue;
+    const v = p[`chip.${attr}`];
+    if (v === undefined) continue;
+    const btn = document.querySelector(`[data-${attr}="${v}"]`);
+    if (btn && !btn.classList.contains("active")) btn.click();
+  }
+  const preset = p["chip.preset"];
+  if (preset) {
+    document.querySelectorAll("[data-preset]").forEach((b) => {
+      b.classList.toggle("active", b.dataset.preset === preset);
+    });
+    state.preset = preset;
+  }
+  // 큐 모드 카드 표시 여부는 change 리스너가 정하므로, 복원 후 한 번 알린다.
+  $("queueMode")?.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function wirePrefPersistence() {
+  const ids = [...PREF_CHECKBOXES, ...PREF_RANGES, ...PREF_TEXTS];
+  for (const id of ids) {
+    const el = $(id);
+    if (el) {
+      el.addEventListener("change", savePrefs);
+      el.addEventListener("input", savePrefs);
+    }
+  }
+  for (const attr of PREF_CHIPS) {
+    document.querySelectorAll(`[data-${attr}]`).forEach((b) => {
+      // bindChips 가 먼저 등록돼 있으므로 여기서는 저장만 (state 는 이미 갱신됨).
+      b.addEventListener("click", savePrefs);
+    });
+  }
+}
+
+// ── 상단바: 백엔드 URL 편집 + 능력치 표시등 ─────────────────────────────────
+function wireTopbar() {
+  const toggle = $("backendToggle");
+  const panel = $("backendPanel");
+  const input = $("backendUrlInput");
+  if (toggle && panel) {
+    toggle.addEventListener("click", () => { panel.hidden = !panel.hidden; });
+  }
+  if (input) input.value = localStorage.getItem("backendUrl") || DEFAULT_BACKEND_URL;
+
+  $("backendSaveBtn")?.addEventListener("click", () => {
+    const v = (input?.value || "").trim().replace(/\/+$/, "");
+    if (v) localStorage.setItem("backendUrl", v);
+    else localStorage.removeItem("backendUrl");
+    location.reload();
+  });
+  $("backendResetBtn")?.addEventListener("click", () => {
+    localStorage.removeItem("backendUrl");
+    location.reload();
+  });
+
+  const hint = $("backendPanelHint");
+  if (hint) hint.textContent = `현재: ${BACKEND_URL || "(미설정)"} · 저장하면 페이지를 새로 읽습니다.`;
+
+  refreshStatusPills();
+}
+
+function setPill(id, state, text) {
+  const el = $(id);
+  if (!el) return;
+  el.dataset.state = state;
+  el.textContent = text;
+}
+
+async function refreshStatusPills() {
+  const health = await checkBackendHealth();
+  if (!health.ok) {
+    setPill("pillBackend", "bad", "백엔드 연결 실패");
+    setPill("pillWhisper", "off", "자막 불가");
+    setPill("pillMeta", "off", "메타데이터 불가");
+    setPill("pillYoutube", "off", "업로드 불가");
+    return;
+  }
+  const ver = health.version && health.version !== "unknown" ? health.version.slice(0, 7) : null;
+  setPill("pillBackend", "ok", ver ? `백엔드 ${ver}` : "백엔드 연결됨");
+  setPill("pillWhisper", health.whisper === false ? "bad" : "ok",
+    health.whisper === false ? "자막 엔진 오류" : "자막");
+  setPill("pillMeta", "ok",
+    health.metadataProvider === "claude" ? "메타데이터 Claude" : "메타데이터 로컬");
+  setPill("pillYoutube", health.youtube ? "ok" : "off",
+    health.youtube ? (health.youtubeAllowsPublic ? "YouTube 공개 허용" : "YouTube 비공개만") : "YouTube 미설정");
+}
+
+onReady(() => {
+  restorePrefs();
+  wirePrefPersistence();
+  wireTopbar();
+});
 
 // 복사 버튼 — data-copy(요소 id의 텍스트) 또는 data-copy-text(리터럴).
 document.addEventListener("click", async (e) => {
