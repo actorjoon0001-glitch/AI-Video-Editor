@@ -193,10 +193,39 @@
             <span>큐 모드 — 백엔드가 단계별 자동 처리 (긴 영상도 timeout 없음)</span>
           </label>
           <p class="hint-row" id="serverModeHint">
-            * 큐 모드: 무음 감지는 브라우저, 그 이후 (인코딩/자막/썸네일)는 백엔드 단계별 처리.
-            한 단계 실패해도 다른 단계는 계속 — 자막만 따로 "다시 생성" 가능.
+            * 큐 모드: 무음 감지는 브라우저, 그 이후 (인코딩/자막/번인/썸네일/메타데이터/업로드)는
+            백엔드 단계별 처리. 한 단계 실패해도 다른 단계는 계속 — 단계별로 따로 "다시 시도" 가능.
           </p>
         </div>
+
+        <details class="settings-card" id="queueStagesCard" hidden open>
+          <summary>큐 모드 후속 단계</summary>
+          <label class="toggle">
+            <input type="checkbox" id="genMetadata" />
+            <span>메타데이터 생성 — 자막에서 제목 후보 5개 / 설명문 / 태그 / 썸네일 카피</span>
+          </label>
+          <label>채널 페르소나 (선택)
+            <input type="text" id="metaPersona" maxlength="200"
+                   placeholder="예: 20~30대 대상, 담백하고 정보 위주인 리뷰 채널" />
+          </label>
+          <p class="hint-row" id="metaProviderHint"></p>
+
+          <label class="toggle">
+            <input type="checkbox" id="ytUpload" />
+            <span>YouTube 자동 업로드 — 메타데이터의 1순위 제목으로 게시</span>
+          </label>
+          <label>공개 범위
+            <select id="ytPrivacy">
+              <option value="private" selected>비공개 (private)</option>
+              <option value="unlisted">일부 공개 (unlisted)</option>
+              <option value="public">전체 공개 (public)</option>
+            </select>
+          </label>
+          <p class="hint-row" id="ytHint">
+            * 업로드는 서버에 YouTube 자격 증명이 설정돼 있어야 동작합니다. 기본값은 비공개이며,
+            메타데이터 단계가 성공해야 (제목이 있어야) 업로드합니다.
+          </p>
+        </details>
 
         <details class="settings-card" open>
           <summary>컷 편집 설정</summary>
@@ -293,6 +322,32 @@
           <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트 내보내기</button>
           <a id="srtDownloadBtn" class="btn disabled" download="subtitles.srt" aria-disabled="true" role="button">SRT 자막</a>
           <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT 자막</a>
+          <a id="burnedDownloadBtn" class="btn disabled" download="subtitled.mp4" aria-disabled="true" role="button" hidden>자막 번인본 mp4</a>
+        </div>
+
+        <div class="meta-block" id="metaBlock" hidden>
+          <h4 class="thumbs-title">YouTube 메타데이터 <span class="thumbs-hint" id="metaSource"></span></h4>
+          <div class="meta-field">
+            <span class="meta-label">제목 후보</span>
+            <ol class="meta-titles" id="metaTitles"></ol>
+          </div>
+          <div class="meta-field">
+            <span class="meta-label">설명문 <button type="button" class="btn ghost" data-copy="metaDescription">복사</button></span>
+            <pre class="meta-desc" id="metaDescription"></pre>
+          </div>
+          <div class="meta-field">
+            <span class="meta-label">태그 <button type="button" class="btn ghost" data-copy="metaTagsText">복사</button></span>
+            <div class="meta-tags" id="metaTags"></div>
+            <span id="metaTagsText" hidden></span>
+          </div>
+          <div class="meta-field">
+            <span class="meta-label">썸네일 카피</span>
+            <p class="meta-hook" id="metaThumbCopy"></p>
+          </div>
+          <div class="row" id="metaUploadRow" hidden>
+            <a id="uploadedLink" class="btn primary" target="_blank" rel="noopener">업로드된 영상 열기</a>
+            <span class="meta-label" id="uploadedStatus"></span>
+          </div>
         </div>
 
         <div class="job-pipeline" id="jobPipelineBlock" hidden>

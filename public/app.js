@@ -359,7 +359,46 @@ window.addEventListener("DOMContentLoaded", () => {
   } else if (hint) {
     hint.textContent = `* 영상이 일시 서버를 거칩니다 (HTTPS, 처리 후 1시간 내 자동 삭제). 백엔드: ${BACKEND_URL}`;
   }
+  wireQueueStageOptions();
 });
+
+// 큐 모드에서만 의미 있는 후속 단계 옵션(메타데이터/업로드) 카드를 토글하고,
+// 백엔드가 실제로 그 단계를 돌릴 수 있는지(/api/health)를 반영한다.
+function wireQueueStageOptions() {
+  const queue = $("queueMode");
+  const card = $("queueStagesCard");
+  if (!queue || !card) return;
+
+  let capsLoaded = false;
+  const sync = async () => {
+    card.hidden = !queue.checked;
+    if (!queue.checked || capsLoaded) return;
+    capsLoaded = true;
+    const health = await checkBackendHealth();
+
+    const metaHint = $("metaProviderHint");
+    if (metaHint) {
+      metaHint.textContent = health.metadataProvider === "claude"
+        ? "* Claude 로 생성합니다 — 자막 내용만 근거로 제목/설명/태그를 씁니다."
+        : "* 서버에 ANTHROPIC_API_KEY 가 없어 로컬 키워드 분석으로 생성합니다 (품질은 낮지만 자막에 없는 내용은 만들지 않습니다).";
+    }
+
+    const upload = $("ytUpload");
+    const ytHint = $("ytHint");
+    if (upload && !health.youtube) {
+      upload.checked = false;
+      upload.disabled = true;
+      if (ytHint) ytHint.textContent = "* 서버에 YouTube 자격 증명(YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN)이 없어 업로드를 쓸 수 없습니다.";
+    }
+    const publicOpt = $("ytPrivacy")?.querySelector('option[value="public"]');
+    if (publicOpt && health.youtube && !health.youtubeAllowsPublic) {
+      publicOpt.disabled = true;
+      publicOpt.textContent = "전체 공개 (public) — 서버에서 비활성";
+    }
+  };
+  queue.addEventListener("change", sync);
+  sync();
+}
 
 resetBtn.addEventListener("click", () => {
   pickedFile = null;
@@ -380,6 +419,10 @@ resetBtn.addEventListener("click", () => {
   resetSubtitleState();
   lastEditPlan = null;
   const epb = $("editPlanBlock"); if (epb) epb.hidden = true;
+  const mb = $("metaBlock"); if (mb) mb.hidden = true;
+  const jpb = $("jobPipelineBlock"); if (jpb) jpb.hidden = true;
+  const bdb = $("burnedDownloadBtn");
+  if (bdb) { bdb.hidden = true; bdb.classList.add("disabled"); bdb.removeAttribute("href"); }
   document.querySelector(".dz-title").textContent = "여기로 영상을 드래그하세요";
   document.querySelector(".dz-sub").innerHTML =
     '또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm · 여러 개 가능';
@@ -1036,6 +1079,10 @@ async function checkBackendHealth() {
     const body = await r.json();
     backendHealthCache = {
       ok: true, routes: body.routes || null, version: body.version,
+      // 큐 모드 후속 단계 가용성 (구버전 백엔드면 undefined).
+      metadataProvider: body.metadataProvider || null,
+      youtube: body.youtube === true,
+      youtubeAllowsPublic: body.youtubeAllowsPublic === true,
       url, httpStatus: 200, body: JSON.stringify(body).slice(0, 200),
     };
     return backendHealthCache;
@@ -1429,6 +1476,11 @@ async function runQueueModePipeline() {
     fillerMode: state.filler || "off",
     language: "ko",
     model: "tiny",
+    burn: $("burnSubtitles")?.checked === true,
+    metadata: $("genMetadata")?.checked === true,
+    metadataPersona: $("metaPersona")?.value?.trim() || "",
+    upload: $("ytUpload")?.checked === true,
+    privacy: $("ytPrivacy")?.value || "private",
   }));
   const startResp = await fetch(`${BACKEND_URL}/api/jobs`, { method: "POST", body: fd });
   if (!startResp.ok) {
@@ -1496,7 +1548,9 @@ function renderJobPipeline(job) {
     const icon = JOB_STAGE_ICON[s.status] || "·";
     const detail = jobStageDetailText(key, s);
     const detailHtml = detail ? `<span class="detail">${escapeHtml(detail)}</span>` : "";
-    const retryBtn = s.status === "failed" && (key === "transcribe" || key === "thumbnail")
+    // edit 은 원본이 이미 지워져 재시도 불가. upload 는 중복 게시 위험 때문에
+    // 실패했을 때만 (백엔드도 같은 규칙으로 막는다).
+    const retryBtn = s.status === "failed" && key !== "edit"
       ? `<button type="button" class="btn" data-retry="${key}">다시 시도</button>` : "";
     return `<li class="job-stage ${s.status}">
       <span class="icon">${icon}</span>
@@ -1524,6 +1578,17 @@ function jobStageDetailText(key, s) {
     }
     if (key === "thumbnail") {
       return `${s.result.urls?.length || 0}장 추출`;
+    }
+    if (key === "burn") {
+      const mb = s.result.sizeBytes ? ` · ${(s.result.sizeBytes / 1024 / 1024).toFixed(1)} MB` : "";
+      return `자막 합성 완료${mb} · ${((s.result.durationMs || 0) / 1000).toFixed(1)}s`;
+    }
+    if (key === "metadata") {
+      const via = s.result.source === "claude" ? `Claude(${s.result.model})` : "로컬 키워드 분석";
+      return `제목 후보 ${s.result.titles?.length || 0}개 · 태그 ${s.result.tags?.length || 0}개 · ${via}`;
+    }
+    if (key === "upload") {
+      return `${s.result.privacyStatus || "?"} 로 게시 · ${s.result.url || ""}`;
     }
   }
   return "";
@@ -1617,7 +1682,91 @@ async function wireQueueResults(job) {
     }
     thumbsBlock.hidden = false;
   }
+  // 자막 번인본 — 편집본과 별개 파일이라 다운로드 버튼을 따로 노출한다.
+  const burn = job.stages.burn;
+  const burnedBtn = $("burnedDownloadBtn");
+  if (burnedBtn && burn?.status === "done" && burn.result?.url) {
+    burnedBtn.href = BACKEND_URL + burn.result.url;
+    burnedBtn.hidden = false;
+    burnedBtn.classList.remove("disabled");
+    burnedBtn.removeAttribute("aria-disabled");
+  }
+  renderMetadata(job.stages.metadata, job.stages.upload);
 }
+
+// 메타데이터 패널 — 제목 후보/설명/태그/썸네일 카피 + 업로드 결과 링크.
+function renderMetadata(metaStage, uploadStage) {
+  const block = $("metaBlock");
+  if (!block) return;
+  const m = metaStage?.status === "done" ? metaStage.result : null;
+  if (!m) { block.hidden = true; return; }
+  block.hidden = false;
+
+  const src = $("metaSource");
+  if (src) {
+    src.textContent = m.source === "claude" ? `Claude ${m.model || ""}` : "로컬 키워드 분석";
+  }
+
+  const titles = $("metaTitles");
+  if (titles) {
+    titles.innerHTML = (m.titles || [])
+      .map((t) => `<li><span>${escapeHtml(t)}</span><button type="button" class="btn ghost" data-copy-text="${escapeHtml(t)}">복사</button></li>`)
+      .join("");
+  }
+  const desc = $("metaDescription");
+  if (desc) desc.textContent = m.description || "";
+
+  const tags = $("metaTags");
+  const tagsText = (m.tags || []).join(", ");
+  if (tags) {
+    tags.innerHTML = (m.tags || []).map((t) => `<span class="meta-tag">${escapeHtml(t)}</span>`).join("");
+  }
+  const tagsHidden = $("metaTagsText");
+  if (tagsHidden) tagsHidden.textContent = tagsText;
+
+  const hook = $("metaThumbCopy");
+  if (hook) {
+    hook.textContent = m.thumbnailSubcopy
+      ? `${m.thumbnailCopy} / ${m.thumbnailSubcopy}`
+      : (m.thumbnailCopy || "-");
+  }
+
+  const upRow = $("metaUploadRow");
+  const up = uploadStage?.status === "done" ? uploadStage.result : null;
+  if (upRow) {
+    if (up?.url) {
+      upRow.hidden = false;
+      const link = $("uploadedLink");
+      if (link) { link.href = up.url; link.textContent = `업로드된 영상 열기 (${up.privacyStatus})`; }
+      const st = $("uploadedStatus");
+      if (st) {
+        st.textContent = [
+          `제목: ${up.title || "-"}`,
+          up.publishAt ? `예약 게시: ${up.publishAt}` : null,
+          up.thumbnailSet ? "썸네일 적용됨" : (up.thumbnailError ? `썸네일 실패: ${up.thumbnailError}` : null),
+        ].filter(Boolean).join(" · ");
+      }
+    } else {
+      upRow.hidden = true;
+    }
+  }
+}
+
+// 복사 버튼 — data-copy(요소 id의 텍스트) 또는 data-copy-text(리터럴).
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-copy], [data-copy-text]");
+  if (!btn) return;
+  const text = btn.dataset.copyText ?? ($(btn.dataset.copy)?.textContent || "");
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    const prev = btn.textContent;
+    btn.textContent = "복사됨";
+    setTimeout(() => { btn.textContent = prev; }, 1200);
+  } catch {
+    appendLog("클립보드 복사 실패 — 직접 선택해 복사해 주세요.");
+  }
+});
 
 async function processOnBackend(file, opts, onProgress) {
   if (!BACKEND_URL) throw new Error("백엔드 URL 이 설정되지 않았습니다.");
