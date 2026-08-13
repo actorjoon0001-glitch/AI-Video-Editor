@@ -938,10 +938,25 @@ function probeDurationSec(file) {
   });
 }
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`AI Video Editor backend listening on :${PORT}`);
   console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
 });
+
+// 컨테이너에서 node 가 PID 1 로 뜨면 커널이 기본 시그널 동작을 걸어주지 않는다.
+// 즉 핸들러를 직접 등록하지 않으면 SIGTERM 이 무시되고, 배포 때마다 Render 가
+// 유예 시간 뒤 SIGKILL 로 강제 종료하게 된다 (진행 중이던 응답이 그냥 끊김).
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    console.log(`${sig} 수신 — 새 연결을 받지 않고 종료합니다.`);
+    server.close(() => process.exit(0));
+    // 인코딩이 오래 걸릴 수 있으니 무한정 기다리지는 않는다.
+    setTimeout(() => {
+      console.log("유예 시간 초과 — 강제 종료합니다.");
+      process.exit(0);
+    }, 15_000).unref();
+  });
+}
 
 // ── ffmpeg pipeline ──────────────────────────────────────────────────────────
 // keep 구간이 이 개수를 넘으면 trim+concat 대신 select 방식으로 전환한다.

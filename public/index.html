@@ -87,6 +87,19 @@
             <input type="checkbox" id="autoSubtitles" checked />
             <span>자동 자막 (Whisper)</span>
           </label>
+          <label class="sub-field">자막 모델
+            <select id="whisperModel">
+              <option value="tiny">tiny — 가장 빠름 (품질 낮음)</option>
+              <option value="base">base — 빠름</option>
+              <option value="small" selected>small — 균형 (권장)</option>
+              <option value="medium">medium — 정확도 최상 (많이 느림)</option>
+            </select>
+          </label>
+          <p class="hint-row">
+            * 큰 모델일수록 한국어 정확도가 올라가지만 그만큼 오래 걸리고 메모리를 더 씁니다.
+            small 이상은 서버 메모리 2GB(Standard) 이상에서 쓰세요. 모델을 처음 쓰는
+            날은 다운로드 시간이 한 번 추가됩니다.
+          </p>
           <label class="toggle">
             <input type="checkbox" id="burnSubtitles" />
             <span>자막 번인</span>

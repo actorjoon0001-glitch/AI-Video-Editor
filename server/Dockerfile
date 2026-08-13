@@ -49,4 +49,10 @@ ENV NODE_ENV=production
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["npm", "start"]
+# npm 을 거치지 않고 node 를 직접 띄운다.
+#  - npm 이 감싸면 SIGTERM 이 npm 에게 먼저 가서 node 가 정리할 틈을 못 받는다.
+#  - 게다가 npm 은 정상 종료(SIGTERM)까지 "npm error" 로 찍어서 로그에서 진짜
+#    장애와 구분이 안 된다.
+# 단, node 가 PID 1 이 되면 커널이 기본 시그널 처리를 걸어주지 않으므로
+# index.js 에서 SIGTERM 을 직접 받는다.
+CMD ["node", "index.js"]
