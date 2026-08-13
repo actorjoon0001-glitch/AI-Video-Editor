@@ -1515,12 +1515,11 @@ async function runQueueModePipeline() {
     upload: $("ytUpload")?.checked === true,
     privacy: $("ytPrivacy")?.value || "private",
   }));
-  const startResp = await fetch(`${BACKEND_URL}/api/jobs`, { method: "POST", body: fd });
-  if (!startResp.ok) {
-    const t = await startResp.text().catch(() => "");
-    throw new Error(`작업 등록 실패: HTTP ${startResp.status} ${t.slice(0, 200)}`);
-  }
-  const { jobId, pollIntervalMs = 3000 } = await startResp.json();
+  // fetch 는 업로드 진행률을 못 준다. 200MB 넘는 파일에서는 몇 분 동안 화면이
+  // 멈춘 것처럼 보이고, 연결이 끊겨도 영원히 매달려 있게 된다. XHR 로 올려서
+  // 진행률(%)과 타임아웃을 붙인다.
+  const totalMb = (sourceFile.size / 1024 / 1024).toFixed(1);
+  const { jobId, pollIntervalMs = 3000 } = await uploadJobRequest(fd, totalMb);
   appendLog(`작업 등록: ${jobId}`);
 
   // 3) 폴링 — 결과 패널을 미리 보여서 진행 상태 노출.
@@ -1565,6 +1564,51 @@ async function runQueueModePipeline() {
     }
   }
   throw new Error("큐 모드 timeout (30분 초과). 백엔드 로그 확인 필요.");
+}
+
+// /api/jobs 업로드. XHR 을 쓰는 이유는 진행률과 타임아웃 때문 (fetch 는 둘 다 안 됨).
+function uploadJobRequest(fd, totalMb) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BACKEND_URL}/api/jobs`);
+    xhr.responseType = "json";
+    // 업로드가 15분 동안 한 바이트도 못 가면 끊어진 것으로 본다.
+    xhr.timeout = 15 * 60 * 1000;
+
+    let lastPct = -1;
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const pct = Math.round((e.loaded / e.total) * 100);
+      if (pct === lastPct) return;
+      lastPct = pct;
+      const doneMb = (e.loaded / 1024 / 1024).toFixed(1);
+      setStatus(`큐 모드: 영상 업로드 ${pct}% (${doneMb} / ${totalMb} MB)`);
+      // 업로드는 전체 진행바의 10~30% 구간을 차지한다고 보고 매핑.
+      setBar(10 + pct * 0.2);
+    };
+    xhr.upload.onloadend = () => {
+      setStatus("큐 모드: 업로드 완료 — 서버가 작업을 등록하는 중...");
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const body = xhr.response || {};
+        if (!body.jobId) return reject(new Error("서버 응답에 jobId 가 없습니다."));
+        return resolve(body);
+      }
+      const detail = typeof xhr.response === "string"
+        ? xhr.response.slice(0, 200)
+        : JSON.stringify(xhr.response || {}).slice(0, 200);
+      reject(new Error(`작업 등록 실패: HTTP ${xhr.status} ${detail}`));
+    };
+    xhr.onerror = () => reject(new Error(
+      "업로드 중 연결이 끊겼습니다. 파일이 크면 네트워크가 중간에 끊길 수 있습니다."
+    ));
+    xhr.ontimeout = () => reject(new Error(
+      "업로드가 15분을 넘겨 중단했습니다. 파일이 너무 크거나 업로드 속도가 느립니다."
+    ));
+    xhr.send(fd);
+  });
 }
 
 function makeInitialJobState(jobId) {
