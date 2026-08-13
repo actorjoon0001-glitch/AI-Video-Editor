@@ -904,3 +904,26 @@ code {
   .wb { padding: 12px 14px 40px; }
   .controls, .progress, .result, .idle-note { padding: 16px; }
 }
+
+/* 셀렉트 / 하위 필드 — 다크 배경에서 기본 select 가 흰 상자로 튀는 걸 방지 */
+select {
+  padding: 8px 11px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+select:focus { outline: none; border-color: var(--accent); }
+
+/* 토글 바로 아래 붙는 보조 입력 (자막 모델 등) */
+.sub-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 8px 0 0 24px;
+  font-size: 12px;
+  color: var(--muted);
+}

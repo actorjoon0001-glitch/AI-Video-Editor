@@ -933,8 +933,15 @@ async function fetchEditPlan(file, fillerMode) {
   // 비동기 jobs 패턴 + 폴링. 진행 안내는 인자로 받은 onProgress.
   return runTranscribeJob(file, {
     fillerMode,
+    model: selectedWhisperModel(),
     onProgress: (msg) => setStatus(msg),
   });
+}
+
+// 자막 모델은 UI 선택을 따른다. 예전엔 큐 모드가 "tiny" 를 하드코딩해서,
+// 서버 메모리를 늘려도 자막 품질이 그대로였다.
+function selectedWhisperModel() {
+  return $("whisperModel")?.value || "small";
 }
 
 // 백엔드 비동기 transcribe job 등록 후 폴링.
@@ -1226,6 +1233,7 @@ async function maybeGenerateSubtitles(resultBlob) {
   let result;
   try {
     result = await runTranscribeJob(resultBlob, {
+      model: selectedWhisperModel(),
       onProgress: (msg) => setStatus(msg),
     });
   } catch (e) {
@@ -1500,7 +1508,7 @@ async function runQueueModePipeline() {
     thumbnails: true,
     fillerMode: state.filler || "off",
     language: "ko",
-    model: "tiny",
+    model: selectedWhisperModel(),
     burn: $("burnSubtitles")?.checked === true,
     metadata: $("genMetadata")?.checked === true,
     metadataPersona: $("metaPersona")?.value?.trim() || "",
@@ -1802,7 +1810,7 @@ const PREF_CHECKBOXES = [
   "genMetadata", "ytUpload", "loudnorm", "safeMode",
 ];
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol"];
-const PREF_TEXTS = ["metaPersona", "ytPrivacy"];
+const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel"];
 const PREF_CHIPS = ["preset", "ratio", "mode", "speed", "filler"];
 
 function readPrefs() {
