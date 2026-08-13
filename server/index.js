@@ -149,6 +149,7 @@ app.post("/api/process", upload.single("video"), async (req, res) => {
         end: Math.max(0, Number(k.end) || 0),
       })).filter((k) => k.end > k.start),
       ratio: ["16:9", "9:16", "1:1"].includes(opts.ratio) ? opts.ratio : "16:9",
+      quality: QUALITY_SIZES[opts.quality] ? opts.quality : "1080p",
       speed: clamp(Number(opts.speed) || 1.0, 0.5, 2.0),
       loudnorm: opts.loudnorm !== false,
     };
@@ -247,7 +248,7 @@ app.post(
       const args = [
         "-i", videoPath,
         "-vf", `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=20,Outline=2,Shadow=0,MarginV=40'`,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", String(QUALITY_CRF[job.options.quality] ?? 20),
         "-c:a", "copy",
         "-movflags", "+faststart",
         "-y", outputPath,
@@ -621,6 +622,7 @@ function sanitizeJobOptions(opts) {
       end: Math.max(0, Number(k.end) || 0),
     })).filter((k) => k.end > k.start),
     ratio: ["16:9", "9:16", "1:1"].includes(opts.ratio) ? opts.ratio : "16:9",
+    quality: QUALITY_SIZES[opts.quality] ? opts.quality : "1080p",
     speed: clamp(Number(opts.speed) || 1.0, 0.5, 2.0),
     loudnorm: opts.loudnorm !== false,
     transcribe: opts.transcribe !== false,
@@ -991,8 +993,9 @@ const SELECT_FILTER_THRESHOLD = 30;
 
 async function processVideo(input, output, opts, { onProgress, timeoutMs } = {}) {
   const { keeps, ratio, speed, loudnorm } = opts;
+  const quality = QUALITY_SIZES[opts.quality] ? opts.quality : "1080p";
 
-  const ratioFilter = ratioToFilter(ratio);
+  const ratioFilter = ratioToFilter(ratio, quality);
   let filter;
 
   if (keeps.length > SELECT_FILTER_THRESHOLD) {
@@ -1044,8 +1047,10 @@ async function processVideo(input, output, opts, { onProgress, timeoutMs } = {})
     "-map", "[vfinal]",
     "-map", "[afinal]",
     "-c:v", "libx264",
+    // preset 은 veryfast 유지. Render Standard 는 1 CPU 라 preset 을 올리면
+    // 인코딩 시간이 크게 늘어난다 — 화질은 CRF 로 올리는 편이 낫다.
     "-preset", "veryfast",
-    "-crf", "23",
+    "-crf", String(QUALITY_CRF[quality] ?? 20),
     "-c:a", "aac",
     "-b:a", "160k",
     "-movflags", "+faststart",
@@ -1059,10 +1064,21 @@ async function processVideo(input, output, opts, { onProgress, timeoutMs } = {})
   await runFFmpeg(args, { onProgress, timeoutMs });
 }
 
-function ratioToFilter(ratio) {
-  if (ratio === "9:16") return "crop='min(iw,ih*9/16)':ih,scale=720:1280,setsar=1";
-  if (ratio === "1:1") return "crop='min(iw,ih)':'min(iw,ih)',scale=720:720,setsar=1";
-  return "scale='if(gt(a,16/9),1280,-2)':'if(gt(a,16/9),-2,720)',crop=1280:720,setsar=1";
+// 출력 해상도표. 세로 기준(720p/1080p)으로 비율마다 목표 크기를 잡는다.
+const QUALITY_SIZES = {
+  "720p":  { "16:9": [1280, 720],  "9:16": [720, 1280],   "1:1": [720, 720] },
+  "1080p": { "16:9": [1920, 1080], "9:16": [1080, 1920],  "1:1": [1080, 1080] },
+};
+const QUALITY_CRF = { "720p": 21, "1080p": 20 };
+
+function ratioToFilter(ratio, quality = "1080p") {
+  const table = QUALITY_SIZES[quality] || QUALITY_SIZES["1080p"];
+  const [w, h] = table[ratio] || table["16:9"];
+  // force_original_aspect_ratio=increase + crop = "가득 채운 뒤 가운데 잘라내기".
+  // 예전엔 비율마다 다른 식을 직접 썼는데, 세로 원본을 16:9 로 뽑을 때 스케일
+  // 결과가 crop 목표보다 좁아져서 ffmpeg 가 실패하는 조합이 있었다. 이 관용구는
+  // 방향에 상관없이 항상 목표 크기를 덮는다.
+  return `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1`;
 }
 
 function atempoChain(speed) {
