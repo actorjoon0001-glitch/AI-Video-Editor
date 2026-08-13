@@ -439,6 +439,8 @@ resetBtn.addEventListener("click", () => {
   lastEditPlan = null;
   const epb = $("editPlanBlock"); if (epb) epb.hidden = true;
   const mb = $("metaBlock"); if (mb) mb.hidden = true;
+  const sb = $("subEditBlock"); if (sb) sb.hidden = true;
+  subEditState = null;
   const jpb = $("jobPipelineBlock"); if (jpb) jpb.hidden = true;
   const bdb = $("burnedDownloadBtn");
   if (bdb) { bdb.hidden = true; bdb.classList.add("disabled"); bdb.removeAttribute("href"); }
@@ -937,6 +939,7 @@ async function fetchEditPlan(file, fillerMode) {
   return runTranscribeJob(file, {
     fillerMode,
     model: selectedWhisperModel(),
+    glossary: $("glossary")?.value?.trim() || "",
     onProgress: (msg) => setStatus(msg),
   });
 }
@@ -950,7 +953,7 @@ function selectedWhisperModel() {
 // 백엔드 비동기 transcribe job 등록 후 폴링.
 // 동기 /api/transcribe 가 Render Free 의 응답 timeout(30~60s)에 자주 끊어져서,
 // POST /api/transcribe/jobs → GET /api/transcribe/jobs/:id 패턴으로 전환.
-async function runTranscribeJob(file, { fillerMode = "off", model, onProgress } = {}) {
+async function runTranscribeJob(file, { fillerMode = "off", model, glossary, onProgress } = {}) {
   if (!BACKEND_URL) throw new Error("백엔드 URL 미설정");
 
   // 1) 작업 등록 (multipart 업로드)
@@ -958,6 +961,7 @@ async function runTranscribeJob(file, { fillerMode = "off", model, onProgress } 
   fd.append("video", file);
   fd.append("language", "ko");
   if (model) fd.append("model", model);
+  if (glossary) fd.append("glossary", glossary);
   if (fillerMode && fillerMode !== "off") fd.append("fillerMode", fillerMode);
 
   const startResp = await fetch(`${BACKEND_URL}/api/transcribe/jobs`, {
@@ -1512,6 +1516,7 @@ async function runQueueModePipeline() {
     fillerMode: state.filler || "off",
     language: "ko",
     model: selectedWhisperModel(),
+    glossary: $("glossary")?.value?.trim() || "",
     burn: $("burnSubtitles")?.checked === true,
     metadata: $("genMetadata")?.checked === true,
     metadataPersona: $("metaPersona")?.value?.trim() || "",
@@ -1534,29 +1539,23 @@ async function runQueueModePipeline() {
   const POLL_MS = Math.max(1500, pollIntervalMs);
   const MAX_TOTAL_MS = 30 * 60 * 1000; // 30분 (Render Free cold start 여유)
   const startedAt = Date.now();
+  let consecutiveErrors = 0;
   while (Date.now() - startedAt < MAX_TOTAL_MS) {
     await new Promise((r) => setTimeout(r, POLL_MS));
-    let job;
-    try {
-      const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`);
-      if (!r.ok) {
-        if (r.status === 404) {
-          // 작업 목록은 서버 메모리에 있으므로, 백엔드가 재시작(주로 메모리 초과)
-          // 하면 진행 중이던 작업이 통째로 사라진다. 그냥 "없음"이라고 하면
-          // 원인을 알 수 없어 재시작 가능성을 같이 알려준다.
-          throw new Error(
-            "작업이 사라졌습니다. 백엔드가 재시작됐을 가능성이 큽니다 " +
-            "(메모리 초과 등). 영상이 길거나 컷 구간이 많으면 발생할 수 있습니다."
-          );
-        }
-        appendLog(`상태 조회 일시 실패 (${r.status}) — 재시도`);
-        continue;
+    const polled = await pollJobOnce(jobId);
+    if (polled.gone) throw new Error(JOB_GONE_MESSAGE);
+    if (!polled.job) {
+      // 일시적인 네트워크 오류는 넘어가되, 계속 실패하면 화면이 조용히 얼어붙지
+      // 않도록 포기한다.
+      if (++consecutiveErrors >= POLL_FAIL_LIMIT) {
+        throw new Error(
+          `상태 조회가 ${POLL_FAIL_LIMIT}회 연속 실패했습니다. 네트워크 또는 백엔드를 확인해 주세요.`
+        );
       }
-      job = await r.json();
-    } catch (e) {
-      console.warn("polling 일시 실패:", e);
       continue;
     }
+    consecutiveErrors = 0;
+    const job = polled.job;
     renderJobPipeline(job);
     setStatus(`큐 모드: ${job.status}${terminalLabel(job)}`);
     if (job.status === "done" || job.status === "partial" || job.status === "failed") {
@@ -1567,6 +1566,32 @@ async function runQueueModePipeline() {
     }
   }
   throw new Error("큐 모드 timeout (30분 초과). 백엔드 로그 확인 필요.");
+}
+
+// 작업 목록은 서버 메모리에만 있다. 백엔드가 재시작되면 (재배포, 메모리 초과 등)
+// 진행 중이던 작업이 통째로 사라진다.
+const JOB_GONE_MESSAGE =
+  "작업이 사라졌습니다. 백엔드가 재시작된 것으로 보입니다 " +
+  "(재배포 또는 메모리 초과). 작업 목록이 서버 메모리에만 있어서 재시작되면 함께 없어집니다. " +
+  "다시 실행해 주세요.";
+const POLL_FAIL_LIMIT = 10;
+
+// 한 번 폴링. 예전엔 404 를 try 블록 안에서 throw 했는데 바로 아래 catch 가
+// 그걸 삼켜서 continue 로 돌아갔다 — 작업이 사라져도 화면이 멈춘 채로 30분간
+// 조용히 재시도만 했다. 결과를 값으로 돌려주고 판단은 호출부에서 한다.
+async function pollJobOnce(jobId) {
+  try {
+    const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`);
+    if (r.status === 404) return { gone: true, job: null };
+    if (!r.ok) {
+      appendLog(`상태 조회 일시 실패 (${r.status}) — 재시도`);
+      return { gone: false, job: null };
+    }
+    return { gone: false, job: await r.json() };
+  } catch (e) {
+    console.warn("polling 일시 실패:", e);
+    return { gone: false, job: null };
+  }
 }
 
 // /api/jobs 업로드. XHR 을 쓰는 이유는 진행률과 타임아웃 때문 (fetch 는 둘 다 안 됨).
@@ -1715,11 +1740,17 @@ async function pollUntilTerminal(jobId) {
   const POLL_MS = 3000;
   const MAX = 30 * 60 * 1000;
   const t0 = Date.now();
+  let errors = 0;
   while (Date.now() - t0 < MAX) {
     await new Promise((r) => setTimeout(r, POLL_MS));
-    const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`);
-    if (!r.ok) continue;
-    const job = await r.json();
+    const polled = await pollJobOnce(jobId);
+    if (polled.gone) throw new Error(JOB_GONE_MESSAGE);
+    if (!polled.job) {
+      if (++errors >= POLL_FAIL_LIMIT) throw new Error("상태 조회가 계속 실패합니다.");
+      continue;
+    }
+    errors = 0;
+    const job = polled.job;
     renderJobPipeline(job);
     if (job.status === "done" || job.status === "partial" || job.status === "failed") {
       await wireQueueResults(job);
@@ -1793,6 +1824,106 @@ async function wireQueueResults(job) {
     burnedBtn.removeAttribute("aria-disabled");
   }
   renderMetadata(job.stages.metadata, job.stages.upload);
+  renderSubtitleEditor(job);
+}
+
+// ── 자막 교정 ───────────────────────────────────────────────────────────────
+// Whisper 오인식(예: "사각"→"4학")을 브라우저에서 바로 고치고, 고친 자막을
+// 백엔드로 되돌려 보낸다. SRT/VTT 재생성은 클라이언트에서 하고, 서버는 파일만
+// 교체한다 — 그래야 다운로드 버튼과 번인이 같은 교정본을 쓴다.
+let subEditState = null; // { jobId, segments: [{start,end,text}] }
+
+function renderSubtitleEditor(job) {
+  const block = $("subEditBlock");
+  if (!block) return;
+  const tr = job.stages?.transcribe;
+  const segs = tr?.status === "done" ? tr.result?.segments : null;
+  if (!segs?.length) { block.hidden = true; subEditState = null; return; }
+
+  subEditState = { jobId: job.jobId, segments: segs.map((s) => ({ ...s })) };
+  block.hidden = false;
+  const hint = $("subEditHint");
+  if (hint) hint.textContent = `${segs.length}줄 · 고친 뒤 "교정 적용"`;
+  $("subEditStatus").textContent = "";
+  $("subEditReburn").hidden = job.stages?.burn?.status !== "done";
+
+  $("subEditList").innerHTML = subEditState.segments.map((sg, i) => `
+    <li class="subedit-row">
+      <button type="button" class="subedit-time" data-seek="${sg.start}">${fmtClock(sg.start)}</button>
+      <input type="text" class="subedit-text" data-idx="${i}" value="${escapeHtml(sg.text)}" />
+    </li>`).join("");
+
+  const list = $("subEditList");
+  list.querySelectorAll("[data-seek]").forEach((b) => {
+    b.addEventListener("click", () => {
+      // 해당 구간으로 미리보기를 이동시켜 귀로 확인하며 고칠 수 있게.
+      resultVideo.currentTime = parseFloat(b.dataset.seek) || 0;
+      resultVideo.play().catch(() => {});
+    });
+  });
+  list.querySelectorAll(".subedit-text").forEach((inp) => {
+    inp.addEventListener("input", () => {
+      subEditState.segments[Number(inp.dataset.idx)].text = inp.value;
+      $("subEditStatus").textContent = "수정됨 — 적용하지 않으면 반영되지 않습니다";
+    });
+  });
+}
+
+function fmtClock(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function tsSrt(sec) {
+  const ms = Math.max(0, Math.round((Number(sec) || 0) * 1000));
+  const h = String(Math.floor(ms / 3600000)).padStart(2, "0");
+  const m = String(Math.floor((ms % 3600000) / 60000)).padStart(2, "0");
+  const s2 = String(Math.floor((ms % 60000) / 1000)).padStart(2, "0");
+  return `${h}:${m}:${s2},${String(ms % 1000).padStart(3, "0")}`;
+}
+
+function buildSrtVtt(segments) {
+  const srt = segments.map((sg, i) =>
+    `${i + 1}\n${tsSrt(sg.start)} --> ${tsSrt(sg.end)}\n${sg.text.trim()}\n`).join("\n");
+  const vtt = "WEBVTT\n\n" + segments.map((sg) =>
+    `${tsSrt(sg.start).replace(",", ".")} --> ${tsSrt(sg.end).replace(",", ".")}\n${sg.text.trim()}\n`).join("\n");
+  return { srt, vtt };
+}
+
+async function applySubtitleEdits() {
+  if (!subEditState) return;
+  const status = $("subEditStatus");
+  status.textContent = "적용 중...";
+  try {
+    const { srt, vtt } = buildSrtVtt(subEditState.segments);
+    const r = await fetch(`${BACKEND_URL}/api/jobs/${subEditState.jobId}/subtitles`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ srt, vtt, segments: subEditState.segments }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${(await r.text().catch(() => "")).slice(0, 150)}`);
+
+    // 미리보기 자막을 교정본으로 교체. 서버 파일은 URL 이 같아 캐시될 수 있으니
+    // 방금 만든 VTT 를 blob 으로 붙인다.
+    if (subtitleVttUrl?.startsWith("blob:")) URL.revokeObjectURL(subtitleVttUrl);
+    subtitleVttUrl = URL.createObjectURL(new Blob([vtt], { type: "text/vtt" }));
+    attachVttTrack(subtitleVttUrl);
+
+    // 다운로드 버튼도 교정본으로.
+    const srtBtn = $("srtDownloadBtn");
+    if (srtBtn) {
+      srtBtn.href = URL.createObjectURL(new Blob([srt], { type: "text/plain" }));
+      srtBtn.classList.remove("disabled");
+    }
+    const vttBtn = $("vttDownloadBtn");
+    if (vttBtn) { vttBtn.href = subtitleVttUrl; vttBtn.classList.remove("disabled"); }
+
+    status.textContent = "적용 완료 — 다운로드/미리보기에 반영됐습니다";
+    $("subEditReburn").hidden = false;
+    appendLog("자막 교정본 적용");
+  } catch (e) {
+    status.textContent = `적용 실패: ${e?.message || e}`;
+  }
 }
 
 // 메타데이터 패널 — 제목 후보/설명/태그/썸네일 카피 + 업로드 결과 링크.
@@ -1862,7 +1993,7 @@ const PREF_CHECKBOXES = [
   "genMetadata", "ytUpload", "loudnorm", "safeMode",
 ];
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol"];
-const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel"];
+const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel", "glossary"];
 const PREF_CHIPS = ["preset", "ratio", "quality", "mode", "speed", "filler"];
 
 function readPrefs() {
@@ -1988,6 +2119,10 @@ onReady(() => {
   restorePrefs();
   wirePrefPersistence();
   wireTopbar();
+  $("subEditApply")?.addEventListener("click", () => applySubtitleEdits().catch(onError));
+  $("subEditReburn")?.addEventListener("click", () => {
+    if (subEditState) retryJobStage(subEditState.jobId, "burn");
+  });
 });
 
 // 복사 버튼 — data-copy(요소 id의 텍스트) 또는 data-copy-text(리터럴).

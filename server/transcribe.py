@@ -218,6 +218,8 @@ def main() -> int:
                     help="ctranslate2 compute type (int8 가 CPU 에서 가장 빠름)")
     ap.add_argument("--beam-size", type=int, default=1,
                     help="디코딩 beam 크기. 1 이 가장 빠름 (정확도 약간 손실)")
+    ap.add_argument("--initial-prompt", default="",
+                    help="자주 쓰는 고유명사/용어를 미리 알려줘 오인식을 줄인다 (Whisper initial_prompt)")
     ap.add_argument("--filler-mode", default="off",
                     choices=["off", "conservative", "aggressive"],
                     help="off 면 자막만 생성. conservative/aggressive 면 word-level + editPlan 도 반환")
@@ -232,12 +234,15 @@ def main() -> int:
     emit({"phase": "model_ready", "model": args.model})
 
     want_words = args.filler_mode != "off"
+    # initial_prompt 는 디코딩을 그 어휘 쪽으로 편향시킨다. Whisper 의 프롬프트
+    # 창이 224 토큰이라 너무 길면 앞부분이 잘리므로 서버에서 이미 길이를 제한한다.
     segments_iter, info = model.transcribe(
         args.input,
         language=args.language,
         vad_filter=True,
         word_timestamps=want_words,
         beam_size=args.beam_size,
+        initial_prompt=args.initial_prompt or None,
     )
     total_s = float(getattr(info, "duration", 0) or 0)
     emit({"phase": "transcribe_start", "total": total_s})

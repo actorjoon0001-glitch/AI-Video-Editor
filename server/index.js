@@ -110,6 +110,7 @@ function healthBody() {
       { method: "POST", path: "/api/jobs" },
       { method: "GET",  path: "/api/jobs/:id" },
       { method: "POST", path: "/api/jobs/:id/stages/:stage/retry" },
+      { method: "POST", path: "/api/jobs/:id/subtitles" },
       { method: "GET",  path: "/api/jobs/:id/files/:name" },
       { method: "GET",  path: "/api/health" },
       { method: "GET",  path: "/healthz" },
@@ -204,9 +205,10 @@ app.post("/api/transcribe", upload.single("video"), async (req, res) => {
     const language = sanitizeLang(req.body.language);
     const model = sanitizeModel(req.body.model || process.env.WHISPER_MODEL || "tiny");
     const fillerMode = sanitizeFillerMode(req.body.fillerMode);
+    const glossary = sanitizeGlossary(req.body.glossary);
     console.log(`[${id}] transcribe: lang=${language} model=${model} fillerMode=${fillerMode}`);
     const t0 = Date.now();
-    const result = await runTranscribe(inputPath, { language, model, fillerMode });
+    const result = await runTranscribe(inputPath, { language, model, fillerMode, glossary });
     const elapsed = Date.now() - t0;
     console.log(`[${id}] transcribe done in ${(elapsed / 1000).toFixed(1)}s, ${result.segments?.length || 0} segments`);
     res.json({ ...result, durationMs: elapsed });
@@ -300,10 +302,11 @@ app.post("/api/transcribe/jobs", upload.single("video"), async (req, res) => {
   const language = sanitizeLang(req.body.language);
   const model = sanitizeModel(req.body.model || process.env.WHISPER_MODEL || "tiny");
   const fillerMode = sanitizeFillerMode(req.body.fillerMode);
+  const glossary = sanitizeGlossary(req.body.glossary);
 
   jobs.set(id, {
     status: "pending",
-    model, language, fillerMode,
+    model, language, fillerMode, glossary,
     createdAt: Date.now(),
   });
 
@@ -321,7 +324,7 @@ app.post("/api/transcribe/jobs", upload.single("video"), async (req, res) => {
     jobs.set(id, { ...jobs.get(id), status: "running", startedAt: t0 });
     console.log(`[job ${id}] start: lang=${language} model=${model} fillerMode=${fillerMode}`);
     try {
-      const result = await runTranscribe(inputPath, { language, model, fillerMode });
+      const result = await runTranscribe(inputPath, { language, model, fillerMode, glossary });
       const elapsed = Date.now() - t0;
       jobs.set(id, {
         ...jobs.get(id),
@@ -492,6 +495,8 @@ function sanitizeStageResult(name, result) {
       srtUrl: result.srtUrl,
       vttUrl: result.vttUrl,
       segmentCount: result.segments?.length || 0,
+      segments: result.segments || [],
+      edited: result.edited === true,
       language: result.language,
       durationMs: result.durationMs,
       editPlan: result.editPlan || null,
@@ -604,6 +609,41 @@ app.post("/api/jobs/:id/stages/:stage/retry", async (req, res) => {
   retryJobStage(id, stage).catch((e) => console.error(`[job ${id}] retry crash:`, e));
 });
 
+// 교정한 자막을 되돌려 받는다. 프론트에서 오타를 고친 뒤 이걸 호출하면
+// 디스크의 SRT/VTT 가 교체되고, 이어서 burn stage 를 retry 하면 고친 자막으로
+// 다시 구워진다. 다운로드 버튼도 같은 파일을 가리키므로 함께 갱신된다.
+app.post("/api/jobs/:id/subtitles", express.json({ limit: "4mb" }), async (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const job = pipelineJobs.get(id);
+  if (!job) return res.status(404).json({ error: "job not found" });
+
+  const srt = typeof req.body?.srt === "string" ? req.body.srt : null;
+  const vtt = typeof req.body?.vtt === "string" ? req.body.vtt : null;
+  if (!srt || !vtt) return res.status(400).json({ error: "srt 와 vtt 문자열이 모두 필요합니다." });
+
+  const stage = job.stages.transcribe;
+  if (stage?.status !== "done" || !stage.result) {
+    return res.status(400).json({ error: "자막 단계가 완료된 작업에만 적용할 수 있습니다." });
+  }
+
+  const srtPath = path.join(TMP, `${id}.subtitles.srt`);
+  const vttPath = path.join(TMP, `${id}.subtitles.vtt`);
+  await writeFile(srtPath, srt, "utf8");
+  await writeFile(vttPath, vtt, "utf8");
+
+  stage.result.srt = srt;
+  stage.result.vtt = vtt;
+  if (Array.isArray(req.body.segments)) {
+    stage.result.segments = req.body.segments
+      .filter((x) => x && typeof x.text === "string")
+      .map((x) => ({ start: Number(x.start) || 0, end: Number(x.end) || 0, text: x.text }));
+  }
+  stage.result.edited = true;
+
+  console.log(`[job ${id}] 자막 교정본 적용 (${srt.length} chars)`);
+  res.json({ ok: true, segmentCount: stage.result.segments?.length || 0 });
+});
+
 app.get("/api/jobs/:id/files/:name", (req, res) => {
   const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
   const name = String(req.params.name).replace(/[^a-zA-Z0-9._-]/g, "");
@@ -631,6 +671,7 @@ function sanitizeJobOptions(opts) {
     language: sanitizeLang(opts.language),
     model: sanitizeModel(opts.model),
     fillerMode: sanitizeFillerMode(opts.fillerMode),
+    glossary: sanitizeGlossary(opts.glossary),
     // 후속 stage 옵션 — 모두 명시적 opt-in.
     burn: opts.burn === true,
     metadata: opts.metadata === true,
@@ -817,6 +858,7 @@ async function transcribeStageFor(job, editedPath) {
     language: job.options.language,
     model: job.options.model,
     fillerMode: job.options.fillerMode,
+    glossary: job.options.glossary,
     onProgress: (p) => {
       if (!stage) return;
       if (p.phase === "progress" && p.total > 0) {
@@ -1167,6 +1209,13 @@ function sanitizeModel(v) {
   return ALLOWED_MODELS.has(s) ? s : "tiny";
 }
 
+// Whisper 의 initial_prompt 는 224 토큰 창을 쓴다. 한국어는 글자당 토큰이 커서
+// 400자쯤에서 자른다 — 그 이상은 앞부분이 잘려 오히려 효과가 떨어진다.
+const GLOSSARY_MAX = 400;
+function sanitizeGlossary(v) {
+  return String(v || "").replace(/\s+/g, " ").trim().slice(0, GLOSSARY_MAX);
+}
+
 const ALLOWED_FILLER_MODES = new Set(["off", "conservative", "aggressive"]);
 function sanitizeFillerMode(v) {
   const s = String(v || "off").toLowerCase();
@@ -1177,7 +1226,7 @@ const PROGRESS_PREFIX = "@@P@@";
 
 // transcribe.py 를 별도 프로세스로 실행해 stdout JSON 파싱.
 // stdout 은 깨끗한 JSON 만 반환하도록 transcribe.py 가 보장한다.
-function runTranscribe(input, { language, model, fillerMode, onProgress }) {
+function runTranscribe(input, { language, model, fillerMode, glossary, onProgress }) {
   return new Promise((resolve, reject) => {
     const args = [
       path.join(__dirname, "transcribe.py"),
@@ -1191,6 +1240,7 @@ function runTranscribe(input, { language, model, fillerMode, onProgress }) {
     if (fillerMode && fillerMode !== "off") {
       args.push("--filler-mode", fillerMode);
     }
+    if (glossary) args.push("--initial-prompt", glossary);
     const py = spawn(PYTHON_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";

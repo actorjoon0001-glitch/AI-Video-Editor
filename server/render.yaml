@@ -9,6 +9,15 @@ services:
     plan: starter      # free 도 동작하지만 15분 idle 후 슬립
     region: singapore  # 한국 사용자 가까운 리전
     healthCheckPath: /healthz
+    # 백엔드와 무관한 변경(프론트엔드 public/**)으로는 재배포하지 않는다.
+    # 진행 중인 작업 목록이 서버 메모리에만 있어서, 재배포되면 돌고 있던 작업이
+    # 통째로 사라진다. 실제로 프론트만 고쳐 배포했다가 사용자의 4분짜리 편집
+    # 작업이 중간에 날아간 적이 있다.
+    buildFilter:
+      paths:
+        - server/**
+      ignoredPaths:
+        - server/README.md
     envVars:
       - key: ALLOWED_ORIGINS
         value: https://ai-video-editor-good.netlify.app
