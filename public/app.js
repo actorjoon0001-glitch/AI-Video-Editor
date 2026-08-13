@@ -348,8 +348,18 @@ window.addEventListener("drop", (e) => {
   if (list.length) handleFiles(list);
 });
 
+// app.js 는 부트스트랩이 동적으로 주입하므로 DOMContentLoaded 가 이미 지나간
+// 뒤에 실행되는 경우가 많다. 그때는 즉시 실행해야 초기화가 누락되지 않는다.
+function onReady(fn) {
+  if (document.readyState === "loading") {
+    window.addEventListener("DOMContentLoaded", fn, { once: true });
+  } else {
+    fn();
+  }
+}
+
 // 백엔드 URL 미설정 시 토글 비활성
-window.addEventListener("DOMContentLoaded", () => {
+onReady(() => {
   const cb = $("serverMode");
   const hint = $("serverModeHint");
   if (!cb) return;
@@ -359,15 +369,61 @@ window.addEventListener("DOMContentLoaded", () => {
   } else if (hint) {
     hint.textContent = `* 영상이 일시 서버를 거칩니다 (HTTPS, 처리 후 1시간 내 자동 삭제). 백엔드: ${BACKEND_URL}`;
   }
+  wireQueueStageOptions();
 });
+
+// 큐 모드에서만 의미 있는 후속 단계 옵션(메타데이터/업로드) 카드를 토글하고,
+// 백엔드가 실제로 그 단계를 돌릴 수 있는지(/api/health)를 반영한다.
+function wireQueueStageOptions() {
+  const queue = $("queueMode");
+  const card = $("queueStagesCard");
+  if (!queue || !card) return;
+
+  let capsLoaded = false;
+  const sync = async () => {
+    card.hidden = !queue.checked;
+    // 큐 모드가 우선순위를 가지므로 고속 모드는 의미가 없다 — 비활성 표시.
+    const server = $("serverMode");
+    if (server && BACKEND_URL) {
+      server.disabled = queue.checked;
+      if (queue.checked) server.checked = false;
+    }
+    if (!queue.checked || capsLoaded) return;
+    capsLoaded = true;
+    const health = await checkBackendHealth();
+
+    const metaHint = $("metaProviderHint");
+    if (metaHint) {
+      metaHint.textContent = health.metadataProvider === "claude"
+        ? "* Claude 로 생성합니다 — 자막 내용만 근거로 제목/설명/태그를 씁니다."
+        : "* 서버에 ANTHROPIC_API_KEY 가 없어 로컬 키워드 분석으로 생성합니다 (품질은 낮지만 자막에 없는 내용은 만들지 않습니다).";
+    }
+
+    const upload = $("ytUpload");
+    const ytHint = $("ytHint");
+    if (upload && !health.youtube) {
+      upload.checked = false;
+      upload.disabled = true;
+      if (ytHint) ytHint.textContent = "* 서버에 YouTube 자격 증명(YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN)이 없어 업로드를 쓸 수 없습니다.";
+    }
+    const publicOpt = $("ytPrivacy")?.querySelector('option[value="public"]');
+    if (publicOpt && health.youtube && !health.youtubeAllowsPublic) {
+      publicOpt.disabled = true;
+      publicOpt.textContent = "전체 공개 (public) — 서버에서 비활성";
+    }
+  };
+  queue.addEventListener("change", sync);
+  sync();
+}
 
 resetBtn.addEventListener("click", () => {
   pickedFile = null;
   pickedFiles = [];
   fileInput.value = "";
-  controls.hidden = true;
+  // 개인용 작업대 — 설정 패널은 항상 열어둔다 (파일 없이도 미리 조정 가능).
   progress.hidden = true;
   resultSection.hidden = true;
+  const note = $("idleNote"); if (note) note.hidden = false;
   thumbsBlock.hidden = true;
   thumbUrls.forEach((u) => URL.revokeObjectURL(u));
   thumbUrls = [];
@@ -380,6 +436,10 @@ resetBtn.addEventListener("click", () => {
   resetSubtitleState();
   lastEditPlan = null;
   const epb = $("editPlanBlock"); if (epb) epb.hidden = true;
+  const mb = $("metaBlock"); if (mb) mb.hidden = true;
+  const jpb = $("jobPipelineBlock"); if (jpb) jpb.hidden = true;
+  const bdb = $("burnedDownloadBtn");
+  if (bdb) { bdb.hidden = true; bdb.classList.add("disabled"); bdb.removeAttribute("href"); }
   document.querySelector(".dz-title").textContent = "여기로 영상을 드래그하세요";
   document.querySelector(".dz-sub").innerHTML =
     '또는 <button type="button" id="pickBtn" class="link">파일 선택</button> · mp4 / mov / webm · 여러 개 가능';
@@ -391,6 +451,13 @@ resetBtn.addEventListener("click", () => {
 });
 
 runBtn.addEventListener("click", () => {
+  if (pickedFiles.length === 0) {
+    setStatus("영상을 먼저 올려주세요.");
+    dropzone.classList.add("drag");
+    setTimeout(() => dropzone.classList.remove("drag"), 600);
+    return;
+  }
+  const note = $("idleNote"); if (note) note.hidden = true;
   const useQueue = $("queueMode")?.checked && BACKEND_URL;
   const useServer = $("serverMode")?.checked && BACKEND_URL;
   const userSafe = $("safeMode")?.checked === true;
@@ -1036,6 +1103,11 @@ async function checkBackendHealth() {
     const body = await r.json();
     backendHealthCache = {
       ok: true, routes: body.routes || null, version: body.version,
+      whisper: body.whisper,
+      // 큐 모드 후속 단계 가용성 (구버전 백엔드면 undefined).
+      metadataProvider: body.metadataProvider || null,
+      youtube: body.youtube === true,
+      youtubeAllowsPublic: body.youtubeAllowsPublic === true,
       url, httpStatus: 200, body: JSON.stringify(body).slice(0, 200),
     };
     return backendHealthCache;
@@ -1429,6 +1501,11 @@ async function runQueueModePipeline() {
     fillerMode: state.filler || "off",
     language: "ko",
     model: "tiny",
+    burn: $("burnSubtitles")?.checked === true,
+    metadata: $("genMetadata")?.checked === true,
+    metadataPersona: $("metaPersona")?.value?.trim() || "",
+    upload: $("ytUpload")?.checked === true,
+    privacy: $("ytPrivacy")?.value || "private",
   }));
   const startResp = await fetch(`${BACKEND_URL}/api/jobs`, { method: "POST", body: fd });
   if (!startResp.ok) {
@@ -1496,7 +1573,9 @@ function renderJobPipeline(job) {
     const icon = JOB_STAGE_ICON[s.status] || "·";
     const detail = jobStageDetailText(key, s);
     const detailHtml = detail ? `<span class="detail">${escapeHtml(detail)}</span>` : "";
-    const retryBtn = s.status === "failed" && (key === "transcribe" || key === "thumbnail")
+    // edit 은 원본이 이미 지워져 재시도 불가. upload 는 중복 게시 위험 때문에
+    // 실패했을 때만 (백엔드도 같은 규칙으로 막는다).
+    const retryBtn = s.status === "failed" && key !== "edit"
       ? `<button type="button" class="btn" data-retry="${key}">다시 시도</button>` : "";
     return `<li class="job-stage ${s.status}">
       <span class="icon">${icon}</span>
@@ -1524,6 +1603,17 @@ function jobStageDetailText(key, s) {
     }
     if (key === "thumbnail") {
       return `${s.result.urls?.length || 0}장 추출`;
+    }
+    if (key === "burn") {
+      const mb = s.result.sizeBytes ? ` · ${(s.result.sizeBytes / 1024 / 1024).toFixed(1)} MB` : "";
+      return `자막 합성 완료${mb} · ${((s.result.durationMs || 0) / 1000).toFixed(1)}s`;
+    }
+    if (key === "metadata") {
+      const via = s.result.source === "claude" ? `Claude(${s.result.model})` : "로컬 키워드 분석";
+      return `제목 후보 ${s.result.titles?.length || 0}개 · 태그 ${s.result.tags?.length || 0}개 · ${via}`;
+    }
+    if (key === "upload") {
+      return `${s.result.privacyStatus || "?"} 로 게시 · ${s.result.url || ""}`;
     }
   }
   return "";
@@ -1617,7 +1707,228 @@ async function wireQueueResults(job) {
     }
     thumbsBlock.hidden = false;
   }
+  // 자막 번인본 — 편집본과 별개 파일이라 다운로드 버튼을 따로 노출한다.
+  const burn = job.stages.burn;
+  const burnedBtn = $("burnedDownloadBtn");
+  if (burnedBtn && burn?.status === "done" && burn.result?.url) {
+    burnedBtn.href = BACKEND_URL + burn.result.url;
+    burnedBtn.hidden = false;
+    burnedBtn.classList.remove("disabled");
+    burnedBtn.removeAttribute("aria-disabled");
+  }
+  renderMetadata(job.stages.metadata, job.stages.upload);
 }
+
+// 메타데이터 패널 — 제목 후보/설명/태그/썸네일 카피 + 업로드 결과 링크.
+function renderMetadata(metaStage, uploadStage) {
+  const block = $("metaBlock");
+  if (!block) return;
+  const m = metaStage?.status === "done" ? metaStage.result : null;
+  if (!m) { block.hidden = true; return; }
+  block.hidden = false;
+
+  const src = $("metaSource");
+  if (src) {
+    src.textContent = m.source === "claude" ? `Claude ${m.model || ""}` : "로컬 키워드 분석";
+  }
+
+  const titles = $("metaTitles");
+  if (titles) {
+    titles.innerHTML = (m.titles || [])
+      .map((t) => `<li><span>${escapeHtml(t)}</span><button type="button" class="btn ghost" data-copy-text="${escapeHtml(t)}">복사</button></li>`)
+      .join("");
+  }
+  const desc = $("metaDescription");
+  if (desc) desc.textContent = m.description || "";
+
+  const tags = $("metaTags");
+  const tagsText = (m.tags || []).join(", ");
+  if (tags) {
+    tags.innerHTML = (m.tags || []).map((t) => `<span class="meta-tag">${escapeHtml(t)}</span>`).join("");
+  }
+  const tagsHidden = $("metaTagsText");
+  if (tagsHidden) tagsHidden.textContent = tagsText;
+
+  const hook = $("metaThumbCopy");
+  if (hook) {
+    hook.textContent = m.thumbnailSubcopy
+      ? `${m.thumbnailCopy} / ${m.thumbnailSubcopy}`
+      : (m.thumbnailCopy || "-");
+  }
+
+  const upRow = $("metaUploadRow");
+  const up = uploadStage?.status === "done" ? uploadStage.result : null;
+  if (upRow) {
+    if (up?.url) {
+      upRow.hidden = false;
+      const link = $("uploadedLink");
+      if (link) { link.href = up.url; link.textContent = `업로드된 영상 열기 (${up.privacyStatus})`; }
+      const st = $("uploadedStatus");
+      if (st) {
+        st.textContent = [
+          `제목: ${up.title || "-"}`,
+          up.publishAt ? `예약 게시: ${up.publishAt}` : null,
+          up.thumbnailSet ? "썸네일 적용됨" : (up.thumbnailError ? `썸네일 실패: ${up.thumbnailError}` : null),
+        ].filter(Boolean).join(" · ");
+      }
+    } else {
+      upRow.hidden = true;
+    }
+  }
+}
+
+// ── 개인용 설정 저장 ────────────────────────────────────────────────────────
+// 혼자 쓰는 도구라 매번 같은 값을 다시 고르는 게 제일 번거롭다. 체크박스/슬라이더/
+// 칩 선택/텍스트 입력을 전부 localStorage 에 넣고 다음 방문에 그대로 복원한다.
+const PREFS_KEY = "aive.prefs.v1";
+const PREF_CHECKBOXES = [
+  "queueMode", "autoSubtitles", "burnSubtitles", "serverMode",
+  "genMetadata", "ytUpload", "loudnorm", "safeMode",
+];
+const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol"];
+const PREF_TEXTS = ["metaPersona", "ytPrivacy"];
+const PREF_CHIPS = ["preset", "ratio", "mode", "speed", "filler"];
+
+function readPrefs() {
+  try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; }
+}
+
+function savePrefs() {
+  const p = {};
+  for (const id of PREF_CHECKBOXES) if ($(id)) p[id] = $(id).checked;
+  for (const id of PREF_RANGES) if ($(id)) p[id] = $(id).value;
+  for (const id of PREF_TEXTS) if ($(id)) p[id] = $(id).value;
+  for (const attr of PREF_CHIPS) {
+    const active = document.querySelector(`[data-${attr}].active`);
+    if (active) p[`chip.${attr}`] = active.dataset[attr];
+  }
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify(p)); } catch {}
+}
+
+function restorePrefs() {
+  const p = readPrefs();
+  for (const id of [...PREF_CHECKBOXES]) {
+    if (p[id] !== undefined && $(id)) $(id).checked = p[id];
+  }
+  for (const id of [...PREF_RANGES, ...PREF_TEXTS]) {
+    if (p[id] !== undefined && $(id)) $(id).value = p[id];
+  }
+  // 슬라이더 라벨 재동기화
+  for (const [src, label, fmt] of sliders) {
+    const s = $(src), l = $(label);
+    if (s && l) l.textContent = fmt(s.value);
+  }
+  // 칩은 click() 으로 복원해야 state 와 preset 부수효과까지 같이 반영된다.
+  // preset 은 슬라이더를 덮어쓰므로 복원 순서에서 제외 (저장된 슬라이더 값 우선).
+  for (const attr of PREF_CHIPS) {
+    if (attr === "preset") continue;
+    const v = p[`chip.${attr}`];
+    if (v === undefined) continue;
+    const btn = document.querySelector(`[data-${attr}="${v}"]`);
+    if (btn && !btn.classList.contains("active")) btn.click();
+  }
+  const preset = p["chip.preset"];
+  if (preset) {
+    document.querySelectorAll("[data-preset]").forEach((b) => {
+      b.classList.toggle("active", b.dataset.preset === preset);
+    });
+    state.preset = preset;
+  }
+  // 큐 모드 카드 표시 여부는 change 리스너가 정하므로, 복원 후 한 번 알린다.
+  $("queueMode")?.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function wirePrefPersistence() {
+  const ids = [...PREF_CHECKBOXES, ...PREF_RANGES, ...PREF_TEXTS];
+  for (const id of ids) {
+    const el = $(id);
+    if (el) {
+      el.addEventListener("change", savePrefs);
+      el.addEventListener("input", savePrefs);
+    }
+  }
+  for (const attr of PREF_CHIPS) {
+    document.querySelectorAll(`[data-${attr}]`).forEach((b) => {
+      // bindChips 가 먼저 등록돼 있으므로 여기서는 저장만 (state 는 이미 갱신됨).
+      b.addEventListener("click", savePrefs);
+    });
+  }
+}
+
+// ── 상단바: 백엔드 URL 편집 + 능력치 표시등 ─────────────────────────────────
+function wireTopbar() {
+  const toggle = $("backendToggle");
+  const panel = $("backendPanel");
+  const input = $("backendUrlInput");
+  if (toggle && panel) {
+    toggle.addEventListener("click", () => { panel.hidden = !panel.hidden; });
+  }
+  if (input) input.value = localStorage.getItem("backendUrl") || DEFAULT_BACKEND_URL;
+
+  $("backendSaveBtn")?.addEventListener("click", () => {
+    const v = (input?.value || "").trim().replace(/\/+$/, "");
+    if (v) localStorage.setItem("backendUrl", v);
+    else localStorage.removeItem("backendUrl");
+    location.reload();
+  });
+  $("backendResetBtn")?.addEventListener("click", () => {
+    localStorage.removeItem("backendUrl");
+    location.reload();
+  });
+
+  const hint = $("backendPanelHint");
+  if (hint) hint.textContent = `현재: ${BACKEND_URL || "(미설정)"} · 저장하면 페이지를 새로 읽습니다.`;
+
+  refreshStatusPills();
+}
+
+function setPill(id, state, text) {
+  const el = $(id);
+  if (!el) return;
+  el.dataset.state = state;
+  el.textContent = text;
+}
+
+async function refreshStatusPills() {
+  const health = await checkBackendHealth();
+  if (!health.ok) {
+    setPill("pillBackend", "bad", "백엔드 연결 실패");
+    setPill("pillWhisper", "off", "자막 불가");
+    setPill("pillMeta", "off", "메타데이터 불가");
+    setPill("pillYoutube", "off", "업로드 불가");
+    return;
+  }
+  const ver = health.version && health.version !== "unknown" ? health.version.slice(0, 7) : null;
+  setPill("pillBackend", "ok", ver ? `백엔드 ${ver}` : "백엔드 연결됨");
+  setPill("pillWhisper", health.whisper === false ? "bad" : "ok",
+    health.whisper === false ? "자막 엔진 오류" : "자막");
+  setPill("pillMeta", "ok",
+    health.metadataProvider === "claude" ? "메타데이터 Claude" : "메타데이터 로컬");
+  setPill("pillYoutube", health.youtube ? "ok" : "off",
+    health.youtube ? (health.youtubeAllowsPublic ? "YouTube 공개 허용" : "YouTube 비공개만") : "YouTube 미설정");
+}
+
+onReady(() => {
+  restorePrefs();
+  wirePrefPersistence();
+  wireTopbar();
+});
+
+// 복사 버튼 — data-copy(요소 id의 텍스트) 또는 data-copy-text(리터럴).
+document.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-copy], [data-copy-text]");
+  if (!btn) return;
+  const text = btn.dataset.copyText ?? ($(btn.dataset.copy)?.textContent || "");
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    const prev = btn.textContent;
+    btn.textContent = "복사됨";
+    setTimeout(() => { btn.textContent = prev; }, 1200);
+  } catch {
+    appendLog("클립보드 복사 실패 — 직접 선택해 복사해 주세요.");
+  }
+});
 
 async function processOnBackend(file, opts, onProgress) {
   if (!BACKEND_URL) throw new Error("백엔드 URL 이 설정되지 않았습니다.");

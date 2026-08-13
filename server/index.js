@@ -15,6 +15,8 @@ import { mkdir, unlink, stat, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { generateMetadata, metadataProvider } from "./metadata.js";
+import { uploadVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy } from "./youtube.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -94,6 +96,10 @@ function healthBody() {
     whisper: whisperReady,
     whisperError: whisperReady === false ? (whisperError || "").slice(-500) : null,
     whisperModel: process.env.WHISPER_MODEL || "tiny",
+    // 큐 모드 후속 stage 가용성 — 프론트가 옵션을 켤지 말지 판단하는 데 쓴다.
+    metadataProvider: metadataProvider(),
+    youtube: youtubeConfigured(),
+    youtubeAllowsPublic: youtubeAllowsPublic(),
     routes: [
       { method: "POST", path: "/api/process" },
       { method: "GET",  path: "/api/result/:id" },
@@ -402,8 +408,9 @@ const STAGE_NAMES = ["edit", "transcribe", "burn", "thumbnail", "metadata", "upl
 // 핵심 단계 — 실패하면 후속 stage 들 의미 없으니 전체 실패로.
 const CRITICAL_STAGES = new Set(["edit"]);
 
-// 아직 구현 안 된 stage — 자동으로 skipped 로 표시 (후속 PR 에서 채움).
-const STUB_STAGES = new Set(["burn", "metadata", "upload"]);
+// 개별 재시도를 받는 stage. edit 은 원본 업로드가 이미 지워져서, upload 는
+// 중복 게시 위험 때문에 제외한다 (upload 는 실패했을 때만 아래에서 허용).
+const RETRYABLE_STAGES = new Set(["transcribe", "burn", "thumbnail", "metadata"]);
 
 const pipelineJobs = new Map();   // id → job state
 const PIPELINE_JOB_TTL_MS = 60 * 60 * 1000; // 1h
@@ -424,10 +431,7 @@ setInterval(() => {
 function newPipelineJob(id, options) {
   const stages = {};
   for (const name of STAGE_NAMES) {
-    stages[name] = { status: STUB_STAGES.has(name) ? "skipped" : "queued" };
-    if (STUB_STAGES.has(name)) {
-      stages[name].note = "구현 예정 (후속 PR)";
-    }
+    stages[name] = { status: "queued" };
   }
   return {
     id,
@@ -494,6 +498,36 @@ function sanitizeStageResult(name, result) {
   if (name === "thumbnail") {
     return { urls: result.urls };
   }
+  if (name === "burn") {
+    return {
+      url: result.url,
+      sizeBytes: result.sizeBytes,
+      durationMs: result.durationMs,
+    };
+  }
+  if (name === "metadata") {
+    return {
+      url: result.url,
+      titles: result.titles,
+      description: result.description,
+      tags: result.tags,
+      thumbnailCopy: result.thumbnailCopy,
+      thumbnailSubcopy: result.thumbnailSubcopy,
+      source: result.source,
+      model: result.model,
+    };
+  }
+  if (name === "upload") {
+    return {
+      videoId: result.videoId,
+      url: result.url,
+      privacyStatus: result.privacyStatus,
+      publishAt: result.publishAt,
+      title: result.title,
+      thumbnailSet: result.thumbnailSet,
+      thumbnailError: result.thumbnailError || null,
+    };
+  }
   return result;
 }
 
@@ -542,10 +576,22 @@ app.post("/api/jobs/:id/stages/:stage/retry", async (req, res) => {
   const job = pipelineJobs.get(id);
   if (!job) return res.status(404).json({ error: "job not found" });
   if (!STAGE_NAMES.includes(stage)) return res.status(400).json({ error: "unknown stage" });
-  if (STUB_STAGES.has(stage)) return res.status(400).json({ error: "stage not implemented yet" });
+
+  // upload 는 재시도가 중복 게시로 이어질 수 있어 "실패했을 때만" 허용.
+  const retryable =
+    RETRYABLE_STAGES.has(stage) ||
+    (stage === "upload" && job.stages.upload?.status === "failed");
+  if (!retryable) {
+    return res.status(400).json({
+      error:
+        stage === "edit"
+          ? "edit 은 원본 업로드가 이미 정리돼 재시도할 수 없습니다. 다시 업로드해 주세요."
+          : `${stage} 단계는 재시도할 수 없습니다.`,
+    });
+  }
 
   // edit 결과 파일이 있어야 후속 stage 재시도 가능
-  if (stage !== "edit" && (job.stages.edit?.status !== "done")) {
+  if (job.stages.edit?.status !== "done") {
     return res.status(400).json({ error: "edit stage 가 done 이어야 후속 stage 재시도 가능" });
   }
 
@@ -582,7 +628,22 @@ function sanitizeJobOptions(opts) {
     language: sanitizeLang(opts.language),
     model: sanitizeModel(opts.model),
     fillerMode: sanitizeFillerMode(opts.fillerMode),
+    // 후속 stage 옵션 — 모두 명시적 opt-in.
+    burn: opts.burn === true,
+    metadata: opts.metadata === true,
+    metadataPersona: String(opts.metadataPersona || "").slice(0, 500),
+    upload: opts.upload === true,
+    privacy: sanitizePrivacy(opts.privacy),
+    publishAt: sanitizePublishAt(opts.publishAt),
   };
+}
+
+// ISO 8601 예약 게시 시각. 과거이거나 형식이 틀리면 무시 (즉시 게시).
+function sanitizePublishAt(v) {
+  if (!v) return null;
+  const t = Date.parse(String(v));
+  if (!Number.isFinite(t) || t <= Date.now()) return null;
+  return new Date(t).toISOString();
 }
 
 async function runJobPipeline(id, inputPath) {
@@ -611,6 +672,13 @@ async function runJobPipeline(id, inputPath) {
   });
 
   if (job.stages.edit.status !== "done") {
+    // edit 이 죽으면 후속 stage 는 입력 자체가 없다. queued 로 남겨두면 job 이
+    // 영원히 running 으로 보이므로 명시적으로 skipped 처리한다.
+    for (const name of STAGE_NAMES) {
+      if (name !== "edit") {
+        job.stages[name] = { status: "skipped", note: "편집 단계 실패로 중단" };
+      }
+    }
     job.status = computeJobStatus(job);
     job.completedAt = Date.now();
     try { await unlink(inputPath); } catch {}
@@ -627,6 +695,9 @@ async function runJobPipeline(id, inputPath) {
     job.stages.transcribe = { status: "skipped", note: "옵션 OFF" };
   }
 
+  // ── burn ── (비치명적) 자막 SRT 가 있어야 의미가 있다.
+  await runOptionalStage(job, "burn", () => burnStageFor(job, editedPath));
+
   // ── thumbnail ── (비치명적)
   if (job.options.thumbnails) {
     await runStage(job, "thumbnail", () => thumbnailStageFor(job, editedPath));
@@ -634,11 +705,49 @@ async function runJobPipeline(id, inputPath) {
     job.stages.thumbnail = { status: "skipped", note: "옵션 OFF" };
   }
 
-  // burn / metadata / upload — STUB_STAGES 라 newPipelineJob 에서 이미 skipped 로 세팅됨
+  // ── metadata ── (비치명적) 전사 결과에서 제목/설명/태그 생성.
+  await runOptionalStage(job, "metadata", () => metadataStageFor(job));
+
+  // ── upload ── (비치명적) 명시적 opt-in + 자격 증명이 있을 때만.
+  await runOptionalStage(job, "upload", () => uploadStageFor(job, editedPath));
 
   job.status = computeJobStatus(job);
   job.completedAt = Date.now();
   console.log(`[job ${id}] complete: ${job.status}`);
+}
+
+// 선행 조건을 먼저 확인해서, 못 도는 stage 는 "왜 건너뛰었는지"를 남기고
+// skipped 로 끝낸다 (실패가 아니라 미실행이라는 걸 UI 가 구분할 수 있게).
+async function runOptionalStage(job, name, fn) {
+  const skip = stageSkipReason(job, name);
+  if (skip) {
+    job.stages[name] = { status: "skipped", note: skip };
+    return;
+  }
+  await runStage(job, name, fn);
+}
+
+function stageSkipReason(job, name) {
+  const o = job.options;
+  if (name === "burn") {
+    if (!o.burn) return "옵션 OFF";
+    if (job.stages.transcribe?.status !== "done") return "자막 단계가 성공해야 번인 가능";
+    if (!job.stages.transcribe.result?.srt) return "SRT 자막이 비어 있음";
+    return null;
+  }
+  if (name === "metadata") {
+    if (!o.metadata) return "옵션 OFF";
+    if (job.stages.transcribe?.status !== "done") return "자막 단계가 성공해야 메타데이터 생성 가능";
+    if (!(job.stages.transcribe.result?.segments?.length > 0)) return "자막 세그먼트가 비어 있음";
+    return null;
+  }
+  if (name === "upload") {
+    if (!o.upload) return "옵션 OFF";
+    if (!youtubeConfigured()) return "서버에 YouTube 자격 증명(YOUTUBE_*)이 없음";
+    if (!uploadTitleFor(job)) return "제목이 없음 — 메타데이터 단계가 성공해야 업로드 가능";
+    return null;
+  }
+  return null;
 }
 
 async function retryJobStage(id, stage) {
@@ -649,8 +758,12 @@ async function retryJobStage(id, stage) {
     await runStage(job, "transcribe", () => transcribeStageFor(job, editedPath));
   } else if (stage === "thumbnail") {
     await runStage(job, "thumbnail", () => thumbnailStageFor(job, editedPath));
-  } else if (stage === "edit") {
-    return; // edit retry 는 input 원본이 필요한데 정리됐으므로 미지원 (재업로드 필요)
+  } else if (stage === "burn") {
+    await runOptionalStage(job, "burn", () => burnStageFor(job, editedPath));
+  } else if (stage === "metadata") {
+    await runOptionalStage(job, "metadata", () => metadataStageFor(job));
+  } else if (stage === "upload") {
+    await runOptionalStage(job, "upload", () => uploadStageFor(job, editedPath));
   }
   job.status = computeJobStatus(job);
 }
@@ -719,6 +832,75 @@ async function thumbnailStageFor(job, editedPath) {
     urls.push(`/api/jobs/${job.id}/files/thumb_${i}.jpg`);
   }
   return { urls };
+}
+
+// SRT 를 편집본에 영구 합성. /api/burn-subtitles 와 같은 libass 필터를 쓰되,
+// 파일이 이미 디스크에 있으므로 업로드/다운로드 왕복이 없다.
+async function burnStageFor(job, editedPath) {
+  const srtPath = path.join(TMP, `${job.id}.subtitles.srt`);
+  if (!existsSync(srtPath)) {
+    throw new Error("자막 SRT 파일을 찾을 수 없습니다. 자막 단계를 다시 시도해 주세요.");
+  }
+  const out = path.join(TMP, `${job.id}.burned.mp4`);
+  job.artifacts.push(out);
+
+  const escapedSrt = srtPath.replace(/\\/g, "/").replace(/:/g, "\\:");
+  const t0 = Date.now();
+  await runFFmpeg([
+    "-i", editedPath,
+    "-vf", `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=20,Outline=2,Shadow=0,MarginV=40'`,
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    "-y", out,
+  ]);
+  return {
+    _path: out,
+    url: `/api/jobs/${job.id}/files/burned.mp4`,
+    sizeBytes: (await stat(out)).size,
+    durationMs: Date.now() - t0,
+  };
+}
+
+// 전사 세그먼트 → 제목 후보 / 설명 / 태그 / 썸네일 카피.
+async function metadataStageFor(job) {
+  const segments = job.stages.transcribe?.result?.segments || [];
+  const meta = await generateMetadata(segments, { persona: job.options.metadataPersona });
+  const metaPath = path.join(TMP, `${job.id}.metadata.json`);
+  await writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
+  job.artifacts.push(metaPath);
+  return { ...meta, url: `/api/jobs/${job.id}/files/metadata.json` };
+}
+
+// YouTube 업로드. 자막 번인본이 있으면 그쪽을 올린다 (사용자가 번인을 요청한
+// 이상 그게 최종 산출물이므로).
+async function uploadStageFor(job, editedPath) {
+  const burned = job.stages.burn?.status === "done" ? job.stages.burn.result?._path : null;
+  const videoPath = burned && existsSync(burned) ? burned : editedPath;
+  const meta = job.stages.metadata?.result || {};
+  const thumb = job.stages.thumbnail?.status === "done"
+    ? path.join(TMP, `${job.id}.thumb_0.jpg`)
+    : null;
+
+  return uploadVideo({
+    videoPath,
+    title: uploadTitleFor(job),
+    description: meta.description || "",
+    tags: meta.tags || [],
+    privacy: job.options.privacy,
+    publishAtIso: job.options.publishAt,
+    thumbnailPath: thumb && existsSync(thumb) ? thumb : null,
+    onProgress: ({ uploaded, total }) => {
+      console.log(`[job ${job.id}] upload ${((uploaded / total) * 100).toFixed(0)}%`);
+    },
+  });
+}
+
+function uploadTitleFor(job) {
+  const titles = job.stages.metadata?.status === "done"
+    ? job.stages.metadata.result?.titles
+    : null;
+  return titles?.length ? titles[0] : null;
 }
 
 function probeDurationSec(file) {

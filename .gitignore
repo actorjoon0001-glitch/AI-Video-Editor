@@ -11,6 +11,9 @@ client_secrets.json
 *_secrets.json
 .auto_editor/
 
+# Node
+node_modules/
+
 # Generated artifacts
 metadata.json
 thumbnail.png
