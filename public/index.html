@@ -219,7 +219,9 @@
             <button type="button" class="chip active" data-preview="edited" role="tab" aria-selected="true">편집본</button>
           </div>
         </div>
-        <video id="resultVideo" controls playsinline></video>
+        <!-- crossorigin 이 없으면 브라우저가 교차 출처 <track>(VTT) 로드를 거부한다.
+             큐 모드 자막은 백엔드(onrender.com)에서 오므로 이게 반드시 필요하다. -->
+        <video id="resultVideo" controls playsinline crossorigin="anonymous"></video>
         <div class="result-stats" id="resultStats"></div>
         <div class="row">
           <a id="downloadBtn" class="btn primary" download="edited.mp4">mp4 다운로드</a>

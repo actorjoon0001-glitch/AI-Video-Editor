@@ -1654,9 +1654,14 @@ function jobStageDetailText(key, s) {
   if (s.note) return s.note;
   if (s.status === "running") {
     const elapsed = s.startedAt ? ` · ${Math.round((Date.now() - s.startedAt) / 1000)}초 경과` : "";
-    if (s.progress?.totalSec > 0) {
-      const { pct, outTimeSec, totalSec } = s.progress;
-      return `인코딩 ${pct}% (${outTimeSec.toFixed(0)}s / ${totalSec.toFixed(0)}s)${elapsed}`;
+    const p = s.progress;
+    // 자막 단계는 퍼센트가 나오기 전에 모델 다운로드/로딩 구간이 있다.
+    // 그 구간이 제일 길 수 있으므로 뭘 하는 중인지라도 알려준다.
+    if (p?.phase === "model_load") return `Whisper 모델 준비 중 (처음 쓰는 모델이면 다운로드)${elapsed}`;
+    if (p?.phase === "model_ready" || p?.phase === "transcribe_start") return `음성 분석 시작${elapsed}`;
+    if (p?.totalSec > 0 && p.outTimeSec >= 0) {
+      const verb = key === "transcribe" ? "전사" : "인코딩";
+      return `${verb} ${p.pct}% (${p.outTimeSec.toFixed(0)}s / ${p.totalSec.toFixed(0)}s)${elapsed}`;
     }
     return `진행 중${elapsed}`;
   }

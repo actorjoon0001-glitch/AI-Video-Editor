@@ -808,10 +808,28 @@ async function runStage(job, name, fn) {
 }
 
 async function transcribeStageFor(job, editedPath) {
+  const stage = job.stages.transcribe;
+  if (stage) stage.progress = { phase: "model_load", pct: 0 };
+  const t0 = Date.now();
   const result = await runTranscribe(editedPath, {
     language: job.options.language,
     model: job.options.model,
     fillerMode: job.options.fillerMode,
+    onProgress: (p) => {
+      if (!stage) return;
+      if (p.phase === "progress" && p.total > 0) {
+        stage.progress = {
+          phase: "progress",
+          outTimeSec: p.done,
+          totalSec: p.total,
+          pct: Math.min(99, Math.round((p.done / p.total) * 100)),
+        };
+      } else {
+        // model_load / model_ready / transcribe_start — 퍼센트는 없지만
+        // "모델 받는 중"인지 "전사 중"인지는 알려줄 수 있다.
+        stage.progress = { phase: p.phase, pct: 0, totalSec: p.total || 0 };
+      }
+    },
   });
   // SRT/VTT 를 디스크에 떨어뜨리고 url 로 노출
   const srtPath = path.join(TMP, `${job.id}.subtitles.srt`);
@@ -822,6 +840,9 @@ async function transcribeStageFor(job, editedPath) {
   job.artifacts.push(srtPath, vttPath);
   return {
     ...result,
+    // transcribe.py 는 소요시간을 모른다. HTTP 엔드포인트 쪽은 각자 재던
+    // durationMs 를 큐 파이프라인에서는 아무도 안 넣어서 항상 0.0s 로 찍혔다.
+    durationMs: Date.now() - t0,
     srtUrl: result.srt ? `/api/jobs/${job.id}/files/subtitles.srt` : null,
     vttUrl: result.vtt ? `/api/jobs/${job.id}/files/subtitles.vtt` : null,
   };
@@ -1136,9 +1157,11 @@ function sanitizeFillerMode(v) {
   return ALLOWED_FILLER_MODES.has(s) ? s : "off";
 }
 
+const PROGRESS_PREFIX = "@@P@@";
+
 // transcribe.py 를 별도 프로세스로 실행해 stdout JSON 파싱.
 // stdout 은 깨끗한 JSON 만 반환하도록 transcribe.py 가 보장한다.
-function runTranscribe(input, { language, model, fillerMode }) {
+function runTranscribe(input, { language, model, fillerMode, onProgress }) {
   return new Promise((resolve, reject) => {
     const args = [
       path.join(__dirname, "transcribe.py"),
@@ -1156,14 +1179,28 @@ function runTranscribe(input, { language, model, fillerMode }) {
     let stdout = "";
     let stderr = "";
     py.stdout.on("data", (d) => { stdout += d.toString(); });
+    // transcribe.py 는 "@@P@@{json}" 형태로 진행 상황을 stderr 에 흘린다.
+    // (stdout 은 결과 JSON 전용이라 섞을 수 없다.)
+    let pending = "";
     py.stderr.on("data", (d) => {
-      stderr += d.toString();
+      const chunk = d.toString();
+      stderr += chunk;
       if (stderr.length > 200_000) stderr = stderr.slice(-100_000);
+      if (!onProgress) return;
+      pending += chunk;
+      const lines = pending.split("\n");
+      pending = lines.pop() || "";
+      for (const line of lines) {
+        const i = line.indexOf(PROGRESS_PREFIX);
+        if (i < 0) continue;
+        try { onProgress(JSON.parse(line.slice(i + PROGRESS_PREFIX.length))); } catch {}
+      }
     });
     py.on("error", reject);
     py.on("exit", (code) => {
       if (code !== 0) {
-        return reject(new Error(`transcribe exit ${code}: ${stderr.slice(-1500)}`));
+        const clean = stderr.split("\n").filter((l) => !l.includes(PROGRESS_PREFIX)).join("\n");
+        return reject(new Error(`transcribe exit ${code}: ${clean.slice(-1500)}`));
       }
       try {
         resolve(JSON.parse(stdout));

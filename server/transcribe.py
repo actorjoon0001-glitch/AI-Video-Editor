@@ -49,6 +49,18 @@ NG_CHUNK_SIZE_S = 8.0     # chunk 한 개의 목표 길이
 NG_SIMILARITY_THRESHOLD = 0.65
 
 
+PROGRESS_PREFIX = "@@P@@"
+
+
+def emit(payload: dict) -> None:
+    """진행 상황을 stderr 로 한 줄씩 흘린다 (stdout 은 결과 JSON 전용)."""
+    try:
+        sys.stderr.write(PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def fmt_srt(seconds: float) -> str:
     if seconds < 0:
         seconds = 0.0
@@ -213,7 +225,11 @@ def main() -> int:
 
     from faster_whisper import WhisperModel
 
+    # 진행 상황은 stderr 로만 내보낸다 — stdout 은 서버가 통째로 JSON 파싱하므로
+    # 한 글자라도 섞이면 안 된다.
+    emit({"phase": "model_load", "model": args.model})
     model = WhisperModel(args.model, device="auto", compute_type=args.compute_type)
+    emit({"phase": "model_ready", "model": args.model})
 
     want_words = args.filler_mode != "off"
     segments_iter, info = model.transcribe(
@@ -223,6 +239,8 @@ def main() -> int:
         word_timestamps=want_words,
         beam_size=args.beam_size,
     )
+    total_s = float(getattr(info, "duration", 0) or 0)
+    emit({"phase": "transcribe_start", "total": total_s})
 
     segments: list[dict] = []
     words: list[dict] = []
@@ -231,7 +249,13 @@ def main() -> int:
     text_chunks: list[str] = []
 
     idx = 1
+    last_emit = 0.0
     for s in segments_iter:
+        # transcribe 는 제너레이터라 세그먼트가 나올 때마다 그만큼 처리된 것이다.
+        # end 시각을 전체 길이로 나누면 그게 곧 진행률.
+        if total_s > 0 and (float(s.end) - last_emit) >= 2.0:
+            last_emit = float(s.end)
+            emit({"phase": "progress", "done": last_emit, "total": total_s})
         text = (s.text or "").strip()
         if not text:
             continue
