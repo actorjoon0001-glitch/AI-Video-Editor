@@ -112,6 +112,7 @@ let backendHealthCache = null; // { ok, routes, checkedAt } | { ok: false, error
 const state = {
   preset: "standard",
   ratio: "16:9",
+  quality: "1080p",
   mode: "full",
   speed: 1.0,
   filler: "off", // "off" | "conservative" | "aggressive"
@@ -154,6 +155,7 @@ function bindChips(attr, key) {
 }
 bindChips("preset", "preset");
 bindChips("ratio", "ratio");
+bindChips("quality", "quality");
 bindChips("mode", "mode");
 bindChips("speed", "speed");
 bindChips("filler", "filler");
@@ -582,6 +584,7 @@ async function runServerPipeline() {
   const serverOpts = {
     keeps,
     ratio: state.ratio,
+    quality: state.quality,
     speed: state.speed,
     loudnorm: $("loudnorm").checked,
   };
@@ -1860,7 +1863,7 @@ const PREF_CHECKBOXES = [
 ];
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol"];
 const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel"];
-const PREF_CHIPS = ["preset", "ratio", "mode", "speed", "filler"];
+const PREF_CHIPS = ["preset", "ratio", "quality", "mode", "speed", "filler"];
 
 function readPrefs() {
   try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; } catch { return {}; }
@@ -2446,21 +2449,21 @@ function atempoChain(speed) {
   return parts.join(",");
 }
 
-function ratioToFilter(ratio) {
-  // 입력 해상도와 무관하게 중심 크롭 후 목표 비율 컨테이너로 스케일.
-  // setsar=1 로 픽셀 정사각형 보장.
-  if (ratio === "16:9") {
-    // 가로영상 그대로 1280x720 표준
-    return "scale='if(gt(a,16/9),1280,-2)':'if(gt(a,16/9),-2,720)',crop=1280:720,setsar=1";
-  }
-  if (ratio === "9:16") {
-    // 세로 720x1280 — 가로영상이면 중앙 크롭
-    return "crop='min(iw,ih*9/16)':ih,scale=720:1280,setsar=1";
-  }
-  if (ratio === "1:1") {
-    return "crop='min(iw,ih)':'min(iw,ih)',scale=720:720,setsar=1";
-  }
-  return "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+// 백엔드 server/index.js 의 같은 이름 함수와 표를 맞춰 둔다 — 어느 경로로
+// 처리하든 같은 옵션이면 같은 해상도가 나와야 한다.
+const QUALITY_SIZES = {
+  "720p":  { "16:9": [1280, 720],  "9:16": [720, 1280],  "1:1": [720, 720] },
+  "1080p": { "16:9": [1920, 1080], "9:16": [1080, 1920], "1:1": [1080, 1080] },
+};
+
+function ratioToFilter(ratio, quality) {
+  const table = QUALITY_SIZES[quality] || QUALITY_SIZES[state.quality] || QUALITY_SIZES["1080p"];
+  const size = table[ratio];
+  if (!size) return "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+  const [w, h] = size;
+  // "가득 채운 뒤 가운데 잘라내기". 비율마다 다른 식을 쓰던 예전 방식은 세로
+  // 원본을 16:9 로 뽑을 때 스케일 결과가 crop 목표보다 좁아져 실패할 수 있었다.
+  return `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1`;
 }
 
 // ── 썸네일 후보 추출 ─────────────────────────────────────────────────────────
