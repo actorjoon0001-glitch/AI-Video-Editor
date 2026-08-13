@@ -1530,7 +1530,15 @@ async function runQueueModePipeline() {
     try {
       const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`);
       if (!r.ok) {
-        if (r.status === 404) throw new Error("작업이 만료됐거나 없습니다.");
+        if (r.status === 404) {
+          // 작업 목록은 서버 메모리에 있으므로, 백엔드가 재시작(주로 메모리 초과)
+          // 하면 진행 중이던 작업이 통째로 사라진다. 그냥 "없음"이라고 하면
+          // 원인을 알 수 없어 재시작 가능성을 같이 알려준다.
+          throw new Error(
+            "작업이 사라졌습니다. 백엔드가 재시작됐을 가능성이 큽니다 " +
+            "(메모리 초과 등). 영상이 길거나 컷 구간이 많으면 발생할 수 있습니다."
+          );
+        }
         appendLog(`상태 조회 일시 실패 (${r.status}) — 재시도`);
         continue;
       }
@@ -1592,6 +1600,14 @@ function renderJobPipeline(job) {
 function jobStageDetailText(key, s) {
   if (s.error) return `에러: ${s.error}`;
   if (s.note) return s.note;
+  if (s.status === "running") {
+    const elapsed = s.startedAt ? ` · ${Math.round((Date.now() - s.startedAt) / 1000)}초 경과` : "";
+    if (s.progress?.totalSec > 0) {
+      const { pct, outTimeSec, totalSec } = s.progress;
+      return `인코딩 ${pct}% (${outTimeSec.toFixed(0)}s / ${totalSec.toFixed(0)}s)${elapsed}`;
+    }
+    return `진행 중${elapsed}`;
+  }
   if (s.status === "done" && s.result) {
     if (key === "edit") {
       const mb = s.result.sizeBytes ? ` · ${(s.result.sizeBytes / 1024 / 1024).toFixed(1)} MB` : "";
