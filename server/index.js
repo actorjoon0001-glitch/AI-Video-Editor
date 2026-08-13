@@ -460,6 +460,7 @@ function jobResponse(job) {
     const out = { status: s.status };
     if (s.error) out.error = s.error;
     if (s.note) out.note = s.note;
+    if (s.progress) out.progress = s.progress;
     if (s.startedAt) out.startedAt = s.startedAt;
     if (s.completedAt) out.completedAt = s.completedAt;
     if (s.result) out.result = sanitizeStageResult(name, s.result);
@@ -661,7 +662,22 @@ async function runJobPipeline(id, inputPath) {
       throw new Error("keeps 가 비어 있습니다 — 프론트에서 무음 감지 결과를 같이 보내주세요.");
     }
     const t0 = Date.now();
-    await processVideo(inputPath, editedPath, job.options);
+    // 예상 출력 길이 = 남긴 구간 합 / 속도. 진행률(%) 계산 기준.
+    const keptSec = job.options.keeps.reduce((s, k) => s + (k.end - k.start), 0);
+    const expectedSec = keptSec / (job.options.speed || 1);
+    job.stages.edit.progress = { outTimeSec: 0, totalSec: expectedSec, pct: 0 };
+
+    await processVideo(inputPath, editedPath, job.options, {
+      // 5분 동안 ffmpeg 가 진행 신호를 하나도 못 내면 멎은 것으로 보고 중단한다.
+      // 이게 없으면 프론트가 30분 타임아웃까지 "running" 만 보고 있게 된다.
+      timeoutMs: 5 * 60 * 1000,
+      onProgress: ({ outTimeSec }) => {
+        const pct = expectedSec > 0
+          ? Math.min(99, Math.round((outTimeSec / expectedSec) * 100))
+          : 0;
+        job.stages.edit.progress = { outTimeSec, totalSec: expectedSec, pct };
+      },
+    });
     const sizeBytes = (await stat(editedPath)).size;
     return {
       _path: editedPath,
@@ -928,23 +944,47 @@ app.listen(PORT, () => {
 });
 
 // ── ffmpeg pipeline ──────────────────────────────────────────────────────────
-async function processVideo(input, output, opts) {
+// keep 구간이 이 개수를 넘으면 trim+concat 대신 select 방식으로 전환한다.
+// trim+concat 은 구간마다 [0:v]/[0:a] 브랜치를 하나씩 만들기 때문에, 구간이
+// 수백 개가 되면 ffmpeg 가 입력 스트림을 수백 갈래로 split 하면서 메모리와
+// 필터 그래프 구축 시간이 폭발한다 (Render Free 512MB 에서는 사실상 멈춤).
+// select/aselect 는 브랜치 없이 한 번만 디코드하므로 구간 수와 무관하게
+// 메모리가 일정하다. 대신 타임스탬프를 CFR 로 다시 매기므로 VFR 소스에서
+// 미세하게 어긋날 수 있어, 구간이 적을 때는 더 정확한 trim+concat 을 쓴다.
+const SELECT_FILTER_THRESHOLD = 30;
+
+async function processVideo(input, output, opts, { onProgress, timeoutMs } = {}) {
   const { keeps, ratio, speed, loudnorm } = opts;
 
   const ratioFilter = ratioToFilter(ratio);
-  const parts = [];
-  for (let i = 0; i < keeps.length; i++) {
-    const { start, end } = keeps[i];
-    parts.push(
-      `[0:v]trim=start=${start.toFixed(3)}:end=${end.toFixed(3)},setpts=PTS-STARTPTS,${ratioFilter}[v${i}]`
-    );
-    parts.push(
-      `[0:a]atrim=start=${start.toFixed(3)}:end=${end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
-    );
+  let filter;
+
+  if (keeps.length > SELECT_FILTER_THRESHOLD) {
+    // 구간을 OR(+) 로 이어 붙인 하나의 select 식.
+    // between(t,s,e) 은 끝 경계를 포함(t<=e)해서 구간마다 프레임이 한 장씩 더
+    // 붙고, 오디오는 샘플 단위라 그만큼 안 늘어난다 → 구간 수에 비례해 A/V 가
+    // 어긋난다 (197구간에서 6초). 반열린 구간 [s,e) 로 잡아야 맞는다.
+    const expr = keeps
+      .map((k) => `(gte(t,${k.start.toFixed(3)})*lt(t,${k.end.toFixed(3)}))`)
+      .join("+");
+    filter =
+      `[0:v]select='${expr}',setpts=N/FRAME_RATE/TB,${ratioFilter}[vcat];` +
+      `[0:a]aselect='${expr}',asetpts=N/SR/TB[acat]`;
+  } else {
+    const parts = [];
+    for (let i = 0; i < keeps.length; i++) {
+      const { start, end } = keeps[i];
+      parts.push(
+        `[0:v]trim=start=${start.toFixed(3)}:end=${end.toFixed(3)},setpts=PTS-STARTPTS,${ratioFilter}[v${i}]`
+      );
+      parts.push(
+        `[0:a]atrim=start=${start.toFixed(3)}:end=${end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`
+      );
+    }
+    const concatInputs = keeps.map((_, i) => `[v${i}][a${i}]`).join("");
+    filter = parts.join(";") +
+      `;${concatInputs}concat=n=${keeps.length}:v=1:a=1[vcat][acat]`;
   }
-  const concatInputs = keeps.map((_, i) => `[v${i}][a${i}]`).join("");
-  let filter = parts.join(";") +
-    `;${concatInputs}concat=n=${keeps.length}:v=1:a=1[vcat][acat]`;
 
   // 속도
   filter += `;[vcat]setpts=${(1 / speed).toFixed(4)}*PTS[vfinal]`;
@@ -962,6 +1002,7 @@ async function processVideo(input, output, opts) {
   }
 
   const args = [
+    "-nostdin",
     "-i", input,
     "-filter_complex", filter,
     "-map", "[vfinal]",
@@ -972,11 +1013,14 @@ async function processVideo(input, output, opts) {
     "-c:a", "aac",
     "-b:a", "160k",
     "-movflags", "+faststart",
+    // 진행률을 stderr 로 강제 출력 — 이게 없으면 edit 단계가 완전한 블랙박스라
+    // "느린 것"과 "멈춘 것"을 구분할 수 없다.
+    "-progress", "pipe:2",
     "-y",
     output,
   ];
 
-  await runFFmpeg(args);
+  await runFFmpeg(args, { onProgress, timeoutMs });
 }
 
 function ratioToFilter(ratio) {
@@ -995,18 +1039,57 @@ function atempoChain(speed) {
   return parts.join(",");
 }
 
-function runFFmpeg(args) {
+function runFFmpeg(args, { onProgress, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     const ff = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
+    let timer = null;
+    let timedOut = false;
+
+    // 한 번이라도 진행 신호가 오면 타이머를 되감는다 — 느린 것과 멎은 것을
+    // 구분하기 위한 유휴(idle) 타임아웃이지 전체 실행 시간 제한이 아니다.
+    const arm = () => {
+      if (!timeoutMs) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        timedOut = true;
+        ff.kill("SIGKILL");
+      }, timeoutMs);
+    };
+    arm();
+
     ff.stderr.on("data", (d) => {
-      stderr += d.toString();
+      const chunk = d.toString();
+      stderr += chunk;
       if (stderr.length > 200_000) stderr = stderr.slice(-100_000);
+      arm();
+      if (onProgress) {
+        // -progress pipe:2 는 "out_time_us=12345678" 같은 key=value 를 흘린다.
+        const m = chunk.match(/out_time_us=(\d+)/g);
+        if (m?.length) {
+          const us = Number(m[m.length - 1].split("=")[1]);
+          if (Number.isFinite(us)) onProgress({ outTimeSec: us / 1e6 });
+        }
+      }
     });
-    ff.on("error", reject);
-    ff.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-2000)}`));
+
+    ff.on("error", (e) => { clearTimeout(timer); reject(e); });
+    ff.on("exit", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) return resolve();
+      if (timedOut) {
+        return reject(new Error(
+          `ffmpeg 가 ${Math.round(timeoutMs / 1000)}초 동안 아무 진행도 하지 못해 중단했습니다. ` +
+          `영상이 너무 길거나 컷 구간이 너무 많아 서버 메모리를 넘겼을 수 있습니다.`
+        ));
+      }
+      // 137 = SIGKILL, 보통 OOM killer.
+      if (code === 137 || signal === "SIGKILL") {
+        return reject(new Error(
+          "ffmpeg 가 메모리 부족으로 강제 종료됐습니다 (exit 137). 더 짧은 영상으로 시도해 주세요."
+        ));
+      }
+      reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-2000)}`));
     });
   });
 }
