@@ -100,6 +100,14 @@
               <option value="medium">medium — 정확도 최상 (많이 느림)</option>
             </select>
           </label>
+          <label class="sub-field">자주 쓰는 용어 (오인식 방지)
+            <textarea id="glossary" rows="2" maxlength="400"
+                      placeholder="예: 사각 싱크대, 컨테이너 하우스, 단열재, 시공, 평수"></textarea>
+          </label>
+          <p class="hint-row">
+            * 용어를 미리 알려주면 Whisper 가 그쪽으로 알아듣습니다. 채널에서 반복되는
+            고유명사·전문용어를 쉼표로 넣어두면 "사각"을 "4학"으로 잘못 쓰는 일이 줄어듭니다.
+          </p>
           <p class="hint-row">
             * 큰 모델일수록 한국어 정확도가 올라가지만 그만큼 오래 걸리고 메모리를 더 씁니다.
             small 이상은 서버 메모리 2GB(Standard) 이상에서 쓰세요. 모델을 처음 쓰는
@@ -234,6 +242,18 @@
           <a id="srtDownloadBtn" class="btn disabled" download="subtitles.srt" aria-disabled="true" role="button">SRT</a>
           <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT</a>
           <a id="burnedDownloadBtn" class="btn disabled" download="subtitled.mp4" aria-disabled="true" role="button" hidden>자막 번인본</a>
+        </div>
+
+        <div class="subedit-block" id="subEditBlock" hidden>
+          <h4 class="thumbs-title">자막 교정
+            <span class="thumbs-hint" id="subEditHint"></span>
+          </h4>
+          <div class="row subedit-actions">
+            <button type="button" id="subEditApply" class="btn primary">교정 적용</button>
+            <button type="button" id="subEditReburn" class="btn" hidden>수정본으로 번인 다시</button>
+            <span class="meta-label" id="subEditStatus"></span>
+          </div>
+          <ol class="subedit-list" id="subEditList"></ol>
         </div>
 
         <div class="meta-block" id="metaBlock" hidden>
