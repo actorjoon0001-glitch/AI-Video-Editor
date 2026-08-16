@@ -2062,7 +2062,7 @@ function renderMetadata(metaStage, uploadStage) {
     // Claude 를 쓰려다 실패해서 휴리스틱으로 내려온 경우, 조용히 품질만 떨어지면
     // 왜 결과가 나빠졌는지 알 수가 없으니 사유를 그대로 보여준다.
     src.textContent = m.source === "claude"
-      ? `Claude ${m.model || ""}`
+      ? (m.model || "Claude")   // 모델 ID 자체에 이미 "claude" 가 들어있다
       : m.fallbackFrom === "claude"
         ? `로컬 키워드 분석 (Claude 호출 실패: ${m.fallbackReason || "사유 미상"})`
         : "로컬 키워드 분석";
