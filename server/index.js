@@ -245,12 +245,17 @@ app.post(
       }
       await writeFile(srtPath, srt, "utf8");
 
+      // 자막 스타일. 큐 모드와 같은 UI 를 쓰므로 같은 빌더를 태운다. 없으면
+      // sanitizeSubtitleStyle() 의 기본값(흰 글자 + 검은 외곽선)으로 떨어진다.
+      let style;
+      try { style = req.body.style ? JSON.parse(req.body.style) : null; } catch { style = null; }
+
       // libass 가 SRT 파일을 직접 읽도록 subtitles 필터 사용. 이스케이프된 절대 경로.
       const escapedSrt = srtPath.replace(/\\/g, "/").replace(/:/g, "\\:");
       const args = [
         "-i", videoPath,
-        "-vf", `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=20,Outline=2,Shadow=0,MarginV=40'`,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", String(QUALITY_CRF[job.options.quality] ?? 20),
+        "-vf", `subtitles='${escapedSrt}':force_style='${buildForceStyle(style)}'`,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "copy",
         "-movflags", "+faststart",
         "-y", outputPath,
@@ -672,6 +677,7 @@ function sanitizeJobOptions(opts) {
     model: sanitizeModel(opts.model),
     fillerMode: sanitizeFillerMode(opts.fillerMode),
     glossary: sanitizeGlossary(opts.glossary),
+    subtitleStyle: sanitizeSubtitleStyle(opts.subtitleStyle),
     // 후속 stage 옵션 — 모두 명시적 opt-in.
     burn: opts.burn === true,
     metadata: opts.metadata === true,
@@ -917,6 +923,72 @@ async function thumbnailStageFor(job, editedPath) {
 
 // SRT 를 편집본에 영구 합성. /api/burn-subtitles 와 같은 libass 필터를 쓰되,
 // 파일이 이미 디스크에 있으므로 업로드/다운로드 왕복이 없다.
+
+// ── 자막 번인 스타일 ────────────────────────────────────────────────────────
+// libass 의 force_style 문자열을 만든다. 색은 ASS 규격이라 &HAABBGGRR (BGR 순서,
+// AA 는 "투명도"가 아니라 alpha 의 반대 — 00 이 불투명, FF 가 완전 투명) 이다.
+// 흔히 틀리는 부분이라 여기서 한 번에 변환한다.
+const SUBTITLE_FONT = process.env.SUBTITLE_FONT || "NanumGothic";
+
+// ffmpeg 이 SRT 를 ASS 로 바꿀 때 스크립트 해상도를 항상 384x288 로 박아 넣는다
+// (probe: "PlayResX: 384 / PlayResY: 288"). 그래서 FontSize/MarginV/Outline 은
+// 픽셀이 아니라 288 높이 기준 단위다 — FontSize=48 을 그대로 주면 1080p 에서
+// 180px 짜리 글자가 나와 화면을 잡아먹는다. UI 는 "1080p 픽셀"로 받고 여기서
+// 한 번만 환산한다.
+const ASS_PLAY_RES_Y = 288;
+const pxToAss = (px) => Math.max(0, (Number(px) || 0) * (ASS_PLAY_RES_Y / 1080));
+
+function assColour(hex, alphaPct = 100) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ""));
+  const rgb = m ? m[1] : "ffffff";
+  const r = rgb.slice(0, 2), g = rgb.slice(2, 4), b = rgb.slice(4, 6);
+  const a = Math.round((1 - clamp(Number(alphaPct) / 100, 0, 1)) * 255)
+    .toString(16).padStart(2, "0");
+  return `&H${a}${b}${g}${r}`.toUpperCase();
+}
+
+function sanitizeSubtitleStyle(v) {
+  const o = v && typeof v === "object" ? v : {};
+  return {
+    // 아래 값들은 전부 "1080p 기준 픽셀". 환산은 buildForceStyle() 에서 한다.
+    fontSize: clamp(parseInt(o.fontSize, 10) || 54, 16, 200),
+    color: /^#?[0-9a-f]{6}$/i.test(o.color || "") ? o.color : "#ffffff",
+    // "outline" = 글자 외곽선만 / "box" = 반투명 배경 박스
+    background: o.background === "box" ? "box" : "outline",
+    boxColor: /^#?[0-9a-f]{6}$/i.test(o.boxColor || "") ? o.boxColor : "#000000",
+    boxOpacity: clamp(parseInt(o.boxOpacity, 10) || 60, 0, 100),
+    outline: clamp(Number(o.outline) || 6, 0, 24),
+    marginV: clamp(parseInt(o.marginV, 10) || 60, 0, 500),
+    bold: o.bold === true,
+  };
+}
+
+function buildForceStyle(style) {
+  const st = sanitizeSubtitleStyle(style);
+  const parts = [
+    `FontName=${SUBTITLE_FONT}`,
+    `FontSize=${pxToAss(st.fontSize).toFixed(1)}`,
+    `PrimaryColour=${assColour(st.color, 100)}`,
+    `Bold=${st.bold ? -1 : 0}`,
+    `MarginV=${Math.round(pxToAss(st.marginV))}`,
+    "Shadow=0",
+  ];
+  if (st.background === "box") {
+    // BorderStyle=3(불투명 박스)에서 libass 는 박스를 BackColour 가 아니라
+    // OutlineColour 로 칠한다. BackColour 만 지정하면 사용자가 무슨 색을 골라도
+    // 항상 기본값(검정)으로 나온다 — 실제로 빨강/파랑을 넣어 렌더해 확인했다.
+    // 다른 렌더러 호환을 위해 둘 다 같은 값으로 채운다. Outline 은 박스 여백.
+    const box = assColour(st.boxColor, st.boxOpacity);
+    // Outline 은 여기서 박스 안쪽 여백 — 1080p 기준 10px 정도가 보기 좋다.
+    parts.push("BorderStyle=3", `OutlineColour=${box}`, `BackColour=${box}`,
+      `Outline=${pxToAss(10).toFixed(1)}`);
+  } else {
+    parts.push("BorderStyle=1", "OutlineColour=&H00000000",
+      `Outline=${pxToAss(st.outline).toFixed(1)}`);
+  }
+  return parts.join(",");
+}
+
 async function burnStageFor(job, editedPath) {
   const srtPath = path.join(TMP, `${job.id}.subtitles.srt`);
   if (!existsSync(srtPath)) {
@@ -929,8 +1001,9 @@ async function burnStageFor(job, editedPath) {
   const t0 = Date.now();
   await runFFmpeg([
     "-i", editedPath,
-    "-vf", `subtitles='${escapedSrt}':force_style='FontName=Arial,FontSize=20,Outline=2,Shadow=0,MarginV=40'`,
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+    "-vf", `subtitles='${escapedSrt}':force_style='${buildForceStyle(job.options.subtitleStyle)}'`,
+    "-c:v", "libx264", "-preset", "veryfast",
+    "-crf", String(QUALITY_CRF[job.options.quality] ?? 20),
     "-c:a", "copy",
     "-movflags", "+faststart",
     "-y", out,

@@ -115,8 +115,43 @@
           </p>
           <label class="toggle">
             <input type="checkbox" id="burnSubtitles" />
-            <span>자막 번인</span>
+            <span>자막 번인 — 영상에 자막을 영구 합성</span>
           </label>
+          <div class="substyle" id="subStyleBox" hidden>
+            <div class="substyle-preview" id="subStylePreview">
+              <span id="subStyleSample">싱크대는 깊은 사각 싱크대</span>
+            </div>
+            <div class="substyle-grid">
+              <label>글자 크기
+                <input type="range" id="subFontSize" min="28" max="140" step="2" value="54" />
+                <span id="subFontSizeVal">54</span>
+              </label>
+              <label>아래 여백
+                <input type="range" id="subMarginV" min="0" max="400" step="10" value="60" />
+                <span id="subMarginVVal">60</span>
+              </label>
+              <label>글자색
+                <input type="color" id="subColor" value="#ffffff" />
+              </label>
+              <label>배경
+                <select id="subBackground">
+                  <option value="outline" selected>외곽선만</option>
+                  <option value="box">배경 박스</option>
+                </select>
+              </label>
+              <label>박스 색
+                <input type="color" id="subBoxColor" value="#000000" />
+              </label>
+              <label>박스 투명도
+                <input type="range" id="subBoxOpacity" min="0" max="100" step="5" value="60" />
+                <span id="subBoxOpacityVal">60%</span>
+              </label>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="subBold" />
+              <span>굵게</span>
+            </label>
+          </div>
           <label class="toggle">
             <input type="checkbox" id="serverMode" />
             <span>고속 모드 — 단일 요청 인코딩 (큐 모드 OFF일 때만)</span>

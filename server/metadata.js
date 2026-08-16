@@ -46,8 +46,23 @@ export async function generateMetadata(segments, { persona = "", durationSec = 0
     throw new Error("자막이 비어 있어 메타데이터를 만들 수 없습니다. 자막 단계를 먼저 성공시켜 주세요.");
   }
   if (process.env.ANTHROPIC_API_KEY) {
-    const data = await generateWithClaude(clean, persona);
-    return { ...normalize(data), source: "claude", model: MODEL };
+    try {
+      const data = await generateWithClaude(clean, persona);
+      return { ...normalize(data), source: "claude", model: MODEL };
+    } catch (e) {
+      // 키가 있어도 호출은 실패할 수 있다 (크레딧 소진, 레이트리밋, 일시적 5xx,
+      // 안전장치 거절). 그 때문에 편집·자막까지 끝난 작업의 메타데이터 단계를
+      // 통째로 실패시킬 이유는 없으니 휴리스틱으로 내려가고 사유만 남긴다.
+      const reason = String(e?.message || e).slice(0, 300);
+      console.warn(`[metadata] Claude 실패 — 휴리스틱으로 대체: ${reason}`);
+      return {
+        ...normalize(generateHeuristic(clean, durationSec)),
+        source: "heuristic",
+        model: null,
+        fallbackFrom: "claude",
+        fallbackReason: reason,
+      };
+    }
   }
   return { ...normalize(generateHeuristic(clean, durationSec)), source: "heuristic", model: null };
 }
@@ -67,11 +82,16 @@ async function generateWithClaude(segments, persona) {
   const { default: Anthropic } = await import("@anthropic-ai/sdk");
   const client = new Anthropic();
 
-  // 안정적인 prefix(고정 프롬프트 → 채널 페르소나) 뒤에 매번 달라지는 자막이 오도록
-  // 배치. cache_control 은 마지막 안정 블록에 건다.
-  const system = [{ type: "text", text: SYSTEM_PROMPT }];
+  // 캐시는 prefix 매칭이라 브레이크포인트 앞에 있는 게 전부 캐시 대상이 된다.
+  // 페르소나는 UI 에서 바뀌므로 브레이크포인트 뒤에 둬야 고정 프롬프트가
+  // 살아남는다 (예전엔 페르소나 블록에 걸려 있어서, 페르소나를 고치면 캐시가
+  // 통째로 날아갔다).
+  //
+  // 다만 지금 고정 프롬프트는 한국어 약 250 토큰이라 claude-opus-5 의 최소
+  // 캐시 길이(512 토큰)에 못 미친다 — 즉 지금은 캐시가 실제로 안 걸린다.
+  // 에러는 안 나고 조용히 무시되며, 프롬프트가 길어지면 그때부터 동작한다.
+  const system = [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }];
   if (persona) system.push({ type: "text", text: `채널 페르소나/톤: ${persona}` });
-  system[system.length - 1].cache_control = { type: "ephemeral" };
 
   const transcript = segments
     .map((s) => `[${formatTimestamp(s.start)}] ${String(s.text).trim()}`)

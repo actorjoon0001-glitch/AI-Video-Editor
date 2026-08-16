@@ -128,6 +128,9 @@ const sliders = [
   ["padding", "paddingVal", (v) => `${parseFloat(v).toFixed(2)} s`],
   ["shortLen", "shortLenVal", (v) => `${v} s`],
   ["bgmVol", "bgmVolVal", (v) => `${v} dB`],
+  ["subFontSize", "subFontSizeVal", (v) => `${v} px`],
+  ["subMarginV", "subMarginVVal", (v) => `${v} px`],
+  ["subBoxOpacity", "subBoxOpacityVal", (v) => `${v}%`],
 ];
 for (const [src, label, fmt] of sliders) {
   const s = $(src), l = $(label);
@@ -946,6 +949,47 @@ async function fetchEditPlan(file, fillerMode) {
 
 // 자막 모델은 UI 선택을 따른다. 예전엔 큐 모드가 "tiny" 를 하드코딩해서,
 // 서버 메모리를 늘려도 자막 품질이 그대로였다.
+// 자막 번인 스타일. 백엔드 buildForceStyle() 과 키를 맞춘다.
+function subtitleStyleFromUI() {
+  return {
+    // 크기/여백은 "1080p 기준 픽셀". 서버가 ASS 단위로 환산한다.
+    fontSize: parseInt($("subFontSize")?.value, 10) || 54,
+    color: $("subColor")?.value || "#ffffff",
+    background: $("subBackground")?.value || "outline",
+    boxColor: $("subBoxColor")?.value || "#000000",
+    boxOpacity: parseInt($("subBoxOpacity")?.value, 10) || 60,
+    marginV: parseInt($("subMarginV")?.value, 10) || 60,
+    bold: $("subBold")?.checked === true,
+    outline: 6,
+  };
+}
+
+// 미리보기는 16:9 미니 프레임이고, 값이 1080p 픽셀이므로 그대로 축소하면
+// 실제 번인 비율과 일치한다 (배율 = 미리보기 높이 / 1080).
+function renderSubtitleStylePreview() {
+  const el = $("subStyleSample");
+  const box = $("subStylePreview");
+  if (!el || !box) return;
+  const st = subtitleStyleFromUI();
+  const scale = box.clientHeight / 1080;
+  el.style.fontSize = `${Math.max(5, st.fontSize * scale)}px`;
+  el.style.color = st.color;
+  el.style.fontWeight = st.bold ? "700" : "500";
+  el.style.marginBottom = `${Math.max(0, st.marginV * scale)}px`;
+  if (st.background === "box") {
+    const a = (st.boxOpacity / 100).toFixed(2);
+    const [r, g, b] = [1, 3, 5].map((i) => parseInt(st.boxColor.slice(i, i + 2), 16));
+    el.style.background = `rgba(${r},${g},${b},${a})`;
+    el.style.padding = `${(6 * scale).toFixed(1)}px ${(10 * scale).toFixed(1)}px`;
+    el.style.textShadow = "none";
+  } else {
+    el.style.background = "transparent";
+    el.style.padding = "0";
+    const w = Math.max(1, st.outline * scale).toFixed(1);
+    el.style.textShadow = `0 0 ${w}px #000, ${w}px ${w}px ${w}px #000, -${w}px -${w}px ${w}px #000`;
+  }
+}
+
 function selectedWhisperModel() {
   return $("whisperModel")?.value || "small";
 }
@@ -1318,6 +1362,7 @@ async function maybeGenerateSubtitles(resultBlob) {
       const fd = new FormData();
       fd.append("video", resultBlob, "edited.mp4");
       fd.append("srt", subtitleSrtText);
+      fd.append("style", JSON.stringify(subtitleStyleFromUI()));
       const r = await fetch(`${BACKEND_URL}/api/burn-subtitles`, { method: "POST", body: fd });
       if (!r.ok) {
         const errText = await r.text().catch(() => "");
@@ -1517,6 +1562,7 @@ async function runQueueModePipeline() {
     language: "ko",
     model: selectedWhisperModel(),
     glossary: $("glossary")?.value?.trim() || "",
+    subtitleStyle: subtitleStyleFromUI(),
     burn: $("burnSubtitles")?.checked === true,
     metadata: $("genMetadata")?.checked === true,
     metadataPersona: $("metaPersona")?.value?.trim() || "",
@@ -1936,7 +1982,13 @@ function renderMetadata(metaStage, uploadStage) {
 
   const src = $("metaSource");
   if (src) {
-    src.textContent = m.source === "claude" ? `Claude ${m.model || ""}` : "로컬 키워드 분석";
+    // Claude 를 쓰려다 실패해서 휴리스틱으로 내려온 경우, 조용히 품질만 떨어지면
+    // 왜 결과가 나빠졌는지 알 수가 없으니 사유를 그대로 보여준다.
+    src.textContent = m.source === "claude"
+      ? `Claude ${m.model || ""}`
+      : m.fallbackFrom === "claude"
+        ? `로컬 키워드 분석 (Claude 호출 실패: ${m.fallbackReason || "사유 미상"})`
+        : "로컬 키워드 분석";
   }
 
   const titles = $("metaTitles");
@@ -1990,10 +2042,12 @@ function renderMetadata(metaStage, uploadStage) {
 const PREFS_KEY = "aive.prefs.v1";
 const PREF_CHECKBOXES = [
   "queueMode", "autoSubtitles", "burnSubtitles", "serverMode",
-  "genMetadata", "ytUpload", "loudnorm", "safeMode",
+  "genMetadata", "ytUpload", "loudnorm", "safeMode", "subBold",
 ];
-const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol"];
-const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel", "glossary"];
+const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol",
+  "subFontSize", "subMarginV", "subBoxOpacity"];
+const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel", "glossary",
+  "subColor", "subBackground", "subBoxColor"];
 const PREF_CHIPS = ["preset", "ratio", "quality", "mode", "speed", "filler"];
 
 function readPrefs() {
@@ -2043,6 +2097,7 @@ function restorePrefs() {
   }
   // 큐 모드 카드 표시 여부는 change 리스너가 정하므로, 복원 후 한 번 알린다.
   $("queueMode")?.dispatchEvent(new Event("change", { bubbles: true }));
+  renderSubtitleStylePreview();
 }
 
 function wirePrefPersistence() {
@@ -2119,6 +2174,23 @@ onReady(() => {
   restorePrefs();
   wirePrefPersistence();
   wireTopbar();
+  for (const id of ["subFontSize", "subMarginV", "subColor", "subBackground",
+                    "subBoxColor", "subBoxOpacity", "subBold"]) {
+    $(id)?.addEventListener("input", renderSubtitleStylePreview);
+    $(id)?.addEventListener("change", renderSubtitleStylePreview);
+  }
+  // 스타일 패널은 번인을 켰을 때만 의미가 있다. 숨어 있는 동안은 미리보기의
+  // clientHeight 가 0 이라 글자 크기 환산이 0 으로 죽으므로, 보여준 다음에
+  // 반드시 다시 그린다.
+  const syncSubStyleBox = () => {
+    const box = $("subStyleBox");
+    if (!box) return;
+    box.hidden = $("burnSubtitles")?.checked !== true;
+    if (!box.hidden) renderSubtitleStylePreview();
+  };
+  $("burnSubtitles")?.addEventListener("change", syncSubStyleBox);
+  syncSubStyleBox();
+  renderSubtitleStylePreview();
   $("subEditApply")?.addEventListener("click", () => applySubtitleEdits().catch(onError));
   $("subEditReburn")?.addEventListener("click", () => {
     if (subEditState) retryJobStage(subEditState.jobId, "burn");
