@@ -275,6 +275,24 @@
              큐 모드 자막은 백엔드(onrender.com)에서 오므로 이게 반드시 필요하다. -->
         <video id="resultVideo" controls playsinline crossorigin="anonymous"></video>
         <div class="result-stats" id="resultStats"></div>
+
+        <!-- 컷 타임라인 — 원본 길이를 가로 막대로 두고 남긴 구간/잘린 구간을 칠한다.
+             클릭하면 원본 미리보기가 그 지점으로 이동해서 잘린 부분을 직접 들어볼 수 있다. -->
+        <div class="cuts" id="cutsBlock" hidden>
+          <div class="cuts-head">
+            <h4>컷 타임라인</h4>
+            <span class="cuts-summary" id="cutsSummary"></span>
+          </div>
+          <div class="cuts-bar" id="cutsBar"></div>
+          <div class="cuts-axis" id="cutsAxis"></div>
+          <p class="hint-row">
+            초록 = 남긴 구간 · 빨강 = 잘라낸 무음. 막대를 클릭하면 <b>원본</b>의 그 지점부터 재생돼서
+            무엇이 잘렸는지 직접 확인할 수 있습니다.
+          </p>
+          <div class="row">
+            <button type="button" id="cutsPlayRemoved" class="btn">잘린 구간만 미리듣기</button>
+          </div>
+        </div>
         <div class="row">
           <a id="downloadBtn" class="btn primary" download="edited.mp4">mp4 다운로드</a>
           <button type="button" id="exportDraftBtn" class="btn">CapCut 드래프트</button>
