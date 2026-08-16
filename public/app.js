@@ -616,6 +616,7 @@ async function runServerPipeline() {
   if (outputUrl) URL.revokeObjectURL(outputUrl);
   outputUrl = URL.createObjectURL(blob);
   setPreviewMode("edited"); // 기본은 편집본 탭. 사용자가 원본 탭을 누르면 전환.
+  renderCutTimeline(pickedDuration, lastKeeps);
   downloadBtn.href = outputUrl;
   downloadBtn.download = outputFileName(pickedFile.name);
 
@@ -822,6 +823,7 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
   if (outputUrl) URL.revokeObjectURL(outputUrl);
   outputUrl = URL.createObjectURL(blob);
   setPreviewMode("edited"); // 기본은 편집본 탭. 사용자가 원본 탭을 누르면 전환.
+  renderCutTimeline(pickedDuration, lastKeeps);
   downloadBtn.href = outputUrl;
   downloadBtn.download = outputFileName(pickedFile.name);
 
@@ -1602,6 +1604,10 @@ async function runQueueModePipeline() {
     );
   }
   if (keeps.length === 0) throw new Error("남은 구간이 없습니다. 임계값을 완화해 보세요.");
+  // 컷 타임라인과 CapCut 드래프트가 같은 keeps 를 쓴다. 예전엔 큐 모드에서 이걸
+  // 안 채워서 CapCut 버튼이 아무 반응도 없었다.
+  lastKeeps = keeps;
+  pickedDuration = duration;
 
   // 예전엔 무음이 0~1개만 잡혀도 그냥 원본 길이 그대로 인코딩해놓고 "완료" 라고
   // 했다. 사용자 입장에선 몇 분 기다린 결과가 원본과 똑같은데 왜인지 알 수가 없다.
@@ -1940,6 +1946,7 @@ async function wireQueueResults(job) {
     burnedBtn.removeAttribute("aria-disabled");
   }
   renderMetadata(job.stages.metadata, job.stages.upload);
+  renderCutTimeline(pickedDuration, lastKeeps);
   renderSubtitleEditor(job);
 }
 
@@ -2268,6 +2275,9 @@ onReady(() => {
     const lbl = $("silenceDbVal");
     if (lbl) lbl.textContent = auto ? "자동" : `${slider?.value} dB`;
   };
+  $("cutsPlayRemoved")?.addEventListener("click", () => {
+    previewRemovedOnly(pickedDuration, lastKeeps).catch(onError);
+  });
   $("silenceAuto")?.addEventListener("change", syncSilenceAuto);
   $("silenceDb")?.addEventListener("input", syncSilenceAuto);
   syncSilenceAuto();
@@ -2795,6 +2805,94 @@ async function extractThumbnails(ff, srcName, duration, count) {
     }
   }
   if (thumbUrls.length > 0) thumbsBlock.hidden = false;
+}
+
+// ── 컷 타임라인 ──────────────────────────────────────────────────────────────
+// "얼마나 줄었다"는 숫자만으로는 무엇이 잘렸는지 알 수 없다. 원본 길이를 막대로
+// 펴서 남긴 구간과 잘린 구간을 칠하고, 클릭하면 원본의 그 지점으로 보낸다.
+let cutsPreviewTimer = null;
+
+function renderCutTimeline(duration, keeps) {
+  const block = $("cutsBlock");
+  if (!block) return;
+  if (!duration || !keeps?.length) { block.hidden = true; return; }
+
+  const removed = removedRanges(duration, keeps);
+  const keptSec = keeps.reduce((s, k) => s + (k.end - k.start), 0);
+  const cutSec = duration - keptSec;
+  block.hidden = false;
+
+  $("cutsSummary").textContent =
+    `원본 ${fmtClock(duration)} → 편집본 ${fmtClock(keptSec)} · ` +
+    `${removed.length}곳 / ${cutSec.toFixed(1)}초 삭제 (${((cutSec / duration) * 100).toFixed(0)}%)`;
+
+  // 남긴 구간과 잘린 구간을 하나의 배열로 합쳐 시간순으로 그린다.
+  const spans = [
+    ...keeps.map((k) => ({ ...k, kind: "keep" })),
+    ...removed.map((r) => ({ ...r, kind: "cut" })),
+  ].sort((a, b) => a.start - b.start);
+
+  $("cutsBar").innerHTML = spans.map((s) => {
+    const pct = ((s.end - s.start) / duration) * 100;
+    const label = `${s.kind === "keep" ? "남김" : "잘림"} ${fmtClock(s.start)}–${fmtClock(s.end)} (${(s.end - s.start).toFixed(1)}초)`;
+    return `<button type="button" class="cuts-seg ${s.kind}" style="width:${pct}%"
+      data-start="${s.start}" data-end="${s.end}" title="${label}" aria-label="${label}"></button>`;
+  }).join("");
+
+  // 눈금 — 원본 기준 시각을 5등분해서 표시.
+  $("cutsAxis").innerHTML = Array.from({ length: 6 }, (_, i) =>
+    `<span>${fmtClock((duration * i) / 5)}</span>`).join("");
+
+  $("cutsBar").querySelectorAll(".cuts-seg").forEach((el) => {
+    el.addEventListener("click", () => {
+      playOriginalRange(parseFloat(el.dataset.start), parseFloat(el.dataset.end));
+    });
+  });
+}
+
+function removedRanges(duration, keeps) {
+  const out = [];
+  let cursor = 0;
+  for (const k of [...keeps].sort((a, b) => a.start - b.start)) {
+    if (k.start > cursor + 0.01) out.push({ start: cursor, end: k.start });
+    cursor = Math.max(cursor, k.end);
+  }
+  if (cursor < duration - 0.01) out.push({ start: cursor, end: duration });
+  return out;
+}
+
+// 원본 탭으로 전환해 지정 구간만 재생하고 끝나면 멈춘다. src 를 갈아끼우면
+// 로드가 끝나야 seek 이 먹으므로 loadeddata 를 기다린다.
+function playOriginalRange(start, end) {
+  if (!originalUrl) return;
+  clearTimeout(cutsPreviewTimer);
+  const go = () => {
+    resultVideo.currentTime = start;
+    resultVideo.play().catch(() => {});
+    cutsPreviewTimer = setTimeout(() => resultVideo.pause(), Math.max(300, (end - start) * 1000));
+  };
+  if (previewMode !== "original") {
+    setPreviewMode("original");
+    resultVideo.addEventListener("loadeddata", go, { once: true });
+  } else {
+    go();
+  }
+}
+
+// 잘린 구간만 이어서 재생 — 무음만 제대로 지웠는지 귀로 확인하는 용도.
+async function previewRemovedOnly(duration, keeps) {
+  const removed = removedRanges(duration, keeps);
+  if (!originalUrl || removed.length === 0) return;
+  if (previewMode !== "original") {
+    setPreviewMode("original");
+    await new Promise((r) => resultVideo.addEventListener("loadeddata", r, { once: true }));
+  }
+  for (const r of removed) {
+    resultVideo.currentTime = r.start;
+    await resultVideo.play().catch(() => {});
+    await new Promise((res) => setTimeout(res, Math.max(200, (r.end - r.start) * 1000)));
+  }
+  resultVideo.pause();
 }
 
 // ── CapCut 드래프트 내보내기 ─────────────────────────────────────────────────

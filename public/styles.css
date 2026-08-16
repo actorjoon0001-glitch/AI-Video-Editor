@@ -1034,3 +1034,49 @@ textarea:focus { outline: none; border-color: var(--accent); }
   cursor: pointer;
 }
 .substyle .toggle { margin-top: 12px; }
+
+/* 컷 타임라인 — 원본 길이를 100% 로 펴고 남긴/잘린 구간을 비율대로 칠한다 */
+.cuts {
+  margin-top: 14px;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+}
+.cuts-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.cuts-head h4 { margin: 0; font-size: 13px; }
+.cuts-summary { font-size: 12px; color: var(--muted); }
+.cuts-bar {
+  display: flex;
+  height: 34px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+.cuts-seg {
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  min-width: 1px;
+  transition: filter .12s;
+}
+.cuts-seg.keep { background: var(--accent); }
+.cuts-seg.cut  { background: #b3384a; }
+.cuts-seg:hover { filter: brightness(1.35); }
+.cuts-seg:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+.cuts-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
