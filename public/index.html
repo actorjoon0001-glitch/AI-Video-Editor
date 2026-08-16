@@ -192,6 +192,10 @@
               <input type="range" id="silenceDb" min="-50" max="-20" step="1" value="-32" />
               <span id="silenceDbVal">-32 dB</span>
             </label>
+            <label class="toggle">
+              <input type="checkbox" id="silenceAuto" checked />
+              <span>자동 — 영상마다 노이즈 바닥을 재서 임계값 결정 (권장)</span>
+            </label>
             <label>최소 무음 길이(초)
               <input type="range" id="minSilence" min="0.2" max="2.0" step="0.1" value="0.6" />
               <span id="minSilenceVal">0.6 s</span>

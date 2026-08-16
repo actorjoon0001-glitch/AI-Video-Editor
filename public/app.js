@@ -567,7 +567,7 @@ async function runServerPipeline() {
     const start = Math.max(0, (pickedDuration - targetLen) / 2);
     keeps = [{ start, end: Math.min(pickedDuration, start + targetLen) }];
   } else {
-    const noiseDb = parseFloat($("silenceDb").value);
+    const noiseDb = silenceThresholdSetting();
     const minSilence = parseFloat($("minSilence").value);
     const padding = parseFloat($("padding").value);
     setStatus("Web Audio 로 무음 감지 중...");
@@ -723,7 +723,7 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
     keeps = await pickHighlightWindow(ff, inName, pickedDuration, targetLen, sourceFile);
     appendLog(`highlight: ${keeps[0].start.toFixed(2)} → ${keeps[0].end.toFixed(2)}`);
   } else {
-    const noiseDb = parseFloat($("silenceDb").value);
+    const noiseDb = silenceThresholdSetting();
     const minSilence = parseFloat($("minSilence").value);
     const padding = parseFloat($("padding").value);
     setStatus(`무음 감지 (noise<${noiseDb}dB, ≥${minSilence}s)...`);
@@ -876,8 +876,14 @@ async function runPipeline({ engine = "mt", safeMode = false } = {}) {
 }
 
 // ── Web Audio 기반 무음 감지 (백엔드 모드용 — ffmpeg.wasm 불필요) ─────────────
-async function detectSilencesWebAudio(file, noiseDb, minSilence) {
-  // AudioContext 로 디코딩 (브라우저가 코덱 지원해야 함, AAC 는 대부분 OK).
+// null = 자동(측정한 노이즈 바닥 기준). 숫자 = 슬라이더 값 그대로.
+function silenceThresholdSetting() {
+  return $("silenceAuto")?.checked !== false ? null : parseFloat($("silenceDb").value);
+}
+
+// 50ms 창마다 RMS 를 dBFS 로 뽑는다. 무음 판정과 임계값 자동 계산이 같은 배열을
+// 쓰도록 분리해 뒀다 (디코딩은 한 번만).
+async function analyzeAudioWindows(file) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   let buf;
   try {
@@ -887,17 +893,13 @@ async function detectSilencesWebAudio(file, noiseDb, minSilence) {
   }
   const sr = buf.sampleRate;
   const nch = buf.numberOfChannels;
-  const winSize = Math.max(1, Math.floor(sr * 0.05)); // 50ms 창
+  const winSize = Math.max(1, Math.floor(sr * 0.05));
   const winDuration = winSize / sr;
   const totalWin = Math.floor(buf.length / winSize);
-  const noiseLin = Math.pow(10, noiseDb / 20);
-
   const channels = [];
   for (let c = 0; c < nch; c++) channels.push(buf.getChannelData(c));
 
-  const silences = [];
-  let silentRun = 0;
-  let runStart = 0;
+  const db = new Float32Array(totalWin);
   for (let w = 0; w < totalWin; w++) {
     let sumSq = 0;
     const off = w * winSize;
@@ -909,8 +911,41 @@ async function detectSilencesWebAudio(file, noiseDb, minSilence) {
       }
     }
     const rms = Math.sqrt(sumSq / (winSize * nch));
-    const isSilent = rms < noiseLin;
-    if (isSilent) {
+    // 완전 무음(0)은 log 가 -Infinity 라 하한을 둔다.
+    db[w] = rms > 0 ? Math.max(-100, 20 * Math.log10(rms)) : -100;
+  }
+  return { db, winDuration, duration: buf.duration };
+}
+
+// 고정 임계값(-32dB 등)은 영상마다 틀린다. 조용한 방에서 찍으면 바닥이 -55dB 라
+// -32 가 너무 높아 말끝까지 잘리고, 에어컨 돌아가는 방이나 카메라 내장 마이크는
+// 바닥이 -28dB 라 -32 아래로 내려가는 구간이 아예 없어서 컷이 0개가 된다.
+// (실제로 102초 영상에서 무음이 1개만 잡힌 적이 있다.)
+//
+// 그래서 실제 측정한 노이즈 바닥 기준으로 잡는다: 하위 5% = 바닥, 상위 15% = 말소리.
+function autoSilenceThresholdDb(db) {
+  const sorted = Float32Array.from(db).sort();
+  const at = (p) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(sorted.length * p)))];
+  const floorDb = at(0.05);
+  const speechDb = at(0.85);
+  const range = speechDb - floorDb;
+  // 바닥에서 얼마나 띄울지 — 다이내믹 레인지가 좁으면 적게 띄워야 말소리를 안 먹는다.
+  const margin = Math.min(10, Math.max(3, range * 0.3));
+  const threshold = Math.min(floorDb + margin, speechDb - 6);
+  return {
+    thresholdDb: Math.max(-50, Math.min(-18, threshold)),
+    floorDb,
+    speechDb,
+    range,
+  };
+}
+
+function silencesFromWindows(db, winDuration, thresholdDb, minSilence) {
+  const silences = [];
+  let silentRun = 0;
+  let runStart = 0;
+  for (let w = 0; w < db.length; w++) {
+    if (db[w] < thresholdDb) {
       if (silentRun === 0) runStart = w * winDuration;
       silentRun++;
     } else if (silentRun > 0) {
@@ -922,6 +957,23 @@ async function detectSilencesWebAudio(file, noiseDb, minSilence) {
   if (silentRun > 0) {
     const dur = silentRun * winDuration;
     if (dur >= minSilence) silences.push({ start: runStart, end: runStart + dur });
+  }
+  return silences;
+}
+
+// noiseDb 가 null 이면 자동 측정. stats 를 같이 돌려줘서 로그/경고에 쓴다.
+async function detectSilencesWebAudio(file, noiseDb, minSilence, stats = null) {
+  const { db, winDuration } = await analyzeAudioWindows(file);
+  const auto = autoSilenceThresholdDb(db);
+  const thresholdDb = noiseDb == null ? auto.thresholdDb : noiseDb;
+  const silences = silencesFromWindows(db, winDuration, thresholdDb, minSilence);
+  if (stats) {
+    Object.assign(stats, auto, {
+      thresholdDb,
+      auto: noiseDb == null,
+      silenceCount: silences.length,
+      silenceSec: silences.reduce((s, x) => s + (x.end - x.start), 0),
+    });
   }
   return silences;
 }
@@ -1529,7 +1581,7 @@ async function runQueueModePipeline() {
 
   // 1) 브라우저에서 무음 감지 → keeps 산출
   const sourceFile = pickedFiles[0];
-  const noiseDb = parseFloat($("silenceDb").value);
+  const noiseDb = silenceThresholdSetting();
   const minSilence = parseFloat($("minSilence").value);
   const padding = parseFloat($("padding").value);
   const duration = await measureDurationFromFile(sourceFile);
@@ -1540,11 +1592,29 @@ async function runQueueModePipeline() {
     const w = await pickHighlightWindowWebAudio(sourceFile, duration, targetLen).catch(() => null);
     keeps = w ? [w] : [{ start: 0, end: Math.min(duration, targetLen) }];
   } else {
-    const silences = await detectSilencesWebAudio(sourceFile, noiseDb, minSilence);
+    const stats = {};
+    const silences = await detectSilencesWebAudio(sourceFile, noiseDb, minSilence, stats);
     keeps = invertSilences(duration, silences, padding);
+    appendLog(
+      `무음 감지: 노이즈 바닥 ${stats.floorDb.toFixed(1)}dB · 말소리 ${stats.speechDb.toFixed(1)}dB` +
+      ` → 임계값 ${stats.thresholdDb.toFixed(1)}dB${stats.auto ? " (자동)" : " (수동)"}` +
+      ` · 무음 ${stats.silenceCount}개 / ${stats.silenceSec.toFixed(1)}초`
+    );
   }
   if (keeps.length === 0) throw new Error("남은 구간이 없습니다. 임계값을 완화해 보세요.");
-  appendLog(`큐 모드: keeps=${keeps.length}, duration=${duration.toFixed(2)}s`);
+
+  // 예전엔 무음이 0~1개만 잡혀도 그냥 원본 길이 그대로 인코딩해놓고 "완료" 라고
+  // 했다. 사용자 입장에선 몇 분 기다린 결과가 원본과 똑같은데 왜인지 알 수가 없다.
+  const keptSec = keeps.reduce((s, k) => s + (k.end - k.start), 0);
+  const cutPct = duration > 0 ? (1 - keptSec / duration) * 100 : 0;
+  appendLog(`큐 모드: keeps=${keeps.length}, duration=${duration.toFixed(2)}s, 컷 ${cutPct.toFixed(1)}%`);
+  if (cutPct < 2) {
+    appendLog(
+      "! 잘라낼 무음을 거의 못 찾았습니다 — 결과가 원본과 비슷한 길이로 나옵니다." +
+      " 녹음 환경 소음이 크면 '컷 편집 세부'에서 무음 임계 dB 를 올려(-26 쪽) 다시 시도하세요."
+    );
+    setStatus(`무음이 거의 없어 컷이 ${cutPct.toFixed(1)}% 뿐입니다 — 그대로 진행합니다.`);
+  }
   setBar(10);
 
   // 2) /api/jobs 로 업로드
@@ -2042,7 +2112,7 @@ function renderMetadata(metaStage, uploadStage) {
 const PREFS_KEY = "aive.prefs.v1";
 const PREF_CHECKBOXES = [
   "queueMode", "autoSubtitles", "burnSubtitles", "serverMode",
-  "genMetadata", "ytUpload", "loudnorm", "safeMode", "subBold",
+  "genMetadata", "ytUpload", "loudnorm", "safeMode", "subBold", "silenceAuto",
 ];
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol",
   "subFontSize", "subMarginV", "subBoxOpacity"];
@@ -2190,6 +2260,17 @@ onReady(() => {
   };
   $("burnSubtitles")?.addEventListener("change", syncSubStyleBox);
   syncSubStyleBox();
+  // 자동일 때 슬라이더는 아무 효과가 없으므로 비활성 표시.
+  const syncSilenceAuto = () => {
+    const auto = $("silenceAuto")?.checked !== false;
+    const slider = $("silenceDb");
+    if (slider) slider.disabled = auto;
+    const lbl = $("silenceDbVal");
+    if (lbl) lbl.textContent = auto ? "자동" : `${slider?.value} dB`;
+  };
+  $("silenceAuto")?.addEventListener("change", syncSilenceAuto);
+  $("silenceDb")?.addEventListener("input", syncSilenceAuto);
+  syncSilenceAuto();
   renderSubtitleStylePreview();
   $("subEditApply")?.addEventListener("click", () => applySubtitleEdits().catch(onError));
   $("subEditReburn")?.addEventListener("click", () => {
