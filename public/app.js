@@ -975,6 +975,8 @@ async function detectSilencesWebAudio(file, noiseDb, minSilence, stats = null) {
       auto: noiseDb == null,
       silenceCount: silences.length,
       silenceSec: silences.reduce((s, x) => s + (x.end - x.start), 0),
+      // 파형 그리기에 그대로 재사용 — 오디오를 두 번 디코딩하지 않기 위해.
+      db, winDuration,
     });
   }
   return silences;
@@ -1597,6 +1599,7 @@ async function runQueueModePipeline() {
     const stats = {};
     const silences = await detectSilencesWebAudio(sourceFile, noiseDb, minSilence, stats);
     keeps = invertSilences(duration, silences, padding);
+    lastWaveform = { db: stats.db, winDuration: stats.winDuration, thresholdDb: stats.thresholdDb };
     appendLog(
       `무음 감지: 노이즈 바닥 ${stats.floorDb.toFixed(1)}dB · 말소리 ${stats.speechDb.toFixed(1)}dB` +
       ` → 임계값 ${stats.thresholdDb.toFixed(1)}dB${stats.auto ? " (자동)" : " (수동)"}` +
@@ -2811,8 +2814,97 @@ async function extractThumbnails(ff, srcName, duration, count) {
 // "얼마나 줄었다"는 숫자만으로는 무엇이 잘렸는지 알 수 없다. 원본 길이를 막대로
 // 펴서 남긴 구간과 잘린 구간을 칠하고, 클릭하면 원본의 그 지점으로 보낸다.
 let cutsPreviewTimer = null;
+let lastWaveform = null;   // { db, winDuration, thresholdDb } — 무음 감지 때 나온 것 재사용
+let wavePlayhead = null;
 
-function renderCutTimeline(duration, keeps) {
+// 파형 + 컷 구간 + 임계선을 한 캔버스에 겹쳐 그린다. "왜 여기가 잘렸나" 를
+// 설명하는 게 목적이라 임계선이 핵심이다 — 선 아래로 내려간 구간이 잘린 구간이다.
+function renderWaveform(duration, keeps, wf = lastWaveform) {
+  const cv = $("cutsWave");
+  if (!cv || !wf?.db?.length || !duration) { if (cv) cv.hidden = true; return; }
+  cv.hidden = false;
+
+  const { db, winDuration, thresholdDb } = wf;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = cv.clientWidth || cv.parentElement.clientWidth || 800;
+  const cssH = 140;
+  cv.width = Math.round(cssW * dpr);
+  cv.height = Math.round(cssH * dpr);
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, cssW, cssH);
+
+  const FLOOR = -60;                                  // 표시 하한
+  const norm = (d) => Math.max(0, Math.min(1, (d - FLOOR) / (0 - FLOOR)));
+  const xOf = (t) => (t / duration) * cssW;
+
+  // 잘린 구간 배경 먼저 (파형이 그 위에 올라오도록)
+  g.fillStyle = "rgba(179, 56, 74, 0.18)";
+  for (const r of removedRanges(duration, keeps)) {
+    g.fillRect(xOf(r.start), 0, Math.max(1, xOf(r.end) - xOf(r.start)), cssH);
+  }
+
+  // 파형 — 픽셀 열마다 그 구간의 최대 음량을 쓴다(peak). 평균을 쓰면 짧은 말소리가
+  // 뭉개져서 임계선과의 관계가 안 보인다.
+  const perPx = db.length / cssW;
+  for (let x = 0; x < cssW; x++) {
+    const a = Math.floor(x * perPx);
+    const b = Math.max(a + 1, Math.floor((x + 1) * perPx));
+    let peak = -100;
+    for (let i = a; i < b && i < db.length; i++) if (db[i] > peak) peak = db[i];
+    const h = norm(peak) * (cssH - 16);
+    const t = (a * winDuration);
+    const inCut = !keeps.some((k) => t >= k.start && t < k.end);
+    g.fillStyle = inCut ? "#e0637a" : "#5cf2c0";
+    g.fillRect(x, (cssH - h) / 2, 1, h);
+  }
+
+  // 임계선
+  if (Number.isFinite(thresholdDb)) {
+    const h = norm(thresholdDb) * (cssH - 16);
+    const y = (cssH - h) / 2;
+    g.strokeStyle = "rgba(255,255,255,.55)";
+    g.setLineDash([5, 4]);
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(cssW, y); g.stroke();
+    g.beginPath(); g.moveTo(0, cssH - y); g.lineTo(cssW, cssH - y); g.stroke();
+    g.setLineDash([]);
+    // 라벨은 파형 위에 그냥 얹으면 초록 배경과 겹쳐 안 읽힌다 — 어두운 판을 깔고 쓴다.
+    g.font = "10px system-ui, sans-serif";
+    const text = `무음 기준 ${thresholdDb.toFixed(1)}dB`;
+    const tw = g.measureText(text).width;
+    g.fillStyle = "rgba(10, 11, 16, 0.85)";
+    g.fillRect(5, 4, tw + 12, 15);
+    g.fillStyle = "rgba(255,255,255,.9)";
+    g.fillText(text, 11, 15);
+  }
+
+  cv.onclick = (e) => {
+    const rect = cv.getBoundingClientRect();
+    const t = ((e.clientX - rect.left) / rect.width) * duration;
+    playOriginalRange(t, duration);
+  };
+}
+
+// 원본 재생 중일 때 재생 위치를 파형 위에 세로선으로 표시.
+function startPlayheadLoop(duration) {
+  cancelAnimationFrame(wavePlayhead);
+  const cv = $("cutsWave");
+  const marker = $("cutsPlayhead");
+  if (!cv || !marker) return;
+  const tick = () => {
+    if (previewMode === "original" && duration > 0) {
+      marker.hidden = false;
+      marker.style.left = `${(resultVideo.currentTime / duration) * 100}%`;
+    } else {
+      marker.hidden = true;
+    }
+    wavePlayhead = requestAnimationFrame(tick);
+  };
+  tick();
+}
+
+function renderCutTimeline(duration, keeps, wf = lastWaveform) {
   const block = $("cutsBlock");
   if (!block) return;
   if (!duration || !keeps?.length) { block.hidden = true; return; }
@@ -2842,6 +2934,9 @@ function renderCutTimeline(duration, keeps) {
   // 눈금 — 원본 기준 시각을 5등분해서 표시.
   $("cutsAxis").innerHTML = Array.from({ length: 6 }, (_, i) =>
     `<span>${fmtClock((duration * i) / 5)}</span>`).join("");
+
+  renderWaveform(duration, keeps, wf);
+  startPlayheadLoop(duration);
 
   $("cutsBar").querySelectorAll(".cuts-seg").forEach((el) => {
     el.addEventListener("click", () => {

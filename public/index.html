@@ -283,11 +283,16 @@
             <h4>컷 타임라인</h4>
             <span class="cuts-summary" id="cutsSummary"></span>
           </div>
+          <div class="cuts-wave-wrap">
+            <canvas id="cutsWave" class="cuts-wave" height="140"></canvas>
+            <div class="cuts-playhead" id="cutsPlayhead" hidden></div>
+          </div>
           <div class="cuts-bar" id="cutsBar"></div>
           <div class="cuts-axis" id="cutsAxis"></div>
           <p class="hint-row">
-            초록 = 남긴 구간 · 빨강 = 잘라낸 무음. 막대를 클릭하면 <b>원본</b>의 그 지점부터 재생돼서
-            무엇이 잘렸는지 직접 확인할 수 있습니다.
+            세로 막대 = 음량. <b>가로 점선</b>이 무음 판정 기준선이고, 그 아래로 내려간 구간이
+            빨갛게 잘렸습니다. 클릭하면 <b>원본</b>의 그 지점부터 재생돼서 무엇이 잘렸는지
+            직접 확인할 수 있습니다.
           </p>
           <div class="row">
             <button type="button" id="cutsPlayRemoved" class="btn">잘린 구간만 미리듣기</button>
