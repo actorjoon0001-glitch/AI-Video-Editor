@@ -800,6 +800,8 @@ input[type=range] {
   margin: 12px 0 0;
   font-size: 14px;
   color: var(--muted);
+  /* 용량 초과 안내처럼 여러 줄짜리 메시지가 한 줄로 뭉치지 않게 */
+  white-space: pre-line;
 }
 
 .logbox { margin-top: 14px; font-size: 12px; }
