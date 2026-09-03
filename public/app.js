@@ -309,20 +309,34 @@ function handleFiles(files) {
       `총 ${totalMb.toFixed(1)} MB · 업로드 순서대로 자동 병합됩니다<br>` +
       accepted.map((f, i) => `<span class="file-row">${i + 1}. ${escapeHtml(f.name)} (${(f.size / 1024 / 1024).toFixed(1)} MB)</span>`).join("");
   }
-  // 상한 초과는 편집을 시작하기 전에 알려준다. 8GB 파일을 골라놓고 "자동 편집 시작"
-  // 을 누른 뒤에야 알게 되면, 그때는 이미 브라우저가 몇 분 매달린 뒤다.
+  validatePickedSize();
+
+  // 부드럽게 컨트롤로 스크롤
+  controls.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// 상한 초과는 편집을 시작하기 전에 알려준다. 8GB 파일을 골라놓고 "자동 편집 시작"
+// 을 누른 뒤에야 알게 되면, 그때는 이미 브라우저가 몇 분 매달린 뒤다.
+//
+// 서버 상한(MAX_UPLOAD_MB)은 /api/health 를 받아야 알 수 있는데 그건 비동기다.
+// 그래서 파일을 놓는 시점엔 아직 기본값(500)일 수 있다 — 실제로 서버 상한을
+// 10GB 로 올린 뒤에도 "상한은 500MB" 경고가 그대로 떴다. health 가 도착하면
+// 이 함수를 다시 불러 판정을 갱신한다.
+function validatePickedSize() {
+  if (pickedFiles.length === 0) return;
+  const totalMb = pickedFiles.reduce((a, f) => a + f.size, 0) / 1024 / 1024;
   if (totalMb > MAX_UPLOAD_MB) {
     setStatus(oversizeMessage(totalMb));
     progress.hidden = false;
     runBtn.disabled = true;
   } else {
-    // 직전에 큰 파일을 골랐다면 그 경고가 남아 있다 — 새 파일에는 해당 없으므로 지운다.
-    setStatus("");
+    // 직전 판정의 경고가 남아 있을 수 있다 — 통과했으면 지운다.
+    if (/업로드 상한/.test(statusEl.textContent)) {
+      setStatus("");
+      progress.hidden = true;
+    }
     runBtn.disabled = false;
   }
-
-  // 부드럽게 컨트롤로 스크롤
-  controls.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function escapeHtml(s) {
@@ -1256,6 +1270,9 @@ async function checkBackendHealth() {
       metadataProvider: body.metadataProvider || null,
       youtube: body.youtube === true,
       youtubeAllowsPublic: body.youtubeAllowsPublic === true,
+      // 업로드 상한·여유 디스크. 이걸 빠뜨려서, 서버에서 상한을 10GB 로 올린 뒤에도
+      // 프론트는 계속 기본값 500MB 로 판정하고 "상한은 500MB" 경고를 띄웠다.
+      limits: body.limits || null,
       url, httpStatus: 200, body: JSON.stringify(body).slice(0, 200),
     };
     return backendHealthCache;
@@ -2331,7 +2348,10 @@ async function refreshStatusPills() {
     health.metadataProvider === "claude" ? "메타데이터 Claude" : "메타데이터 로컬");
   // 상한은 서버가 정한다 (MAX_UPLOAD_MB 환경변수). 프론트에 박아두면 서버에서
   // 올려도 프론트가 계속 막는다.
-  if (health.limits?.maxUploadMb > 0) MAX_UPLOAD_MB = health.limits.maxUploadMb;
+  if (health.limits?.maxUploadMb > 0) {
+    MAX_UPLOAD_MB = health.limits.maxUploadMb;
+    validatePickedSize();   // 파일을 먼저 놓았어도 갱신된 상한으로 다시 판정
+  }
   setPill("pillYoutube", health.youtube ? "ok" : "off",
     health.youtube ? (health.youtubeAllowsPublic ? "YouTube 공개 허용" : "YouTube 비공개만") : "YouTube 미설정");
 }
