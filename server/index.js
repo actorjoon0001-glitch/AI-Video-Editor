@@ -118,6 +118,9 @@ function healthBody() {
       { method: "GET",  path: "/api/transcribe/jobs/:id" },
       { method: "POST", path: "/api/burn-subtitles" },
       { method: "POST", path: "/api/jobs" },
+      { method: "POST", path: "/api/uploads" },
+      { method: "PUT",  path: "/api/uploads/:id" },
+      { method: "POST", path: "/api/uploads/:id/complete" },
       { method: "GET",  path: "/api/jobs/:id" },
       { method: "POST", path: "/api/jobs/:id/stages/:stage/retry" },
       { method: "POST", path: "/api/jobs/:id/subtitles" },
@@ -593,6 +596,110 @@ app.post("/api/jobs", upload.single("video"), async (req, res) => {
 
   // 백그라운드 실행
   runJobPipeline(id, inputPath).catch((e) => {
+    console.error(`[job ${id}] dispatcher crash:`, e);
+  });
+});
+
+// ── 청크 업로드 ─────────────────────────────────────────────────────────────
+// 8GB 파일을 요청 하나로 올리면, 중간에 네트워크가 한 번만 끊겨도 처음부터 다시
+// 해야 한다. 실제로 125MB 지점에서 연결이 끊겨 통째로 실패했다. 파일을 쪼개서
+// 올리고 실패한 조각만 다시 보낸다.
+//
+// 조각은 순서대로 이어붙인다. 서버는 받은 바이트 수만 들고 있으면 되고, 클라이언트는
+// 재개할 때 그 값을 물어봐서 그 지점부터 이어서 보낸다.
+const uploads = new Map();  // id -> { path, received, total, createdAt, fh }
+const UPLOAD_TTL_MS = 6 * 60 * 60 * 1000;
+
+// 버려진 업로드 정리 — 안 하면 디스크가 조각 파일로 찬다.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, u] of uploads) {
+    if (now - u.updatedAt > UPLOAD_TTL_MS) {
+      uploads.delete(id);
+      u.fh?.close().catch(() => {});
+      unlink(u.path).catch(() => {});
+      console.log(`[upload ${id}] 만료 정리`);
+    }
+  }
+}, 30 * 60 * 1000).unref();
+
+app.post("/api/uploads", express.json({ limit: "1mb" }), async (req, res) => {
+  const total = Number(req.body?.totalBytes) || 0;
+  if (total <= 0) return res.status(400).json({ error: "totalBytes required" });
+  if (total > MAX_UPLOAD_BYTES) {
+    return res.status(413).json({
+      error: `파일이 ${Math.round(total / 1024 / 1024)}MB 로 상한 ${MAX_UPLOAD_MB}MB 를 넘습니다.`,
+    });
+  }
+  const id = randomUUID();
+  const p = path.join(TMP, `${id}.upload`);
+  const { open: openFile } = await import("fs/promises");
+  const fh = await openFile(p, "w");
+  uploads.set(id, { path: p, received: 0, total, fh, updatedAt: Date.now() });
+  console.log(`[upload ${id}] 시작 — ${(total / 1024 / 1024).toFixed(1)}MB`);
+  res.status(201).json({ uploadId: id, chunkSize: 16 * 1024 * 1024 });
+});
+
+// 재개용 — 클라이언트가 어디까지 갔는지 묻는다.
+app.get("/api/uploads/:id", (req, res) => {
+  const u = uploads.get(String(req.params.id).replace(/[^a-f0-9-]/gi, ""));
+  if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
+  res.json({ received: u.received, total: u.total });
+});
+
+// 조각 append. offset 을 함께 받아, 중복 전송(재시도)이면 조용히 무시한다.
+app.put("/api/uploads/:id", express.raw({ type: "*/*", limit: "64mb" }), async (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const u = uploads.get(id);
+  if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
+  const offset = Number(req.query.offset);
+  if (!Number.isFinite(offset) || offset < 0) {
+    return res.status(400).json({ error: "offset required" });
+  }
+  // 이미 받은 지점이면 재시도로 보고 성공 처리 — 클라이언트가 응답을 못 받고
+  // 다시 보낸 경우다. 여기서 400 을 주면 정상 재시도가 실패로 끝난다.
+  if (offset < u.received) return res.json({ received: u.received, total: u.total });
+  if (offset > u.received) {
+    return res.status(409).json({ error: "offset 불일치", received: u.received });
+  }
+  const buf = req.body;
+  if (!buf?.length) return res.status(400).json({ error: "빈 조각" });
+  if (u.received + buf.length > u.total) {
+    return res.status(400).json({ error: "선언한 크기를 초과했습니다." });
+  }
+  try {
+    await u.fh.write(buf, 0, buf.length, u.received);
+  } catch (e) {
+    return res.status(500).json({ error: `조각 기록 실패: ${e?.message || e}` });
+  }
+  u.received += buf.length;
+  u.updatedAt = Date.now();
+  res.json({ received: u.received, total: u.total });
+});
+
+// 조립 완료 → 기존 작업 파이프라인으로 넘긴다.
+app.post("/api/uploads/:id/complete", express.json({ limit: "4mb" }), async (req, res) => {
+  const uploadId = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const u = uploads.get(uploadId);
+  if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
+  if (u.received !== u.total) {
+    return res.status(400).json({
+      error: `업로드가 끝나지 않았습니다 (${u.received} / ${u.total} 바이트).`,
+      received: u.received,
+    });
+  }
+  await u.fh.close().catch(() => {});
+  uploads.delete(uploadId);
+
+  const id = randomUUID();
+  const safeOpts = sanitizeJobOptions(req.body?.options || {});
+  const job = newPipelineJob(id, safeOpts);
+  pipelineJobs.set(id, job);
+  console.log(`[upload ${uploadId}] 완료 → job ${id} (${(u.total / 1024 / 1024).toFixed(1)}MB)`);
+
+  res.status(202).json({ jobId: id, statusUrl: `/api/jobs/${id}`, pollIntervalMs: 3000 });
+
+  runJobPipeline(id, u.path).catch((e) => {
     console.error(`[job ${id}] dispatcher crash:`, e);
   });
 });

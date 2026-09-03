@@ -1698,11 +1698,9 @@ async function runQueueModePipeline() {
   }
   setBar(10);
 
-  // 2) /api/jobs 로 업로드
+  // 2) 업로드
   setStatus("큐 모드: 작업 등록 중 (영상 업로드)...");
-  const fd = new FormData();
-  fd.append("video", sourceFile);
-  fd.append("options", JSON.stringify({
+  const jobOptions = {
     keeps,
     // keeps 가 비어 있으면 서버가 이 값들로 직접 무음을 찾는다.
     sourceDuration: duration,
@@ -1724,12 +1722,21 @@ async function runQueueModePipeline() {
     metadataPersona: $("metaPersona")?.value?.trim() || "",
     upload: $("ytUpload")?.checked === true,
     privacy: $("ytPrivacy")?.value || "private",
-  }));
-  // fetch 는 업로드 진행률을 못 준다. 200MB 넘는 파일에서는 몇 분 동안 화면이
-  // 멈춘 것처럼 보이고, 연결이 끊겨도 영원히 매달려 있게 된다. XHR 로 올려서
-  // 진행률(%)과 타임아웃을 붙인다.
+  };
+
   const totalMb = (sourceFile.size / 1024 / 1024).toFixed(1);
-  const { jobId, pollIntervalMs = 3000 } = await uploadJobRequest(fd, totalMb);
+  // 큰 파일은 조각으로 올린다 — 한 번에 올리면 중간에 한 번만 끊겨도 처음부터다.
+  // 작은 파일은 왕복이 늘 뿐이라 기존 단일 요청(XHR, 진행률·타임아웃 지원)을 쓴다.
+  let uploadResult;
+  if (sourceFile.size > CHUNK_UPLOAD_THRESHOLD_MB * 1024 * 1024) {
+    uploadResult = await uploadJobChunked(sourceFile, jobOptions, totalMb);
+  } else {
+    const fd = new FormData();
+    fd.append("video", sourceFile);
+    fd.append("options", JSON.stringify(jobOptions));
+    uploadResult = await uploadJobRequest(fd, totalMb);
+  }
+  const { jobId, pollIntervalMs = 3000 } = uploadResult;
   appendLog(`작업 등록: ${jobId}`);
 
   // 3) 폴링 — 결과 패널을 미리 보여서 진행 상태 노출.
@@ -1839,6 +1846,99 @@ function uploadJobRequest(fd, totalMb) {
     ));
     xhr.send(fd);
   });
+}
+
+// 조각 업로드. 큰 파일을 요청 하나로 올리면 중간에 네트워크가 한 번만 끊겨도
+// 처음부터 다시 해야 한다 — 실제로 8.2GB 를 올리다 125MB 지점에서 끊겨 통째로
+// 실패했다. 파일을 잘라 보내고, 실패한 조각만 다시 보낸다.
+const CHUNK_RETRIES = 5;
+// 이 크기를 넘으면 조각 업로드. 작은 파일은 단일 요청이 더 빠르다.
+const CHUNK_UPLOAD_THRESHOLD_MB = 200;
+
+async function uploadJobChunked(file, options, totalMb) {
+  const started = Date.now();
+  const create = await fetch(`${BACKEND_URL}/api/uploads`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ totalBytes: file.size }),
+  });
+  if (!create.ok) {
+    const t = await create.text().catch(() => "");
+    throw new Error(`업로드 세션 생성 실패 (HTTP ${create.status}): ${t.slice(0, 200)}`);
+  }
+  const { uploadId, chunkSize } = await create.json();
+  const CHUNK = chunkSize || 16 * 1024 * 1024;
+  const chunkLabel = CHUNK >= 1024 * 1024
+    ? `${(CHUNK / 1024 / 1024).toFixed(0)}MB`
+    : `${(CHUNK / 1024).toFixed(0)}KB`;
+  appendLog(`조각 업로드 시작 — ${Math.ceil(file.size / CHUNK)}개 조각 (${chunkLabel}씩)`);
+
+  let offset = 0;
+  while (offset < file.size) {
+    const end = Math.min(offset + CHUNK, file.size);
+    let ok = false;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= CHUNK_RETRIES; attempt++) {
+      try {
+        const r = await fetch(`${BACKEND_URL}/api/uploads/${uploadId}?offset=${offset}`, {
+          method: "PUT",
+          headers: { "content-type": "application/octet-stream" },
+          body: file.slice(offset, end),
+        });
+        if (r.ok) {
+          offset = (await r.json()).received;
+          ok = true;
+          break;
+        }
+        // offset 이 어긋났으면 서버가 받은 지점으로 맞춘다 (재시도가 중간에 성공한 경우).
+        if (r.status === 409) {
+          offset = (await r.json()).received;
+          ok = true;
+          break;
+        }
+        lastErr = new Error(`HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 150)}`);
+      } catch (e) {
+        lastErr = e;   // 네트워크 끊김 — 이게 원래 통째로 실패시키던 원인이다
+      }
+      // 서버가 실제로 어디까지 받았는지 물어보고 그 지점부터 재개한다.
+      try {
+        const st = await fetch(`${BACKEND_URL}/api/uploads/${uploadId}`);
+        if (st.ok) offset = (await st.json()).received;
+      } catch {}
+      const waitMs = Math.min(8000, 500 * 2 ** (attempt - 1));
+      appendLog(`조각 재시도 ${attempt}/${CHUNK_RETRIES} (${(offset / 1024 / 1024).toFixed(0)}MB 지점) — ${lastErr?.message || ""}`);
+      setStatus(`업로드 재시도 중 ${attempt}/${CHUNK_RETRIES}... (${(offset / 1024 / 1024).toFixed(0)} / ${totalMb} MB)`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+    if (!ok) {
+      throw new Error(
+        `업로드가 ${(offset / 1024 / 1024).toFixed(0)}MB 지점에서 ${CHUNK_RETRIES}번 재시도 후에도 실패했습니다: ${lastErr?.message || ""}`
+      );
+    }
+    const pct = Math.round((offset / file.size) * 100);
+    const mbps = offset / 1024 / 1024 / ((Date.now() - started) / 1000);
+    const remainSec = mbps > 0 ? (file.size / 1024 / 1024 - offset / 1024 / 1024) / mbps : 0;
+    setStatus(
+      `큐 모드: 영상 업로드 ${pct}% (${(offset / 1024 / 1024).toFixed(0)} / ${totalMb} MB` +
+      `${remainSec > 5 ? ` · 남은 시간 약 ${fmtClock(remainSec)}` : ""})`
+    );
+    setBar(10 + pct * 0.2);
+  }
+
+  setStatus("큐 모드: 업로드 완료 — 서버가 작업을 등록하는 중...");
+  const done = await fetch(`${BACKEND_URL}/api/uploads/${uploadId}/complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ options }),
+  });
+  if (!done.ok) {
+    const t = await done.text().catch(() => "");
+    throw new Error(`작업 등록 실패 (HTTP ${done.status}): ${t.slice(0, 200)}`);
+  }
+  const body = await done.json();
+  if (!body.jobId) throw new Error("서버 응답에 jobId 가 없습니다.");
+  appendLog(`업로드 완료 — ${((Date.now() - started) / 1000).toFixed(0)}초, 평균 ${(file.size / 1024 / 1024 / ((Date.now() - started) / 1000)).toFixed(1)} MB/s`);
+  return body;
 }
 
 function makeInitialJobState(jobId) {
