@@ -18,6 +18,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { generateMetadata, metadataProvider } from "./metadata.js";
 import { uploadVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy } from "./youtube.js";
+import { detectKeeps } from "./silence.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -703,6 +704,11 @@ function sanitizeJobOptions(opts) {
     fillerMode: sanitizeFillerMode(opts.fillerMode),
     glossary: sanitizeGlossary(opts.glossary),
     subtitleStyle: sanitizeSubtitleStyle(opts.subtitleStyle),
+    // keeps 를 안 보내면 서버가 무음을 직접 찾는다. 그때 쓰는 파라미터.
+    sourceDuration: Math.max(0, Number(opts.sourceDuration) || 0),
+    noiseDb: opts.noiseDb == null ? null : clamp(Number(opts.noiseDb) || -32, -60, -10),
+    minSilence: clamp(Number(opts.minSilence) || 0.6, 0.1, 5),
+    padding: clamp(Number(opts.padding) || 0.1, 0, 1),
     // 후속 stage 옵션 — 모두 명시적 opt-in.
     burn: opts.burn === true,
     metadata: opts.metadata === true,
@@ -730,10 +736,35 @@ async function runJobPipeline(id, inputPath) {
   const editedPath = path.join(TMP, `${id}.edited.mp4`);
   job.artifacts.push(editedPath);
 
+  // ── detect ── keeps 를 안 받았으면 서버가 직접 무음을 찾는다.
+  // 브라우저는 분석하려면 파일 전체를 메모리에 올려야 해서 큰 파일에서 죽는다.
+  // 여기서는 ffmpeg 가 오디오만 스트리밍으로 흘려주므로 길이·크기 제한이 없다.
+  if (job.options.keeps.length === 0) {
+    await runStage(job, "detect", async () => {
+      const t0 = Date.now();
+      const r = await detectKeeps(inputPath, job.options.sourceDuration, {
+        noiseDb: job.options.noiseDb,
+        minSilence: job.options.minSilence,
+        padding: job.options.padding,
+      });
+      if (r.keeps.length === 0) {
+        throw new Error("남길 구간이 없습니다. 영상 전체가 무음으로 판정됐습니다.");
+      }
+      job.options.keeps = r.keeps;
+      return {
+        keeps: r.keeps,
+        duration: r.duration,
+        stats: r.stats,
+        waveform: r.waveform,
+        durationMs: Date.now() - t0,
+      };
+    });
+  }
+
   // ── edit ──
   await runStage(job, "edit", async () => {
     if (job.options.keeps.length === 0) {
-      throw new Error("keeps 가 비어 있습니다 — 프론트에서 무음 감지 결과를 같이 보내주세요.");
+      throw new Error("keeps 가 비어 있습니다 — 무음 감지 단계가 먼저 성공해야 합니다.");
     }
     const t0 = Date.now();
     // 예상 출력 길이 = 남긴 구간 합 / 속도. 진행률(%) 계산 기준.

@@ -74,7 +74,10 @@ let pickedFiles = [];
 // 이유가 없다. 브라우저도 그 전에 죽는다 — 8GB 파일에서 file.arrayBuffer() 가
 // NotReadableError 를 던지는데, 그 에러 문구가 "permission problems" 라서
 // 원인을 짐작할 수가 없다.
-const MAX_UPLOAD_MB = 500;
+let MAX_UPLOAD_MB = 500;   // /api/health 의 limits.maxUploadMb 로 갱신된다
+// 브라우저에서 음량을 분석하려면 파일 전체를 메모리에 올려야 한다. 이 크기를 넘으면
+// 분석을 서버에 맡긴다 — ffmpeg 는 오디오만 스트리밍으로 훑어서 크기 제한이 없다.
+const BROWSER_ANALYSIS_LIMIT_MB = 400;
 
 function oversizeMessage(totalMb) {
   return `파일이 ${totalMb.toFixed(0)}MB 입니다. 서버 업로드 상한은 ${MAX_UPLOAD_MB}MB 라 이대로는 처리할 수 없습니다.\n\n` +
@@ -958,12 +961,18 @@ function autoSilenceThresholdDb(db) {
   const range = speechDb - floorDb;
   // 바닥에서 얼마나 띄울지 — 다이내믹 레인지가 좁으면 적게 띄워야 말소리를 안 먹는다.
   const margin = Math.min(10, Math.max(3, range * 0.3));
-  const threshold = Math.min(floorDb + margin, speechDb - 6);
+  // speechDb - 6 은 말소리를 먹지 않으려는 상한인데, 다이내믹 레인지가 6dB 보다
+  // 좁으면 이 값이 노이즈 바닥보다 아래로 내려간다. 그러면 임계값 아래인 창이
+  // 하나도 없어 무음이 0개가 되고, 결과는 원본과 같은 길이가 된다.
+  // 바닥보다는 반드시 위에 있어야 한다.
+  const threshold = Math.max(floorDb + 1.5, Math.min(floorDb + margin, speechDb - 6));
   return {
     thresholdDb: Math.max(-50, Math.min(-18, threshold)),
     floorDb,
     speechDb,
     range,
+    // range 가 좁으면 말과 소음을 음량만으로 가르기 어렵다 — UI 가 경고할 수 있게.
+    lowContrast: range < 8,
   };
 }
 
@@ -1579,7 +1588,10 @@ function attachVttTrack(vttUrl) {
 // 무음 감지만 브라우저에서 빠르게 끝낸 뒤, 영상 + keeps + 옵션을 백엔드 /api/jobs
 // 로 한 번에 보낸다. 인코딩·자막·썸네일은 백엔드가 단계별로 돌리고, 프론트는 3초
 // 폴링으로 진행 상태를 다단계 패널에 그린다. 한 단계 실패해도 나머지는 진행.
+// detect 는 큰 파일에서만 도는 단계 — 브라우저가 분석을 못 할 때 서버가 대신한다.
+// 안 돌면 renderJobPipeline 이 알아서 숨긴다.
 const STAGE_LABELS = [
+  ["detect",     "0. 무음 감지 (서버)"],
   ["edit",       "1. 편집 (cut + ratio + speed + loudnorm)"],
   ["transcribe", "2. 자막 (Whisper)"],
   ["burn",       "3. 자막 번인"],
@@ -1615,8 +1627,20 @@ async function runQueueModePipeline() {
   const padding = parseFloat($("padding").value);
   const duration = await measureDurationFromFile(sourceFile);
   if (duration <= 0) throw new Error("브라우저가 영상 길이를 못 읽었습니다.");
+
+  // 큰 파일은 브라우저가 분석하다 죽는다 (file.arrayBuffer() 가 파일 전체를 램에
+  // 올린다 — 8GB 원본에서 NotReadableError). 서버에 맡기고 keeps 를 비워 보내면
+  // detect 단계가 직접 찾는다.
+  const sourceMb = sourceFile.size / 1024 / 1024;
+  const serverDetect = state.mode !== "short" && sourceMb > BROWSER_ANALYSIS_LIMIT_MB;
+
   let keeps;
-  if (state.mode === "short") {
+  if (serverDetect) {
+    keeps = [];
+    lastWaveform = null;
+    appendLog(`무음 감지를 서버에 위임 (${sourceMb.toFixed(0)}MB > ${BROWSER_ANALYSIS_LIMIT_MB}MB) — 브라우저 메모리 한계 회피`);
+    setStatus("큐 모드: 업로드 후 서버가 무음을 분석합니다...");
+  } else if (state.mode === "short") {
     const targetLen = parseFloat($("shortLen").value);
     const w = await pickHighlightWindowWebAudio(sourceFile, duration, targetLen).catch(() => null);
     keeps = w ? [w] : [{ start: 0, end: Math.min(duration, targetLen) }];
@@ -1631,7 +1655,9 @@ async function runQueueModePipeline() {
       ` · 무음 ${stats.silenceCount}개 / ${stats.silenceSec.toFixed(1)}초`
     );
   }
-  if (keeps.length === 0) throw new Error("남은 구간이 없습니다. 임계값을 완화해 보세요.");
+  if (!serverDetect && keeps.length === 0) {
+    throw new Error("남은 구간이 없습니다. 임계값을 완화해 보세요.");
+  }
   // 컷 타임라인과 CapCut 드래프트가 같은 keeps 를 쓴다. 예전엔 큐 모드에서 이걸
   // 안 채워서 CapCut 버튼이 아무 반응도 없었다.
   lastKeeps = keeps;
@@ -1641,8 +1667,12 @@ async function runQueueModePipeline() {
   // 했다. 사용자 입장에선 몇 분 기다린 결과가 원본과 똑같은데 왜인지 알 수가 없다.
   const keptSec = keeps.reduce((s, k) => s + (k.end - k.start), 0);
   const cutPct = duration > 0 ? (1 - keptSec / duration) * 100 : 0;
-  appendLog(`큐 모드: keeps=${keeps.length}, duration=${duration.toFixed(2)}s, 컷 ${cutPct.toFixed(1)}%`);
-  if (cutPct < 2) {
+  if (serverDetect) {
+    appendLog(`큐 모드: duration=${duration.toFixed(2)}s — 무음 감지는 서버가 수행`);
+  } else {
+    appendLog(`큐 모드: keeps=${keeps.length}, duration=${duration.toFixed(2)}s, 컷 ${cutPct.toFixed(1)}%`);
+  }
+  if (!serverDetect && cutPct < 2) {
     appendLog(
       "! 잘라낼 무음을 거의 못 찾았습니다 — 결과가 원본과 비슷한 길이로 나옵니다." +
       " 녹음 환경 소음이 크면 '컷 편집 세부'에서 무음 임계 dB 를 올려(-26 쪽) 다시 시도하세요."
@@ -1657,6 +1687,11 @@ async function runQueueModePipeline() {
   fd.append("video", sourceFile);
   fd.append("options", JSON.stringify({
     keeps,
+    // keeps 가 비어 있으면 서버가 이 값들로 직접 무음을 찾는다.
+    sourceDuration: duration,
+    noiseDb,
+    minSilence,
+    padding,
     ratio: state.ratio,
     speed: state.speed,
     loudnorm: $("loudnorm").checked,
@@ -1807,15 +1842,17 @@ function renderJobPipeline(job) {
   const ol = document.getElementById("jobStages");
   if (!ol) return;
   ol.innerHTML = STAGE_LABELS.map(([key, label]) => {
-    const s = job.stages?.[key] || { status: "queued" };
-    const icon = JOB_STAGE_ICON[s.status] || "·";
-    const detail = jobStageDetailText(key, s);
+    const s = job.stages?.[key];
+    // detect 는 큰 파일에서만 돈다 — 안 돈 작업에서는 줄 자체를 감춘다.
+    if (key === "detect" && !s) return "";
+    const icon = JOB_STAGE_ICON[(s || { status: "queued" }).status] || "·";
+    const detail = jobStageDetailText(key, s || { status: "queued" });
     const detailHtml = detail ? `<span class="detail">${escapeHtml(detail)}</span>` : "";
     // edit 은 원본이 이미 지워져 재시도 불가. upload 는 중복 게시 위험 때문에
     // 실패했을 때만 (백엔드도 같은 규칙으로 막는다).
-    const retryBtn = s.status === "failed" && key !== "edit"
+    const retryBtn = s?.status === "failed" && key !== "edit"
       ? `<button type="button" class="btn" data-retry="${key}">다시 시도</button>` : "";
-    return `<li class="job-stage ${s.status}">
+    return `<li class="job-stage ${(s || { status: "queued" }).status}">
       <span class="icon">${icon}</span>
       <span><span class="label">${label}</span>${detailHtml}</span>
       <span class="actions">${retryBtn}</span>
@@ -1830,6 +1867,11 @@ function renderJobPipeline(job) {
 function jobStageDetailText(key, s) {
   if (s.error) return `에러: ${s.error}`;
   if (s.note) return s.note;
+  if (key === "detect" && s.status === "done" && s.result) {
+    const st = s.result.stats || {};
+    return `무음 ${st.silenceCount}곳 / ${(st.silenceSec || 0).toFixed(1)}초 · 임계 ${(st.thresholdDb || 0).toFixed(1)}dB` +
+      `${st.auto ? " (자동)" : ""}${st.lowContrast ? " · 음량 대비 낮음" : ""}`;
+  }
   if (s.status === "running") {
     const elapsed = s.startedAt ? ` · ${Math.round((Date.now() - s.startedAt) / 1000)}초 경과` : "";
     const p = s.progress;
@@ -1974,6 +2016,22 @@ async function wireQueueResults(job) {
     burnedBtn.removeAttribute("aria-disabled");
   }
   renderMetadata(job.stages.metadata, job.stages.upload);
+  // 서버가 무음을 찾았으면 그 결과로 타임라인을 그린다 (브라우저는 분석을 안 했다).
+  const det = job.stages?.detect?.result;
+  if (det?.keeps?.length) {
+    lastKeeps = det.keeps;
+    pickedDuration = det.duration || pickedDuration;
+    if (det.waveform?.db?.length) lastWaveform = det.waveform;
+    const st = det.stats || {};
+    appendLog(
+      `서버 무음 감지: 노이즈 바닥 ${st.floorDb?.toFixed(1)}dB · 말소리 ${st.speechDb?.toFixed(1)}dB` +
+      ` → 임계값 ${st.thresholdDb?.toFixed(1)}dB${st.auto ? " (자동)" : " (수동)"}` +
+      ` · 무음 ${st.silenceCount}개 / ${st.silenceSec?.toFixed(1)}초`
+    );
+    if (st.lowContrast) {
+      appendLog("! 말소리와 배경 소음의 음량 차이가 작아 자동 감지가 부정확할 수 있습니다.");
+    }
+  }
   renderCutTimeline(pickedDuration, lastKeeps);
   renderSubtitleEditor(job);
 }
@@ -2271,6 +2329,9 @@ async function refreshStatusPills() {
     health.whisper === false ? "자막 엔진 오류" : "자막");
   setPill("pillMeta", "ok",
     health.metadataProvider === "claude" ? "메타데이터 Claude" : "메타데이터 로컬");
+  // 상한은 서버가 정한다 (MAX_UPLOAD_MB 환경변수). 프론트에 박아두면 서버에서
+  // 올려도 프론트가 계속 막는다.
+  if (health.limits?.maxUploadMb > 0) MAX_UPLOAD_MB = health.limits.maxUploadMb;
   setPill("pillYoutube", health.youtube ? "ok" : "off",
     health.youtube ? (health.youtubeAllowsPublic ? "YouTube 공개 허용" : "YouTube 비공개만") : "YouTube 미설정");
 }
