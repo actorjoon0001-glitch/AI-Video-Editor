@@ -70,6 +70,19 @@ let ffmpeg = null;
 let ffmpegEngine = null; // "mt" | "st"
 // pickedFiles 가 source of truth. pickedFile 은 pickedFiles[0] 의 별칭(편의용).
 let pickedFiles = [];
+// 서버 multer 상한과 같은 값. 이걸 넘으면 업로드 자체가 거부되므로 편집을 시작할
+// 이유가 없다. 브라우저도 그 전에 죽는다 — 8GB 파일에서 file.arrayBuffer() 가
+// NotReadableError 를 던지는데, 그 에러 문구가 "permission problems" 라서
+// 원인을 짐작할 수가 없다.
+const MAX_UPLOAD_MB = 500;
+
+function oversizeMessage(totalMb) {
+  return `파일이 ${totalMb.toFixed(0)}MB 입니다. 서버 업로드 상한은 ${MAX_UPLOAD_MB}MB 라 이대로는 처리할 수 없습니다.\n\n` +
+    `해결 방법:\n` +
+    `1) 화질을 낮춰 다시 내보내기 — 4K/고비트레이트 원본을 1080p 로 다시 쓰면 보통 10~20배 줄어듭니다 (화질 손해는 거의 없습니다).\n` +
+    `2) 영상을 나눠서 따로 돌리기.\n\n` +
+    `참고: 브라우저가 음량을 분석할 때 파일 전체를 메모리에 올리기 때문에, 길이도 30분 이내를 권장합니다.`;
+}
 let pickedFile = null;
 let pickedDuration = 0; // 다중 입력 시 합산 길이
 let lastKeeps = [];
@@ -293,6 +306,18 @@ function handleFiles(files) {
       `총 ${totalMb.toFixed(1)} MB · 업로드 순서대로 자동 병합됩니다<br>` +
       accepted.map((f, i) => `<span class="file-row">${i + 1}. ${escapeHtml(f.name)} (${(f.size / 1024 / 1024).toFixed(1)} MB)</span>`).join("");
   }
+  // 상한 초과는 편집을 시작하기 전에 알려준다. 8GB 파일을 골라놓고 "자동 편집 시작"
+  // 을 누른 뒤에야 알게 되면, 그때는 이미 브라우저가 몇 분 매달린 뒤다.
+  if (totalMb > MAX_UPLOAD_MB) {
+    setStatus(oversizeMessage(totalMb));
+    progress.hidden = false;
+    runBtn.disabled = true;
+  } else {
+    // 직전에 큰 파일을 골랐다면 그 경고가 남아 있다 — 새 파일에는 해당 없으므로 지운다.
+    setStatus("");
+    runBtn.disabled = false;
+  }
+
   // 부드럽게 컨트롤로 스크롤
   controls.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -3170,6 +3195,19 @@ function renderStats({ inputDuration, outputDuration, cutTime, cuts, ratio, spee
 
 function onError(err) {
   console.error(err);
+  // 브라우저의 NotReadableError 원문은 "permission problems" 라고만 해서 실제 원인
+  // (파일이 너무 크거나, 외장/네트워크 드라이브가 끊겼거나, 파일이 바뀜)을 알 수 없다.
+  const name = err?.name || "";
+  if (name === "NotReadableError" || /could not be read/i.test(err?.message || "")) {
+    const mb = pickedFiles.reduce((a, f) => a + f.size, 0) / 1024 / 1024;
+    setStatus(mb > MAX_UPLOAD_MB
+      ? oversizeMessage(mb)
+      : "브라우저가 파일을 읽지 못했습니다. 외장 드라이브·네트워크 드라이브에 있거나 " +
+        "선택 후 파일이 옮겨졌을 수 있습니다. 파일을 내 컴퓨터 디스크로 복사한 뒤 다시 선택해 주세요.");
+    resultSection.hidden = true;
+    runBtn.disabled = false;
+    return;
+  }
   // 편집 실패 시 미리보기는 노출하지 않는다. 진행 패널의 status 영역에 에러만 표시.
   resultSection.hidden = true;
   setStatus("오류: " + (err?.message || err));
