@@ -12,7 +12,8 @@ import multer from "multer";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { mkdir, unlink, stat, writeFile } from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, statfsSync } from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { generateMetadata, metadataProvider } from "./metadata.js";
@@ -49,9 +50,14 @@ app.use(
   })
 );
 
+// 업로드 상한. 원본과 편집본이 디스크에 동시에 존재하므로 실제로는 이 값의
+// 2배 이상 여유가 필요하다 — /api/health 의 limits 로 남은 용량을 노출한다.
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 500;
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+
 const upload = multer({
   dest: TMP,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB 상한
+  limits: { fileSize: MAX_UPLOAD_BYTES },
 });
 
 app.get("/", (req, res) => res.type("text/plain").send("AI Video Editor backend"));
@@ -100,6 +106,9 @@ function healthBody() {
     metadataProvider: metadataProvider(),
     youtube: youtubeConfigured(),
     youtubeAllowsPublic: youtubeAllowsPublic(),
+    // 업로드 상한을 올릴 수 있는지는 남은 디스크와 메모리가 정한다. 원본 + 편집본이
+    // 동시에 올라가므로 파일 크기의 최소 2배가 필요하다.
+    limits: diskAndMemory(),
     routes: [
       { method: "POST", path: "/api/process" },
       { method: "GET",  path: "/api/result/:id" },
@@ -117,6 +126,22 @@ function healthBody() {
     ],
     allowedOrigins: ALLOWED_ORIGINS,
   };
+}
+// 진단용 — 큰 파일을 받을 수 있는 환경인지 프론트/운영자가 판단할 수 있게.
+function diskAndMemory() {
+  const out = { maxUploadMb: Math.round(MAX_UPLOAD_BYTES / 1024 / 1024) };
+  try {
+    const st = statfsSync(TMP);
+    out.tmpFreeMb = Math.round((st.bavail * st.bsize) / 1024 / 1024);
+    out.tmpTotalMb = Math.round((st.blocks * st.bsize) / 1024 / 1024);
+  } catch (e) {
+    out.diskError = String(e?.message || e).slice(0, 120);
+  }
+  try {
+    out.totalMemMb = Math.round(os.totalmem() / 1024 / 1024);
+    out.freeMemMb = Math.round(os.freemem() / 1024 / 1024);
+  } catch {}
+  return out;
 }
 app.get("/healthz", (req, res) => res.json(healthBody()));
 app.get("/api/health", (req, res) => res.json(healthBody()));
