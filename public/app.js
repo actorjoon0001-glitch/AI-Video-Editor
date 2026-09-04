@@ -2486,6 +2486,11 @@ function renderMetadata(metaStage, uploadStage) {
           `제목: ${up.title || "-"}`,
           up.publishAt ? `예약 게시: ${up.publishAt}` : null,
           up.thumbnailSet ? "썸네일 적용됨" : (up.thumbnailError ? `썸네일 실패: ${up.thumbnailError}` : null),
+          // 카드 합성은 실패해도 업로드를 막지 않는다. 그래서 조용히 원본 사진이
+          // 올라가는데, 왜 문구가 없는지는 보여야 한다.
+          up.thumbnailCard?.error
+            ? `썸네일 문구 없음: ${up.thumbnailCard.error}`
+            : (up.thumbnailCard?.font ? `썸네일 문구 ${up.thumbnailCard.font}` : null),
         ].filter(Boolean).join(" · ");
       }
     } else {
