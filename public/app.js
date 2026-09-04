@@ -1063,6 +1063,79 @@ async function fetchEditPlan(file, fillerMode) {
 // 자막 모델은 UI 선택을 따른다. 예전엔 큐 모드가 "tiny" 를 하드코딩해서,
 // 서버 메모리를 늘려도 자막 품질이 그대로였다.
 // 자막 번인 스타일. 백엔드 buildForceStyle() 과 키를 맞춘다.
+// 설명글 기본 템플릿. 사용자가 UI 에서 고쳐 쓰고, 고친 값은 저장된다.
+// 중괄호 자리는 영상마다 서버가 채운다 — 자막에서 확인 안 된 값은 그 줄이
+// 통째로 빠지므로 "· 가격대 :" 같은 빈 항목이 남지 않는다.
+const DEFAULT_DESC_TEMPLATE = [
+  "{한줄요약}",
+  "",
+  "{집소개}",
+  "",
+  "━━━━━━━━━━━━━━━━━━━",
+  "",
+  "📍 이 집 정보",
+  "· 면적 : {평수}평 ({제곱미터}㎡)",
+  "· 공법 : {공법}",
+  "· 구성 : {구성}",
+  "· 가격대 : {가격}",
+  "",
+  "━━━━━━━━━━━━━━━━━━━",
+  "",
+  "🏠 이 집이 궁금하시면 이집사에게 물어보세요",
+  "",
+  "가격이 궁금하신지, 실제로 지을 수 있는지,",
+  "편하게 남겨주시면 제가 직접 답 드립니다.",
+  "",
+  "👉 {문의링크}?h={집번호}",
+  "",
+  "📖 이집사가 소개한 모든 집 보기",
+  "지금까지 다녀온 집들을 한곳에 모아뒀습니다.",
+  "👉 {카탈로그링크}?from=yt&h={집번호}",
+  "",
+  "━━━━━━━━━━━━━━━━━━━",
+  "",
+  "⏱ 타임라인",
+  "00:00 {챕터1}",
+  "{타임라인}",
+  "",
+  "━━━━━━━━━━━━━━━━━━━",
+  "",
+  "이집사입니다.",
+  "",
+  "모듈러주택, 전원주택, 세컨하우스,",
+  "체류형쉼터, 컨테이너하우스까지",
+  "",
+  "마음에 드는 집이 있으면",
+  "원하는 대로 3D 설계를 해드리고,",
+  "그 집을 지을 수 있는 시공사까지 연결해드립니다.",
+  "",
+  "상담부터 설계, 시공까지 함께하면서",
+  "알게 된 것들을 그대로 전해드리려고 합니다.",
+  "",
+  "좋으면 좋다고, 아니면 아니라고 하겠습니다.",
+  "",
+  "━━━━━━━━━━━━━━━━━━━",
+  "",
+  "📮 촬영 요청 · 협업 문의",
+  "{이메일}",
+  "",
+  "🔗 문의 : {문의링크}",
+  "🔗 카탈로그 : {카탈로그링크}",
+  "🔗 인스타 : {인스타}",
+  "",
+  "#모듈러주택 #전원주택 #세컨하우스 #체류형쉼터 #컨테이너하우스 #{평수}평주택 #이동식주택 #집짓기 #이집사",
+].join("\n");
+
+function descriptionChannelFromUI() {
+  return {
+    inquiryUrl: $("chInquiry")?.value.trim() || "",
+    catalogUrl: $("chCatalog")?.value.trim() || "",
+    email: $("chEmail")?.value.trim() || "",
+    instagram: $("chInstagram")?.value.trim() || "",
+    houseNo: $("chHouseNo")?.value.trim() || "",
+  };
+}
+
 // 미리보기에서 쓸 CSS 글꼴 이름. 서버의 fontconfig 이름과 대체로 같다.
 const PREVIEW_FONT_STACK = {
   gothic: "NanumGothic",
@@ -1749,6 +1822,8 @@ async function runQueueModePipeline() {
     burn: $("burnSubtitles")?.checked === true,
     metadata: $("genMetadata")?.checked === true,
     metadataPersona: $("metaPersona")?.value?.trim() || "",
+    descriptionTemplate: $("descTemplate")?.value || "",
+    channel: descriptionChannelFromUI(),
     upload: $("ytUpload")?.checked === true,
     privacy: $("ytPrivacy")?.value || "private",
   };
@@ -2430,7 +2505,8 @@ const PREF_CHECKBOXES = [
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol",
   "subFontSize", "subMarginV", "subBoxOpacity", "subOutline"];
 const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel", "glossary",
-  "subColor", "subBackground", "subBoxColor", "subFont", "subOutlineColor"];
+  "subColor", "subBackground", "subBoxColor", "subFont", "subOutlineColor",
+  "descTemplate", "chInquiry", "chCatalog", "chEmail", "chInstagram", "chHouseNo"];
 const PREF_CHIPS = ["preset", "ratio", "quality", "mode", "speed", "filler"];
 
 function readPrefs() {
@@ -2580,6 +2656,15 @@ onReady(() => {
   };
   $("burnSubtitles")?.addEventListener("change", syncSubStyleBox);
   syncSubStyleBox();
+
+  // 템플릿은 저장된 값이 있으면 그걸, 없으면 기본 템플릿을 넣는다.
+  const tpl = $("descTemplate");
+  if (tpl && !tpl.value.trim()) tpl.value = DEFAULT_DESC_TEMPLATE;
+  $("descTemplateReset")?.addEventListener("click", () => {
+    if (!tpl) return;
+    tpl.value = DEFAULT_DESC_TEMPLATE;
+    tpl.dispatchEvent(new Event("input", { bubbles: true }));
+  });
   // 자동일 때 슬라이더는 아무 효과가 없으므로 비활성 표시.
   const syncSilenceAuto = () => {
     const auto = $("silenceAuto")?.checked !== false;

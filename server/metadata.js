@@ -16,26 +16,60 @@ export function metadataProvider() {
 const SYSTEM_PROMPT = `당신은 한국 유튜브 채널의 메타데이터 카피라이터입니다. 영상 자막 전체를 읽고 다음을 만듭니다.
 
 - titles: 제목 후보 5개. 각 30자 이하, 클릭 유도하되 낚시는 금지.
-- description: 영상 설명문. 첫 2줄에 핵심을 담고, 이어서 "0:00 내용" 형식의 챕터 5개를 자막 타임스탬프에서 뽑아 넣습니다.
+- one_liner: 영상을 한 줄로 요약. 40자 이하, 마침표 없이.
+- intro: 집/영상 소개 2~4문장. 설명글 맨 위에 들어갑니다.
+- spec: 영상에 나온 집의 제원. 각 항목은 문자열이며, 자막에서 확인되지 않으면
+  반드시 빈 문자열("")로 둡니다. 추측해서 채우지 마세요.
+    area_pyeong  평수 숫자만 (예: "10")
+    area_m2      제곱미터 숫자만 (예: "33")
+    method       공법 (예: "경량목구조", "모듈러")
+    composition  구성 (예: "방1 거실1 욕실1")
+    price        가격대 (예: "5,980만원")
+- chapters: 챕터 5~8개. 각 { time, title } 이고 time 은 "0:00" 또는 "1:23:45" 형식.
+  첫 챕터는 반드시 "0:00" 입니다. 타임스탬프는 자막에 있는 시각에서만 고릅니다.
 - tags: 검색 노출용 태그 12개 이하. 한글 위주, 영어 키워드 1~2개.
 - thumbnail_copy: 썸네일에 큰 글자로 박을 6~10자 후크 카피 1개.
 - thumbnail_subcopy: 보조 카피 4~8자. 마땅한 게 없으면 빈 문자열.
 
 규칙:
 - 영상에 실제 등장한 단어와 주제만 사용합니다. 자막에 없는 사실을 지어내지 않습니다.
-- 챕터 타임스탬프는 반드시 자막에 있는 시각에서 고릅니다.
+- 특히 평수·가격·공법은 자막에서 들리지 않으면 비워 둡니다. 빈 항목은 설명글에서
+  줄째로 빠지므로, 틀린 값을 넣는 것보다 비우는 편이 낫습니다.
 - tags 안의 영어 키워드를 빼고 모든 출력은 한국어입니다.`;
 
 const METADATA_SCHEMA = {
   type: "object",
   properties: {
     titles: { type: "array", items: { type: "string" } },
-    description: { type: "string" },
+    one_liner: { type: "string" },
+    intro: { type: "string" },
+    spec: {
+      type: "object",
+      properties: {
+        area_pyeong: { type: "string" },
+        area_m2: { type: "string" },
+        method: { type: "string" },
+        composition: { type: "string" },
+        price: { type: "string" },
+      },
+      required: ["area_pyeong", "area_m2", "method", "composition", "price"],
+      additionalProperties: false,
+    },
+    chapters: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { time: { type: "string" }, title: { type: "string" } },
+        required: ["time", "title"],
+        additionalProperties: false,
+      },
+    },
     tags: { type: "array", items: { type: "string" } },
     thumbnail_copy: { type: "string" },
     thumbnail_subcopy: { type: "string" },
   },
-  required: ["titles", "description", "tags", "thumbnail_copy", "thumbnail_subcopy"],
+  required: ["titles", "one_liner", "intro", "spec", "chapters", "tags",
+             "thumbnail_copy", "thumbnail_subcopy"],
   additionalProperties: false,
 };
 
@@ -68,12 +102,106 @@ export async function generateMetadata(segments, { persona = "", durationSec = 0
 }
 
 function normalize(data) {
+  const spec = data.spec && typeof data.spec === "object" ? data.spec : {};
+  const chapters = (Array.isArray(data.chapters) ? data.chapters : [])
+    .map((c) => ({ time: String(c?.time || "").trim(), title: String(c?.title || "").trim() }))
+    .filter((c) => c.time && c.title)
+    .slice(0, 10);
   return {
     titles: (Array.isArray(data.titles) ? data.titles : []).map(String).slice(0, 5),
-    description: String(data.description || ""),
+    oneLiner: String(data.one_liner || "").trim(),
+    intro: String(data.intro || "").trim(),
+    spec: {
+      areaPyeong: String(spec.area_pyeong || "").trim(),
+      areaM2: String(spec.area_m2 || "").trim(),
+      method: String(spec.method || "").trim(),
+      composition: String(spec.composition || "").trim(),
+      price: String(spec.price || "").trim(),
+    },
+    chapters,
     tags: (Array.isArray(data.tags) ? data.tags : []).map(String).slice(0, 12),
     thumbnailCopy: String(data.thumbnail_copy || ""),
     thumbnailSubcopy: String(data.thumbnail_subcopy || ""),
+  };
+}
+
+// ── 설명글 조립 ─────────────────────────────────────────────────────────────
+//
+// 템플릿은 채널 주인이 UI 에서 직접 고쳐 쓰는 문자열이다. 코드에 문구를 박아
+// 두면 한 글자 고치는 데 배포가 필요해진다.
+//
+// 값이 비어 있을 때가 중요하다. 가격을 못 들었는데 "· 가격대 : " 처럼 빈 줄을
+// 남기거나 "{가격}" 을 그대로 노출하면 그게 더 나쁘다. 그래서:
+//   · 로 시작하는 항목 줄은 빈 값이 들어가면 줄째로 지운다
+//   #해시태그 안에 빈 값이 있으면 그 태그만 지운다
+//   그 밖에는 빈 문자열로 바꾸고, 마지막에 연속 빈 줄을 정리한다
+export function fillDescriptionTemplate(template, vars) {
+  const missing = new Set(
+    Object.entries(vars).filter(([, v]) => !String(v ?? "").trim()).map(([k]) => k)
+  );
+
+  const isBullet = (l) => /^\s*[·•-]\s/.test(l);
+  const isRule = (l) => /^[\s━─=_-]+$/.test(l) && l.trim().length > 2;
+  const dropped = (l) => [...missing].some((k) => l.includes(`{${k}}`));
+
+  // 1) 값이 빈 항목 줄을 버린다.
+  const kept = String(template).split("\n").filter((l) => !(isBullet(l) && dropped(l)));
+
+  // 2) 항목이 하나도 안 남은 소제목은 같이 버린다. "📍 이 집 정보" 만 덩그러니
+  //    남고 그 아래가 비어 있으면 그게 더 이상해 보인다.
+  const orig = String(template).split("\n");
+  const headersToDrop = new Set();
+  for (let i = 0; i < orig.length; i++) {
+    if (!isBullet(orig[i])) continue;
+    let j = i;
+    while (j < orig.length && isBullet(orig[j])) j++;
+    const block = orig.slice(i, j);
+    if (block.every(dropped)) {
+      // 블록 바로 위의 비어 있지 않은 줄이 소제목이면 그것도 지운다.
+      for (let k = i - 1; k >= 0; k--) {
+        if (!orig[k].trim()) continue;
+        if (!isRule(orig[k])) headersToDrop.add(orig[k]);
+        break;
+      }
+    }
+    i = j;
+  }
+  const lines = kept.filter((l) => !headersToDrop.has(l));
+
+  let out = lines.join("\n");
+  // 빈 값이 낀 해시태그 제거 (#{평수}평주택 → 통째로).
+  for (const k of missing) {
+    out = out.replace(new RegExp(`#\\S*\\{${k}\\}\\S*\\s?`, "g"), "");
+  }
+  out = out.replace(/\{([^}]+)\}/g, (_, key) => String(vars[key] ?? "").trim());
+  // 치환하면서 생긴 빈 줄 뭉치와, 사이 내용이 사라져 붙어 버린 구분선을 정리한다.
+  return out
+    .replace(/[ \t]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^([\s━─=_-]{3,})(?:\n+[\s━─=_-]{3,})+$/gm, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// 템플릿에 넣을 값들. 채널 고정값(링크·이메일)은 호출자가 넘긴다.
+export function descriptionVarsFrom(meta, channel = {}) {
+  const ch = meta.chapters || [];
+  return {
+    한줄요약: meta.oneLiner || "",
+    집소개: meta.intro || "",
+    평수: meta.spec?.areaPyeong || "",
+    제곱미터: meta.spec?.areaM2 || "",
+    공법: meta.spec?.method || "",
+    구성: meta.spec?.composition || "",
+    가격: meta.spec?.price || "",
+    // 첫 챕터는 템플릿에 "00:00 {챕터1}" 로 이미 시각이 박혀 있다.
+    챕터1: ch[0]?.title || "",
+    타임라인: ch.slice(1).map((c) => `${c.time} ${c.title}`).join("\n"),
+    문의링크: channel.inquiryUrl || "",
+    카탈로그링크: channel.catalogUrl || "",
+    집번호: channel.houseNo || "",
+    이메일: channel.email || "",
+    인스타: channel.instagram || "",
   };
 }
 
@@ -199,22 +327,17 @@ function generateHeuristic(segments, durationSec) {
     const idx = i === 0 ? 0 : Math.floor((segments.length * i) / chapterCount);
     const seg = segments[idx];
     const t = i === 0 ? 0 : seg.start;
-    chapters.push(`${formatTimestamp(t)} ${String(seg.text).trim().slice(0, 30)}`);
+    chapters.push({ time: formatTimestamp(t), title: String(seg.text).trim().slice(0, 30) });
   }
-
-  const description = [
-    firstLine,
-    top.length ? `${top.join(", ")} 에 대해 다룹니다.` : "",
-    "",
-    "타임라인",
-    ...chapters,
-    "",
-    total ? `총 길이 ${formatTimestamp(total)}` : "",
-  ].filter((l) => l !== null).join("\n").trim();
 
   return {
     titles,
-    description,
+    one_liner: firstLine.slice(0, 40),
+    intro: top.length ? `${top.join(", ")} 에 대해 다룹니다.` : firstLine,
+    // 휴리스틱은 자막 빈도만 본다 — 평수·가격 같은 값을 유추할 근거가 없으므로
+    // 비워 둔다. 그러면 설명글에서 해당 줄이 통째로 빠진다.
+    spec: { area_pyeong: "", area_m2: "", method: "", composition: "", price: "" },
+    chapters,
     tags: keywords,
     thumbnail_copy: (top[0] || firstLine).slice(0, 10),
     thumbnail_subcopy: (top[1] || "").slice(0, 8),

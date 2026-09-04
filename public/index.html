@@ -191,6 +191,38 @@
           </label>
           <p class="hint-row" id="metaProviderHint"></p>
 
+          <details class="settings-card settings-card--nested" id="descTemplateCard">
+            <summary>설명글 템플릿 · 채널 정보</summary>
+            <div class="substyle-grid">
+              <label>문의 링크
+                <input type="text" id="chInquiry" placeholder="https://..." />
+              </label>
+              <label>카탈로그 링크
+                <input type="text" id="chCatalog" placeholder="https://..." />
+              </label>
+              <label>이메일
+                <input type="text" id="chEmail" placeholder="hello@example.com" />
+              </label>
+              <label>인스타
+                <input type="text" id="chInstagram" placeholder="https://instagram.com/..." />
+              </label>
+              <label>집 번호
+                <input type="text" id="chHouseNo" placeholder="예: 042" />
+              </label>
+            </div>
+            <label>설명글 템플릿
+              <textarea id="descTemplate" rows="14" spellcheck="false"></textarea>
+            </label>
+            <p class="hint-row">
+              * 중괄호는 영상마다 자동으로 채워집니다:
+              <code>{한줄요약} {집소개} {평수} {제곱미터} {공법} {구성} {가격} {챕터1} {타임라인}</code>
+              — 자막에서 확인 안 되는 값은 그 줄이 통째로 빠집니다 (빈칸으로 남지 않습니다).
+              위 칸에 넣은 링크·이메일·집 번호는
+              <code>{문의링크} {카탈로그링크} {이메일} {인스타} {집번호}</code> 로 들어갑니다.
+            </p>
+            <button type="button" class="ghost" id="descTemplateReset">기본 템플릿으로 되돌리기</button>
+          </details>
+
           <label class="toggle">
             <input type="checkbox" id="ytUpload" checked />
             <span>YouTube 자동 업로드 — 1순위 제목으로 게시</span>

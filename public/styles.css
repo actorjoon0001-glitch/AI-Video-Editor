@@ -1165,3 +1165,23 @@ textarea:focus { outline: none; border-color: var(--accent); }
 @media (max-width: 640px) {
   .miniprog { padding: 8px 14px 10px; font-size: 12px; }
 }
+
+/* 설명글 템플릿 — 카드 안의 카드라 한 단계 가라앉혀 구분한다. */
+.settings-card--nested {
+  background: var(--panel);
+  margin-top: 12px;
+}
+.settings-card--nested textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+.settings-card--nested code {
+  font-size: 11px;
+  background: var(--panel-2);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
