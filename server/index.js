@@ -20,6 +20,7 @@ import { fileURLToPath } from "url";
 import { generateMetadata, metadataProvider } from "./metadata.js";
 import { uploadVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy } from "./youtube.js";
 import { detectKeeps } from "./silence.js";
+import { dropCache, startPageCacheJanitor } from "./pagecache.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -38,6 +39,10 @@ await mkdir(TMP, { recursive: true });
 const PYTHON_BIN = process.env.PYTHON_BIN || "/opt/venv/bin/python3";
 
 const RESULT_TTL_MS = 60 * 60 * 1000; // 결과 파일 1시간 후 삭제
+
+// 업로드와 ffmpeg 가 만들어 내는 페이지 캐시를 주기적으로 커널에 돌려준다.
+// 안 하면 컨테이너 메모리 사용량이 100% 에 붙고 플랫폼이 서비스를 재시작한다.
+startPageCacheJanitor({ dir: TMP, pythonBin: PYTHON_BIN });
 
 // ── App ──────────────────────────────────────────────────────────────────────
 const app = express();
@@ -790,6 +795,9 @@ app.put("/api/uploads/:id", async (req, res) => {
     // 16MB fsync 는 수십~수백 ms — 조각 하나 전송 시간(수 초)에 비하면 무시할 만하다.
     const fh = await openFile(u.path, "r+");
     try { await fh.datasync(); } finally { await fh.close(); }
+    // 디스크에 내려갔으면 캐시에 붙들고 있을 이유가 없다. 이걸 안 하면 올린
+    // 만큼 그대로 컨테이너 메모리로 잡혀서 3GB 즈음 100% 에 붙는다.
+    await dropCache(u.path, { pythonBin: PYTHON_BIN });
 
     u.received = startAt + written;
     u.updatedAt = Date.now();
