@@ -30,8 +30,18 @@ const ALLOWED_ORIGINS = (
   "https://ai-video-editor-good.netlify.app,http://localhost:8888,http://localhost:5173"
 ).split(",").map((s) => s.trim());
 
-const TMP = process.env.TMP_DIR || "/tmp/aive";
+// 작업 디렉터리. 컨테이너의 기본 파일시스템에는 쓸 수 있는 용량이 2GB 밖에
+// 없다 — 그걸 넘기면 트래픽이 없어도, 메모리가 2% 여도 플랫폼이 SIGTERM 으로
+// 서비스를 내린다. 2.2GB 를 올려 두고 아무것도 하지 않은 채 82초 만에 죽는 걸
+// 실측했다. 그래서 영구 디스크가 붙어 있으면 무조건 그쪽을 쓴다.
+const PERSISTENT_ROOT = process.env.DISK_MOUNT_PATH || "/var/data";
+const HAS_PERSISTENT_DISK = existsSync(PERSISTENT_ROOT);
+const TMP =
+  process.env.TMP_DIR || (HAS_PERSISTENT_DISK ? path.join(PERSISTENT_ROOT, "aive") : "/tmp/aive");
 await mkdir(TMP, { recursive: true });
+console.log(
+  `작업 디렉터리: ${TMP}` + (HAS_PERSISTENT_DISK ? " (영구 디스크)" : " (임시 파일시스템 — 약 2GB 제한)")
+);
 
 // Python 인터프리터 절대 경로. Dockerfile 이 venv 를 /opt/venv 에 만들고
 // 거기에 faster-whisper 를 설치하므로 시스템 python3 가 아니라 이 경로를 쓴다.
@@ -59,7 +69,15 @@ app.use(
 
 // 업로드 상한. 원본과 편집본이 디스크에 동시에 존재하므로 실제로는 이 값의
 // 2배 이상 여유가 필요하다 — /api/health 의 limits 로 남은 용량을 노출한다.
-const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 500;
+//
+// 영구 디스크가 없으면 아무리 크게 잡아도 소용이 없다. 2GB 근처에서 서비스가
+// 통째로 내려가므로, 올리는 쪽에서 미리 거절해야 "왜 3GB 에서 갑자기 끊기지"
+// 같은 상황을 안 만든다. 1500MB 는 감지까지의 여유(약 90초 분량)를 뺀 값이다.
+const EPHEMERAL_SAFE_MB = 1500;
+const MAX_UPLOAD_MB = Math.min(
+  Number(process.env.MAX_UPLOAD_MB) || 500,
+  HAS_PERSISTENT_DISK ? Number.MAX_SAFE_INTEGER : EPHEMERAL_SAFE_MB
+);
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 
 const upload = multer({
@@ -139,7 +157,12 @@ function healthBody() {
 }
 // 진단용 — 큰 파일을 받을 수 있는 환경인지 프론트/운영자가 판단할 수 있게.
 function diskAndMemory() {
-  const out = { maxUploadMb: Math.round(MAX_UPLOAD_BYTES / 1024 / 1024) };
+  const out = {
+    maxUploadMb: Math.round(MAX_UPLOAD_BYTES / 1024 / 1024),
+    // 영구 디스크가 붙었는지. 안 붙었으면 상한이 2GB 벽에 맞춰 강제로 낮춰진다.
+    persistentDisk: HAS_PERSISTENT_DISK,
+    tmpDir: TMP,
+  };
   // 프로세스가 언제 시작됐는지. 업로드 도중 이 값이 작아지면 서버가 죽었다가
   // 다시 뜬 것이다 — 클라이언트에는 "Failed to fetch" 로만 보여서 구분이 안 된다.
   out.uptimeSec = Math.round(process.uptime());
