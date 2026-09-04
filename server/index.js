@@ -615,6 +615,8 @@ function jobResponse(job) {
   return {
     jobId: job.id,
     status: computeJobStatus(job),
+    // 아직 시작 못 한 작업이 왜 조용한지 알 수 있게 — 앞에 몇 개 남았는지.
+    queuedBehind: job.startedAt ? 0 : (job.queuedBehind || 0),
     options: job.options,
     stages,
     createdAt: job.createdAt,
@@ -702,10 +704,8 @@ app.post("/api/jobs", upload.single("video"), async (req, res) => {
     pollIntervalMs: 3000,
   });
 
-  // 백그라운드 실행
-  runJobPipeline(id, inputPath).catch((e) => {
-    console.error(`[job ${id}] dispatcher crash:`, e);
-  });
+  // 백그라운드 실행 — 큐에 넣고 차례가 오면 돈다.
+  enqueueJob(id, inputPath);
 });
 
 // ── 청크 업로드 ─────────────────────────────────────────────────────────────
@@ -915,9 +915,7 @@ app.post("/api/uploads/:id/complete", express.json({ limit: "4mb" }), async (req
 
   res.status(202).json({ jobId: id, statusUrl: `/api/jobs/${id}`, pollIntervalMs: 3000 });
 
-  runJobPipeline(id, u.path).catch((e) => {
-    console.error(`[job ${id}] dispatcher crash:`, e);
-  });
+  enqueueJob(id, u.path);
 });
 
 app.get("/api/jobs/:id", (req, res) => {
@@ -1050,10 +1048,53 @@ function sanitizePublishAt(v) {
   return new Date(t).toISOString();
 }
 
+// 큐 모드라는 이름과 달리 여기엔 큐가 없었다. 작업이 들어오는 즉시 실행해서,
+// 두 개를 올리면 ffmpeg 두 개와 Whisper 두 개가 동시에 돌았다. 컨테이너 메모리는
+// 2GB 이고 Whisper small 하나가 그 절반 넘게 쓰므로, 둘째 작업을 시작하는 순간
+// 컨테이너가 통째로 죽는다 — 실제로 그렇게 두 작업을 한꺼번에 잃었다.
+// CPU 도 하나뿐이라 동시에 돌려서 빨라질 것도 없다. 한 번에 하나만 돌린다.
+const jobQueue = [];
+let jobRunning = false;
+
+function enqueueJob(id, inputPath) {
+  jobQueue.push({ id, inputPath });
+  refreshQueuePositions();
+  pumpJobQueue();
+}
+
+// 대기 중인 작업이 자기 차례를 알 수 있게 한다 ("앞에 2개").
+// 줄에서 앞선 대기자 수에, 지금 돌고 있는 작업 한 건을 더해야 실제로 기다리는
+// 수가 된다 — 그게 빠지면 맨 앞 대기자가 "앞에 0개"인데 시작을 안 한다.
+function refreshQueuePositions() {
+  const ahead = jobRunning ? 1 : 0;
+  jobQueue.forEach((entry, i) => {
+    const job = pipelineJobs.get(entry.id);
+    if (job) job.queuedBehind = i + ahead;
+  });
+}
+
+async function pumpJobQueue() {
+  if (jobRunning) return;
+  const next = jobQueue.shift();
+  if (!next) return;
+  jobRunning = true;
+  refreshQueuePositions();
+  try {
+    await runJobPipeline(next.id, next.inputPath);
+  } catch (e) {
+    console.error(`[job ${next.id}] dispatcher crash:`, e);
+  } finally {
+    jobRunning = false;
+    // 앞 작업이 어떻게 끝났든 다음 작업은 돈다.
+    pumpJobQueue();
+  }
+}
+
 async function runJobPipeline(id, inputPath) {
   const job = pipelineJobs.get(id);
   if (!job) return;
   job.status = "running";
+  job.queuedBehind = 0;
   job.startedAt = Date.now();
 
   const editedPath = path.join(TMP, `${id}.edited.mp4`);
