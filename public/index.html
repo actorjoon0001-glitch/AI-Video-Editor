@@ -170,7 +170,9 @@
         <details class="settings-card" id="queueStagesCard" hidden open>
           <summary>메타데이터 · 업로드</summary>
           <label class="toggle">
-            <input type="checkbox" id="genMetadata" />
+          <!-- 기본값 켜짐. 매번 켜는 쪽이 아니라 안 올릴 때만 끄는 쪽이 실제 사용에
+               맞고, 업로드는 어차피 비공개로 올라가서 되돌리기 쉽다. -->
+          <input type="checkbox" id="genMetadata" checked />
             <span>메타데이터 생성 — 제목 후보 / 설명 / 태그 / 썸네일 카피</span>
           </label>
           <label>채널 페르소나
@@ -180,7 +182,7 @@
           <p class="hint-row" id="metaProviderHint"></p>
 
           <label class="toggle">
-            <input type="checkbox" id="ytUpload" />
+            <input type="checkbox" id="ytUpload" checked />
             <span>YouTube 자동 업로드 — 1순위 제목으로 게시</span>
           </label>
           <label>공개 범위

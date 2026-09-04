@@ -1789,7 +1789,12 @@ async function followJob(jobId, pollIntervalMs = 3000) {
     consecutiveErrors = 0;
     const job = polled.job;
     renderJobPipeline(job);
-    setStatus(`큐 모드: ${job.status}${terminalLabel(job)}`);
+    // 서버는 한 번에 하나만 돌린다. 순서를 기다리는 중이면 그렇다고 말해 준다 —
+    // 안 그러면 아무 단계도 안 움직여서 멈춘 것처럼 보인다.
+    const waiting = job.queuedBehind > 0
+      ? ` — 앞선 작업 ${job.queuedBehind}개가 끝나면 시작합니다`
+      : "";
+    setStatus(`큐 모드: ${job.status}${terminalLabel(job)}${waiting}`);
 
     if (job.status === "done" || job.status === "partial" || job.status === "failed") {
       forgetJob(jobId);
