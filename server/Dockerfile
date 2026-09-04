@@ -60,4 +60,7 @@ EXPOSE 8080
 #    장애와 구분이 안 된다.
 # 단, node 가 PID 1 이 되면 커널이 기본 시그널 처리를 걸어주지 않으므로
 # index.js 에서 SIGTERM 을 직접 받는다.
-CMD ["node", "index.js"]
+# Node 는 컨테이너 한도가 아니라 호스트 메모리(31GB)를 보고 힙 상한을 잡는다.
+# 인스턴스는 2GB 라, 그대로 두면 GC 를 게을리하다 cgroup OOM 으로 죽는다.
+# 실제로 큰 파일 업로드 중 1~2GB 지점에서 502 가 났다.
+CMD ["node", "--max-old-space-size=1024", "index.js"]

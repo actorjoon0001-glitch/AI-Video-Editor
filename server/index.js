@@ -11,8 +11,9 @@ import cors from "cors";
 import multer from "multer";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { mkdir, unlink, stat, writeFile } from "fs/promises";
-import { existsSync, statfsSync } from "fs";
+import { mkdir, unlink, stat, writeFile, truncate } from "fs/promises";
+import { existsSync, statfsSync, createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -134,6 +135,16 @@ function healthBody() {
 // 진단용 — 큰 파일을 받을 수 있는 환경인지 프론트/운영자가 판단할 수 있게.
 function diskAndMemory() {
   const out = { maxUploadMb: Math.round(MAX_UPLOAD_BYTES / 1024 / 1024) };
+  // 프로세스가 언제 시작됐는지. 업로드 도중 이 값이 작아지면 서버가 죽었다가
+  // 다시 뜬 것이다 — 클라이언트에는 "Failed to fetch" 로만 보여서 구분이 안 된다.
+  out.uptimeSec = Math.round(process.uptime());
+  try {
+    const m = process.memoryUsage();
+    out.rssMb = Math.round(m.rss / 1024 / 1024);
+    out.heapMb = Math.round(m.heapUsed / 1024 / 1024);
+    out.externalMb = Math.round(m.external / 1024 / 1024);
+  } catch {}
+  out.activeUploads = uploads.size;
   try {
     const st = statfsSync(TMP);
     out.tmpFreeMb = Math.round((st.bavail * st.bsize) / 1024 / 1024);
@@ -616,7 +627,6 @@ setInterval(() => {
   for (const [id, u] of uploads) {
     if (now - u.updatedAt > UPLOAD_TTL_MS) {
       uploads.delete(id);
-      u.fh?.close().catch(() => {});
       unlink(u.path).catch(() => {});
       console.log(`[upload ${id}] 만료 정리`);
     }
@@ -633,9 +643,9 @@ app.post("/api/uploads", express.json({ limit: "1mb" }), async (req, res) => {
   }
   const id = randomUUID();
   const p = path.join(TMP, `${id}.upload`);
-  const { open: openFile } = await import("fs/promises");
-  const fh = await openFile(p, "w");
-  uploads.set(id, { path: p, received: 0, total, fh, updatedAt: Date.now() });
+  // 빈 파일을 만들어 둔다 — 조각마다 createWriteStream(flags:"r+") 로 이어 쓴다.
+  await writeFile(p, "");
+  uploads.set(id, { path: p, received: 0, total, writing: false, updatedAt: Date.now() });
   console.log(`[upload ${id}] 시작 — ${(total / 1024 / 1024).toFixed(1)}MB`);
   res.status(201).json({ uploadId: id, chunkSize: 16 * 1024 * 1024 });
 });
@@ -648,7 +658,14 @@ app.get("/api/uploads/:id", (req, res) => {
 });
 
 // 조각 append. offset 을 함께 받아, 중복 전송(재시도)이면 조용히 무시한다.
-app.put("/api/uploads/:id", express.raw({ type: "*/*", limit: "64mb" }), async (req, res) => {
+//
+// 요청 본문을 파일로 바로 흘려보낸다 (express.raw 로 받지 않는다). 예전엔
+// express.raw 로 16MB 를 통째로 메모리에 담은 뒤 파일에 썼는데, 컨테이너 메모리가
+// 2GB 인 Render 에서 1~2GB 쯤 올리면 서버가 죽었다 (클라이언트에는 502 / "Failed
+// to fetch" 로만 보인다). Node 는 컨테이너 한도가 아니라 호스트 메모리(31GB)를
+// 보고 GC 를 게을리하기 때문에 더 잘 터진다. 스트리밍으로 쓰면 상주 메모리가
+// 조각 크기와 무관하게 소켓 버퍼 몇 개 수준으로 유지된다.
+app.put("/api/uploads/:id", async (req, res) => {
   const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
   const u = uploads.get(id);
   if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
@@ -658,23 +675,63 @@ app.put("/api/uploads/:id", express.raw({ type: "*/*", limit: "64mb" }), async (
   }
   // 이미 받은 지점이면 재시도로 보고 성공 처리 — 클라이언트가 응답을 못 받고
   // 다시 보낸 경우다. 여기서 400 을 주면 정상 재시도가 실패로 끝난다.
-  if (offset < u.received) return res.json({ received: u.received, total: u.total });
+  if (offset < u.received) {
+    req.resume();          // 본문을 버려야 소켓이 막히지 않는다
+    return res.json({ received: u.received, total: u.total });
+  }
   if (offset > u.received) {
+    req.resume();
     return res.status(409).json({ error: "offset 불일치", received: u.received });
   }
-  const buf = req.body;
-  if (!buf?.length) return res.status(400).json({ error: "빈 조각" });
-  if (u.received + buf.length > u.total) {
-    return res.status(400).json({ error: "선언한 크기를 초과했습니다." });
+  if (u.writing) {
+    req.resume();
+    return res.status(409).json({ error: "같은 세션에 동시 쓰기", received: u.received });
   }
+
+  u.writing = true;
+  const startAt = u.received;
+  let written = 0;
+  let ws;
+  let closed = Promise.resolve();
   try {
-    await u.fh.write(buf, 0, buf.length, u.received);
+    ws = createWriteStream(u.path, { flags: "r+", start: startAt });
+    // close 리스너는 생성 직후 한 번만 건다. 나중에 걸면 이미 지나간 이벤트를
+    // 기다리다 타임아웃까지 락을 붙잡고, 다음 조각이 계속 409 를 받는다.
+    closed = new Promise((r) => ws.once("close", r));
+    req.on("data", (d) => {
+      written += d.length;
+      // 선언한 크기를 넘기면 즉시 끊는다 — 안 그러면 디스크가 무한정 찬다.
+      if (startAt + written > u.total) req.destroy(new Error("선언한 크기를 초과했습니다."));
+    });
+    await pipeline(req, ws);
+    if (written === 0) return res.status(400).json({ error: "빈 조각" });
+    u.received = startAt + written;
+    u.updatedAt = Date.now();
+    res.json({ received: u.received, total: u.total });
   } catch (e) {
-    return res.status(500).json({ error: `조각 기록 실패: ${e?.message || e}` });
+    console.warn(`[upload ${id}] 조각 실패 @${startAt}: ${e?.message || e}`);
+    // 끊긴 쓰기는 일부 바이트를 이미 디스크에 남긴다. 그대로 두고 클라이언트가
+    // 같은 offset 부터 덮어쓰게 하면, 아직 빠져나가지 못한 이전 쓰기가 새 쓰기
+    // *뒤에* 착지할 수 있다 — 크기는 맞는데 내용이 깨진 파일이 나온다. 실제로
+    // md5 가 달라지는 걸 확인했다. 받은 지점까지 잘라내 항상 깨끗한 상태로
+    // 되돌린다.
+    try {
+      ws?.destroy();
+      await Promise.race([closed, new Promise((r) => setTimeout(r, 2000).unref?.())]);
+      await truncate(u.path, u.received);
+    } catch (te) {
+      console.error(`[upload ${id}] 되감기 실패: ${te?.message || te}`);
+    }
+    if (!res.headersSent) {
+      res.status(500).json({ error: `조각 기록 실패: ${e?.message || e}`, received: u.received });
+    }
+  } finally {
+    // 스트림이 완전히 닫힌 뒤에야 다음 쓰기를 허용한다. 먼저 풀면 다음 조각의
+    // 쓰기와 아직 빠져나가지 못한 이전 쓰기가 같은 구간에서 겹친다.
+    ws?.destroy();
+    await Promise.race([closed, new Promise((r) => setTimeout(r, 2000).unref?.())]);
+    u.writing = false;
   }
-  u.received += buf.length;
-  u.updatedAt = Date.now();
-  res.json({ received: u.received, total: u.total });
 });
 
 // 조립 완료 → 기존 작업 파이프라인으로 넘긴다.
@@ -688,7 +745,6 @@ app.post("/api/uploads/:id/complete", express.json({ limit: "4mb" }), async (req
       received: u.received,
     });
   }
-  await u.fh.close().catch(() => {});
   uploads.delete(uploadId);
 
   const id = randomUUID();

@@ -1875,10 +1875,14 @@ async function uploadJobChunked(file, options, totalMb) {
 
   let offset = 0;
   while (offset < file.size) {
-    const end = Math.min(offset + CHUNK, file.size);
     let ok = false;
     let lastErr = null;
     for (let attempt = 1; attempt <= CHUNK_RETRIES; attempt++) {
+      // 조각 범위는 매 시도마다 현재 offset 으로 다시 계산한다. 재시도 중에 서버가
+      // 앞서 나갈 수 있는데(끊긴 요청이 사실은 서버까지 도달했던 경우), 범위를
+      // 고정해두면 그 다음 전송이 엉뚱한 위치의 데이터를 보내 파일이 깨진다.
+      const end = Math.min(offset + CHUNK, file.size);
+      if (offset >= file.size) { ok = true; break; }
       try {
         const r = await fetch(`${BACKEND_URL}/api/uploads/${uploadId}?offset=${offset}`, {
           method: "PUT",
@@ -1890,11 +1894,15 @@ async function uploadJobChunked(file, options, totalMb) {
           ok = true;
           break;
         }
-        // offset 이 어긋났으면 서버가 받은 지점으로 맞춘다 (재시도가 중간에 성공한 경우).
+        // 409 는 두 경우다: offset 이 어긋났거나(재시도가 중간에 성공), 직전 조각의
+        // 쓰기가 아직 정리되는 중이거나. 둘 다 서버가 알려준 지점으로 맞춘 뒤
+        // 잠깐 기다렸다 다시 보내면 된다 — 여기서 성공으로 처리하면 while 루프가
+        // 같은 자리를 쉬지 않고 다시 두드린다.
         if (r.status === 409) {
-          offset = (await r.json()).received;
-          ok = true;
-          break;
+          const body = await r.json().catch(() => ({}));
+          if (Number.isFinite(body.received)) offset = body.received;
+          await new Promise((rs) => setTimeout(rs, 300));
+          continue;
         }
         lastErr = new Error(`HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 150)}`);
       } catch (e) {
