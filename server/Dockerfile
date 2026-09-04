@@ -40,8 +40,9 @@ ENV PYTHON_BIN="/opt/venv/bin/python3"
 # 최신 huggingface-hub(1.x) 는 httpx 로 옮겨가서 requests 를 안 끌어오니까
 # `ModuleNotFoundError: No module named 'requests'` 가 import 시점에 터진다.
 RUN /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
- && /opt/venv/bin/pip install --no-cache-dir faster-whisper==1.0.3 requests \
- && /opt/venv/bin/python3 -c "from faster_whisper import WhisperModel; print('faster-whisper import OK')"
+ && /opt/venv/bin/pip install --no-cache-dir faster-whisper==1.0.3 requests pillow \
+ && /opt/venv/bin/python3 -c "from faster_whisper import WhisperModel; print('faster-whisper import OK')" \
+ && /opt/venv/bin/python3 -c "from PIL import Image, ImageDraw, ImageFont; print('pillow import OK')"
 
 # 모델은 lazy download — small(~250MB) 프리다운로드는 Render Free 빌드/메모리에
 # 부담이라 첫 요청 시 받게 둔다. 기본은 tiny(~75MB).

@@ -21,6 +21,7 @@ import { generateMetadata, metadataProvider, fillDescriptionTemplate, descriptio
 import { uploadVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy } from "./youtube.js";
 import { detectKeeps } from "./silence.js";
 import { dropCache, startPageCacheJanitor } from "./pagecache.js";
+import { composeThumbnailCard } from "./thumbcard.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -666,8 +667,13 @@ function sanitizeStageResult(name, result) {
       tags: result.tags,
       thumbnailCopy: result.thumbnailCopy,
       thumbnailSubcopy: result.thumbnailSubcopy,
+      thumbnailLine1: result.thumbnailLine1,
+      thumbnailLine2: result.thumbnailLine2,
+      thumbnailLine3: result.thumbnailLine3,
       source: result.source,
       model: result.model,
+      fallbackFrom: result.fallbackFrom || null,
+      fallbackReason: result.fallbackReason || null,
     };
   }
   if (name === "upload") {
@@ -679,6 +685,9 @@ function sanitizeStageResult(name, result) {
       title: result.title,
       thumbnailSet: result.thumbnailSet,
       thumbnailError: result.thumbnailError || null,
+      // 화이트리스트라 여기 안 적으면 프론트까지 못 간다. 카드가 왜 안 붙었는지는
+      // 조용히 사라지면 안 되는 정보다.
+      thumbnailCard: result.thumbnailCard || null,
     };
   }
   return result;
@@ -1531,11 +1540,36 @@ async function uploadStageFor(job, editedPath) {
   const burned = job.stages.burn?.status === "done" ? job.stages.burn.result?._path : null;
   const videoPath = burned && existsSync(burned) ? burned : editedPath;
   const meta = job.stages.metadata?.result || {};
-  const thumb = job.stages.thumbnail?.status === "done"
+  // 추출된 사진은 그대로 두고, 그 위에 문구를 얹은 카드를 한 장 더 만든다.
+  // 원본이 남아 있어야 문구만 바꿔 다시 만들 수 있다.
+  const rawThumb = job.stages.thumbnail?.status === "done"
     ? path.join(TMP, `${job.id}.thumb_0.jpg`)
     : null;
+  let thumb = rawThumb && existsSync(rawThumb) ? rawThumb : null;
+  let thumbnailCard = null;
+  if (thumb) {
+    const cardPath = path.join(TMP, `${job.id}.thumb_card.jpg`);
+    const card = await composeThumbnailCard({
+      image: thumb,
+      out: cardPath,
+      line1: meta.thumbnailLine1 || meta.thumbnailCopy || "",
+      line2: meta.thumbnailLine2 || meta.thumbnailSubcopy || null,
+      line3: meta.thumbnailLine3 || null,
+      pythonBin: PYTHON_BIN,
+    });
+    if (card.ok) {
+      job.artifacts.push(cardPath);
+      thumb = cardPath;
+      thumbnailCard = { font: card.font, sizes: card.sizes, bytes: card.bytes };
+      console.log(`[job ${job.id}] 썸네일 카드 생성 (${card.font}, ${card.sizes.join("/")}px)`);
+    } else {
+      // 카드는 덤이다. 못 만들어도 사진으로 올린다.
+      thumbnailCard = { error: card.error };
+      console.warn(`[job ${job.id}] 썸네일 카드 실패 — 원본 사진으로 올립니다: ${card.error}`);
+    }
+  }
 
-  return uploadVideo({
+  const result = await uploadVideo({
     videoPath,
     title: uploadTitleFor(job),
     description: meta.description || "",
@@ -1547,6 +1581,7 @@ async function uploadStageFor(job, editedPath) {
       console.log(`[job ${job.id}] upload ${((uploaded / total) * 100).toFixed(0)}%`);
     },
   });
+  return { ...result, thumbnailCard };
 }
 
 function uploadTitleFor(job) {

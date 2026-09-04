@@ -30,6 +30,11 @@ const SYSTEM_PROMPT = `당신은 한국 유튜브 채널의 메타데이터 카�
 - tags: 검색 노출용 태그 12개 이하. 한글 위주, 영어 키워드 1~2개.
 - thumbnail_copy: 썸네일에 큰 글자로 박을 6~10자 후크 카피 1개.
 - thumbnail_subcopy: 보조 카피 4~8자. 마땅한 게 없으면 빈 문자열.
+- thumbnail_line1 / thumbnail_line2 / thumbnail_line3: 썸네일 이미지에 실제로
+  얹을 문구를 줄 단위로 나눈 것. 한 줄에 공백 포함 7자를 절대 넘기지 마세요.
+  line1 은 가장 강조되는 줄이라 반드시 채웁니다. line2 는 되도록 채우고,
+  line3 는 꼭 필요할 때만 쓰고 아니면 빈 문자열로 둡니다.
+  예: "1억으로" / "이런 집이" / ""
 
 규칙:
 - 영상에 실제 등장한 단어와 주제만 사용합니다. 자막에 없는 사실을 지어내지 않습니다.
@@ -67,9 +72,13 @@ const METADATA_SCHEMA = {
     tags: { type: "array", items: { type: "string" } },
     thumbnail_copy: { type: "string" },
     thumbnail_subcopy: { type: "string" },
+    thumbnail_line1: { type: "string" },
+    thumbnail_line2: { type: "string" },
+    thumbnail_line3: { type: "string" },
   },
   required: ["titles", "one_liner", "intro", "spec", "chapters", "tags",
-             "thumbnail_copy", "thumbnail_subcopy"],
+             "thumbnail_copy", "thumbnail_subcopy",
+             "thumbnail_line1", "thumbnail_line2", "thumbnail_line3"],
   additionalProperties: false,
 };
 
@@ -122,6 +131,11 @@ function normalize(data) {
     tags: (Array.isArray(data.tags) ? data.tags : []).map(String).slice(0, 12),
     thumbnailCopy: String(data.thumbnail_copy || ""),
     thumbnailSubcopy: String(data.thumbnail_subcopy || ""),
+    // 썸네일에 얹을 줄. 7자 제한은 렌더러가 다시 확인한다 — 모델이 넘기면
+    // 조용히 자르지 않고 카드 생성을 실패시키고 사진으로 올린다.
+    thumbnailLine1: String(data.thumbnail_line1 || "").trim(),
+    thumbnailLine2: String(data.thumbnail_line2 || "").trim(),
+    thumbnailLine3: String(data.thumbnail_line3 || "").trim(),
   };
 }
 
@@ -341,6 +355,9 @@ function generateHeuristic(segments, durationSec) {
     tags: keywords,
     thumbnail_copy: (top[0] || firstLine).slice(0, 10),
     thumbnail_subcopy: (top[1] || "").slice(0, 8),
+    thumbnail_line1: (top[0] || firstLine).slice(0, 7),
+    thumbnail_line2: (top[1] || "").slice(0, 7),
+    thumbnail_line3: "",
   };
 }
 
