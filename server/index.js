@@ -162,7 +162,22 @@ function diskAndMemory() {
     out.freeMemMb = Math.round(os.freemem() / 1024 / 1024);
   } catch {}
   Object.assign(out, cgroupMemory());
+  if (shutdownNote) out.shutdown = shutdownNote;
   return out;
+}
+
+// 종료 사유 기록. 프로세스가 사라진 뒤에는 아무것도 물어볼 수 없으므로,
+// 사라지기 직전 상태를 여기에 담아 두고 남은 몇 초 동안 헬스체크로 내보낸다.
+let shutdownNote = null;
+function noteShutdown(note) {
+  if (shutdownNote) return;   // 첫 번째 이유가 진짜 이유다
+  shutdownNote = {
+    ...note,
+    uptimeSec: Math.round(process.uptime()),
+    activeUploads: uploads.size,
+    at: new Date().toISOString(),
+    ...cgroupMemory(),
+  };
 }
 
 // 컨테이너가 죽는 이유를 추측하지 않고 실제로 보기 위한 것.
@@ -1398,17 +1413,39 @@ const server = app.listen(PORT, () => {
 // 컨테이너에서 node 가 PID 1 로 뜨면 커널이 기본 시그널 동작을 걸어주지 않는다.
 // 즉 핸들러를 직접 등록하지 않으면 SIGTERM 이 무시되고, 배포 때마다 Render 가
 // 유예 시간 뒤 SIGKILL 로 강제 종료하게 된다 (진행 중이던 응답이 그냥 끊김).
-for (const sig of ["SIGTERM", "SIGINT"]) {
+//
+// 종료 이유는 반드시 남긴다. 업로드 도중 컨테이너가 사라지는 일이 반복되는데,
+// 밖에서 보이는 건 502 와 초기화된 uptime 뿐이라 원인을 구분할 수 없었다.
+// 신호를 받았다면 플랫폼이 내린 결정이고, 예외로 죽었다면 우리 코드가 문제다.
+// 둘을 갈라야 고칠 데를 안다. 죽기 전에 그 사실을 헬스체크로 내보내려면 잠깐
+// 더 살아 있어야 하므로, 업로드가 진행 중일 때는 유예 시간을 길게 잡는다.
+for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
   process.on(sig, () => {
-    console.log(`${sig} 수신 — 새 연결을 받지 않고 종료합니다.`);
-    server.close(() => process.exit(0));
-    // 인코딩이 오래 걸릴 수 있으니 무한정 기다리지는 않는다.
+    noteShutdown({ kind: "signal", detail: sig });
+    console.log(`${sig} 수신 (uptime ${Math.round(process.uptime())}s, 업로드 ${uploads.size}건) — 종료합니다.`);
+    // 바로 server.close() 를 부르면 헬스체크도 함께 닫혀서, 왜 죽었는지 물어볼
+    // 창구가 사라진다. 이유를 알릴 몇 초를 벌고 나서 닫는다.
     setTimeout(() => {
-      console.log("유예 시간 초과 — 강제 종료합니다.");
-      process.exit(0);
-    }, 15_000).unref();
+      server.close(() => process.exit(0));
+      setTimeout(() => {
+        console.log("유예 시간 초과 — 강제 종료합니다.");
+        process.exit(0);
+      }, uploads.size > 0 ? 20_000 : 10_000).unref();
+    }, 6_000).unref();
   });
 }
+
+// 잡히지 않은 예외로 죽는 경우. 기본 동작은 스택을 찍고 즉시 종료라서, 밖에서는
+// 신호로 죽은 것과 구분이 안 된다. 이유를 남기고 조금 늦게 종료한다.
+process.on("uncaughtException", (e) => {
+  noteShutdown({ kind: "uncaughtException", detail: `${e?.message || e}`, stack: (e?.stack || "").slice(0, 800) });
+  console.error(`[치명] 잡히지 않은 예외 (uptime ${Math.round(process.uptime())}s):`, e);
+  setTimeout(() => process.exit(1), 20_000).unref();
+});
+process.on("unhandledRejection", (e) => {
+  noteShutdown({ kind: "unhandledRejection", detail: `${e?.message || e}`, stack: (e?.stack || "").slice(0, 800) });
+  console.error(`[치명] 처리되지 않은 거부 (uptime ${Math.round(process.uptime())}s):`, e);
+});
 
 // ── ffmpeg pipeline ──────────────────────────────────────────────────────────
 // keep 구간이 이 개수를 넘으면 trim+concat 대신 select 방식으로 전환한다.
