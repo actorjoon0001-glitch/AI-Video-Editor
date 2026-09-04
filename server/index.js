@@ -628,6 +628,7 @@ setInterval(() => {
     if (now - u.updatedAt > UPLOAD_TTL_MS) {
       uploads.delete(id);
       unlink(u.path).catch(() => {});
+      unlink(`${u.path}.json`).catch(() => {});
       console.log(`[upload ${id}] 만료 정리`);
     }
   }
@@ -645,14 +646,38 @@ app.post("/api/uploads", express.json({ limit: "1mb" }), async (req, res) => {
   const p = path.join(TMP, `${id}.upload`);
   // 빈 파일을 만들어 둔다 — 조각마다 createWriteStream(flags:"r+") 로 이어 쓴다.
   await writeFile(p, "");
+  // 세션 정보를 디스크에도 남긴다. 메모리에만 두면 서버가 재시작할 때 8GB 를 거의
+  // 다 올려놓고도 404 로 통째로 날린다 — 실제로 3520MB 지점에서 그렇게 잃었다.
+  await writeFile(`${p}.json`, JSON.stringify({ total, createdAt: Date.now() }));
   uploads.set(id, { path: p, received: 0, total, writing: false, updatedAt: Date.now() });
   console.log(`[upload ${id}] 시작 — ${(total / 1024 / 1024).toFixed(1)}MB`);
   res.status(201).json({ uploadId: id, chunkSize: 16 * 1024 * 1024 });
 });
 
+// 메모리에 없으면 디스크에서 되살린다. 조각은 순서대로만 쓰고 실패 시 잘라내므로,
+// 파일 크기가 곧 "받은 바이트" 다 — 별도 기록 없이 정확히 복구된다.
+async function findUpload(id) {
+  const inMem = uploads.get(id);
+  if (inMem) return inMem;
+  const p = path.join(TMP, `${id}.upload`);
+  if (!existsSync(p) || !existsSync(`${p}.json`)) return null;
+  try {
+    const { readFile } = await import("fs/promises");
+    const meta = JSON.parse(await readFile(`${p}.json`, "utf8"));
+    const received = (await stat(p)).size;
+    const u = { path: p, received, total: meta.total, writing: false, updatedAt: Date.now() };
+    uploads.set(id, u);
+    console.log(`[upload ${id}] 재시작 후 복구 — ${received} / ${meta.total} 바이트`);
+    return u;
+  } catch (e) {
+    console.warn(`[upload ${id}] 복구 실패: ${e?.message || e}`);
+    return null;
+  }
+}
+
 // 재개용 — 클라이언트가 어디까지 갔는지 묻는다.
-app.get("/api/uploads/:id", (req, res) => {
-  const u = uploads.get(String(req.params.id).replace(/[^a-f0-9-]/gi, ""));
+app.get("/api/uploads/:id", async (req, res) => {
+  const u = await findUpload(String(req.params.id).replace(/[^a-f0-9-]/gi, ""));
   if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
   res.json({ received: u.received, total: u.total });
 });
@@ -667,8 +692,11 @@ app.get("/api/uploads/:id", (req, res) => {
 // 조각 크기와 무관하게 소켓 버퍼 몇 개 수준으로 유지된다.
 app.put("/api/uploads/:id", async (req, res) => {
   const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
-  const u = uploads.get(id);
-  if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
+  const u = await findUpload(id);
+  if (!u) {
+    req.resume();
+    return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
+  }
   const offset = Number(req.query.offset);
   if (!Number.isFinite(offset) || offset < 0) {
     return res.status(400).json({ error: "offset required" });
@@ -737,7 +765,7 @@ app.put("/api/uploads/:id", async (req, res) => {
 // 조립 완료 → 기존 작업 파이프라인으로 넘긴다.
 app.post("/api/uploads/:id/complete", express.json({ limit: "4mb" }), async (req, res) => {
   const uploadId = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
-  const u = uploads.get(uploadId);
+  const u = await findUpload(uploadId);
   if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
   if (u.received !== u.total) {
     return res.status(400).json({
@@ -746,6 +774,7 @@ app.post("/api/uploads/:id/complete", express.json({ limit: "4mb" }), async (req
     });
   }
   uploads.delete(uploadId);
+  unlink(`${u.path}.json`).catch(() => {});
 
   const id = randomUUID();
   const safeOpts = sanitizeJobOptions(req.body?.options || {});
