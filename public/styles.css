@@ -1108,3 +1108,56 @@ textarea:focus { outline: none; border-color: var(--accent); }
   box-shadow: 0 0 6px rgba(255, 255, 255, .8);
   pointer-events: none;
 }
+
+/* 상단 고정 진행 요약 — 좁은 화면에서 진행 패널이 설정 아래로 밀려도 보이게 */
+.miniprog {
+  position: sticky;
+  top: 0;
+  z-index: 60;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 24px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  background: rgba(10, 11, 16, 0.94);
+  backdrop-filter: blur(16px);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.miniprog-text {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--accent);
+}
+.miniprog-track {
+  display: block;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+.miniprog-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--accent-grad);
+  transition: width .25s ease;
+}
+
+/* 좁은 화면에서 작업이 도는 동안에만 진행/결과를 설정보다 위로 올린다.
+   놀고 있을 때까지 올리면 정작 파일을 고를 드롭 영역이 아래로 밀린다. */
+@media (max-width: 1180px) {
+  .wb.wb--running .wb-right { order: -1; }
+  .miniprog { top: 0; }
+}
+@media (max-width: 640px) {
+  .miniprog { padding: 8px 14px 10px; font-size: 12px; }
+}

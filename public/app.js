@@ -2492,6 +2492,9 @@ onReady(() => {
     const lbl = $("silenceDbVal");
     if (lbl) lbl.textContent = auto ? "자동" : `${slider?.value} dB`;
   };
+  $("miniProg")?.addEventListener("click", () => {
+    document.getElementById("progress")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
   $("cutsPlayRemoved")?.addEventListener("click", () => {
     previewRemovedOnly(pickedDuration, lastKeeps).catch(onError);
   });
@@ -3262,7 +3265,12 @@ function buildCapCutDraft(fileName, keeps, duration) {
 }
 
 // ── UI helpers ───────────────────────────────────────────────────────────────
-function setBar(pct) { bar.style.width = `${pct}%`; }
+function setBar(pct) {
+  bar.style.width = `${pct}%`;
+  const fill = $("miniProgFill");
+  if (fill) fill.style.width = `${pct}%`;
+  syncMiniProgress();
+}
 function formatHMS(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const s = Math.round(seconds);
@@ -3270,7 +3278,22 @@ function formatHMS(seconds) {
   const r = (s % 60).toString().padStart(2, "0");
   return `${m}:${r}`;
 }
-function setStatus(msg) { statusEl.textContent = msg; }
+function setStatus(msg) {
+  statusEl.textContent = msg;
+  const t = $("miniProgText");
+  // 여러 줄 안내(용량 초과 등)는 첫 줄만 요약으로 쓴다.
+  if (t) t.textContent = String(msg || "").split("\n")[0].slice(0, 120);
+  syncMiniProgress();
+}
+
+// 진행 패널이 열려 있는 동안만 상단 요약을 띄운다.
+function syncMiniProgress() {
+  const mini = $("miniProg");
+  if (!mini) return;
+  const active = !progress.hidden && String(statusEl.textContent || "").trim().length > 0;
+  mini.hidden = !active;
+  document.querySelector(".wb")?.classList.toggle("wb--running", active);
+}
 
 // ── 자막 파이프라인 진단 패널 ────────────────────────────────────────────
 function resetSubtitleSteps() {

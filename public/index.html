@@ -29,6 +29,14 @@
     </div>
   </header>
 
+  <!-- 좁은 화면에서는 .wb 가 1열이 되면서 진행 패널이 긴 설정 목록 아래로 밀려
+       한참 스크롤해야 보인다. 상단에 고정되는 요약 줄을 둬서 폭과 무관하게
+       진행 상황이 항상 보이게 한다. 누르면 전체 패널로 이동. -->
+  <button type="button" class="miniprog" id="miniProg" hidden>
+    <span class="miniprog-text" id="miniProgText">진행 중</span>
+    <span class="miniprog-track"><span class="miniprog-fill" id="miniProgFill"></span></span>
+  </button>
+
   <main class="wb">
     <!-- ── 왼쪽: 소스 + 설정 ─────────────────────────────────────────────── -->
     <aside class="wb-col wb-left">
