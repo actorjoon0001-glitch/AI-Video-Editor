@@ -122,7 +122,7 @@
             날은 다운로드 시간이 한 번 추가됩니다.
           </p>
           <label class="toggle">
-            <input type="checkbox" id="burnSubtitles" />
+            <input type="checkbox" id="burnSubtitles" checked />
             <span>자막 번인 — 영상에 자막을 영구 합성</span>
           </label>
           <div class="substyle" id="subStyleBox" hidden>
@@ -160,11 +160,7 @@
               <span>굵게</span>
             </label>
           </div>
-          <label class="toggle">
-            <input type="checkbox" id="serverMode" />
-            <span>고속 모드 — 단일 요청 인코딩 (큐 모드 OFF일 때만)</span>
-          </label>
-          <p class="hint-row" id="serverModeHint"></p>
+          <p class="hint-row" id="backendHint"></p>
         </div>
 
         <details class="settings-card" id="queueStagesCard" hidden open>
