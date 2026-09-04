@@ -129,6 +129,8 @@ function healthBody() {
     whisperModel: process.env.WHISPER_MODEL || "tiny",
     // 큐 모드 후속 stage 가용성 — 프론트가 옵션을 켤지 말지 판단하는 데 쓴다.
     metadataProvider: metadataProvider(),
+    // 실제로 설치돼 확인된 자막 서체만. 프론트는 이 목록으로 선택지를 만든다.
+    subtitleFonts: subtitleFonts.map(({ key, label }) => ({ key, label })),
     youtube: youtubeConfigured(),
     youtubeAllowsPublic: youtubeAllowsPublic(),
     // 업로드 상한을 올릴 수 있는지는 남은 디스크와 메모리가 정한다. 원본 + 편집본이
@@ -1350,6 +1352,52 @@ async function thumbnailStageFor(job, editedPath) {
 // 흔히 틀리는 부분이라 여기서 한 번에 변환한다.
 const SUBTITLE_FONT = process.env.SUBTITLE_FONT || "NanumGothic";
 
+// 고를 수 있는 자막 서체. key 는 옵션에 실려 오는 값, family 는 fontconfig 이름.
+const SUBTITLE_FONT_CHOICES = [
+  { key: "gothic", label: "나눔고딕", family: "NanumGothic" },
+  { key: "barungothic", label: "나눔바른고딕", family: "NanumBarunGothic" },
+  { key: "square", label: "나눔스퀘어", family: "NanumSquare" },
+  { key: "squareround", label: "나눔스퀘어라운드", family: "NanumSquareRound" },
+  { key: "myeongjo", label: "나눔명조", family: "NanumMyeongjo" },
+  { key: "gothicbold", label: "나눔고딕 굵게", family: "NanumGothicExtraBold" },
+  // 이 둘만 이름에 띄어쓰기가 있다 — 붙여 쓰면 fc-match 가 엉뚱한 걸 돌려준다.
+  { key: "pen", label: "나눔손글씨 펜", family: "Nanum Pen Script" },
+  { key: "brush", label: "나눔손글씨 붓", family: "Nanum Brush Script" },
+];
+
+// 설치돼 있다고 확인된 것만 남긴다. libass 는 없는 서체를 지정하면 조용히 다른
+// 걸로 대체하므로, 목록에만 있고 이미지엔 없는 서체를 고르면 아무 오류 없이
+// 엉뚱한 글씨로 구워진다 — 40분짜리 인코딩을 끝내고 나서야 알게 된다.
+let subtitleFonts = [{ key: "gothic", label: "나눔고딕", family: SUBTITLE_FONT }];
+
+function fcMatchFamily(family) {
+  return new Promise((resolve) => {
+    const p = spawn("fc-match", ["-f", "%{family}", family], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    p.stdout.on("data", (d) => { out += d.toString(); });
+    p.on("error", () => resolve(null));
+    p.on("exit", () => resolve(out.trim()));
+  });
+}
+
+(async () => {
+  const found = [];
+  for (const f of SUBTITLE_FONT_CHOICES) {
+    // fc-match 는 못 찾아도 가장 비슷한 걸 돌려주므로, 이름이 실제로 일치하는지
+    // 확인해야 한다. 별칭이 쉼표로 붙어 나오는 경우가 있어 갈라서 본다.
+    const m = await fcMatchFamily(f.family);
+    if (m && m.split(",").some((x) => x.trim().toLowerCase() === f.family.toLowerCase())) {
+      found.push(f);
+    }
+  }
+  if (found.length) subtitleFonts = found;
+  console.log(`자막 서체 ${subtitleFonts.length}종: ${subtitleFonts.map((f) => f.family).join(", ")}`);
+})();
+
+function subtitleFontFamily(key) {
+  return subtitleFonts.find((f) => f.key === key)?.family || SUBTITLE_FONT;
+}
+
 // ffmpeg 이 SRT 를 ASS 로 바꿀 때 스크립트 해상도를 항상 384x288 로 박아 넣는다
 // (probe: "PlayResX: 384 / PlayResY: 288"). 그래서 FontSize/MarginV/Outline 은
 // 픽셀이 아니라 288 높이 기준 단위다 — FontSize=48 을 그대로 주면 1080p 에서
@@ -1372,7 +1420,10 @@ function sanitizeSubtitleStyle(v) {
   return {
     // 아래 값들은 전부 "1080p 기준 픽셀". 환산은 buildForceStyle() 에서 한다.
     fontSize: clamp(parseInt(o.fontSize, 10) || 54, 16, 200),
+    font: SUBTITLE_FONT_CHOICES.some((f) => f.key === o.font) ? o.font : "gothic",
     color: /^#?[0-9a-f]{6}$/i.test(o.color || "") ? o.color : "#ffffff",
+    // 외곽선 색. 예전엔 검정으로 박혀 있어서 밝은 배경에서 글자가 묻혔다.
+    outlineColor: /^#?[0-9a-f]{6}$/i.test(o.outlineColor || "") ? o.outlineColor : "#000000",
     // "outline" = 글자 외곽선만 / "box" = 반투명 배경 박스
     background: o.background === "box" ? "box" : "outline",
     boxColor: /^#?[0-9a-f]{6}$/i.test(o.boxColor || "") ? o.boxColor : "#000000",
@@ -1386,7 +1437,7 @@ function sanitizeSubtitleStyle(v) {
 function buildForceStyle(style) {
   const st = sanitizeSubtitleStyle(style);
   const parts = [
-    `FontName=${SUBTITLE_FONT}`,
+    `FontName=${subtitleFontFamily(st.font)}`,
     `FontSize=${pxToAss(st.fontSize).toFixed(1)}`,
     `PrimaryColour=${assColour(st.color, 100)}`,
     `Bold=${st.bold ? -1 : 0}`,
@@ -1403,7 +1454,7 @@ function buildForceStyle(style) {
     parts.push("BorderStyle=3", `OutlineColour=${box}`, `BackColour=${box}`,
       `Outline=${pxToAss(10).toFixed(1)}`);
   } else {
-    parts.push("BorderStyle=1", "OutlineColour=&H00000000",
+    parts.push("BorderStyle=1", `OutlineColour=${assColour(st.outlineColor, 100)}`,
       `Outline=${pxToAss(st.outline).toFixed(1)}`);
   }
   return parts.join(",");

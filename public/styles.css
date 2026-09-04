@@ -1026,6 +1026,10 @@ textarea:focus { outline: none; border-color: var(--accent); }
   font-size: 11.5px;
   gap: 4px;
 }
+/* 서체 이름은 길어서 반 칸에 넣으면 잘린다. 한 줄을 다 쓴다. */
+.substyle-grid .substyle-wide {
+  grid-column: 1 / -1;
+}
 .substyle input[type=color] {
   width: 100%;
   height: 30px;

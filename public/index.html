@@ -130,6 +130,13 @@
               <span id="subStyleSample">싱크대는 깊은 사각 싱크대</span>
             </div>
             <div class="substyle-grid">
+              <label class="substyle-wide">서체
+                <!-- 선택지는 /api/health 가 준다. 이미지에 실제로 설치된 것만
+                     올라오므로, 없는 서체를 골라 엉뚱한 글씨로 구워질 일이 없다. -->
+                <select id="subFont">
+                  <option value="gothic" selected>나눔고딕</option>
+                </select>
+              </label>
               <label>글자 크기
                 <input type="range" id="subFontSize" min="28" max="140" step="2" value="54" />
                 <span id="subFontSizeVal">54</span>
@@ -153,6 +160,13 @@
               <label>박스 투명도
                 <input type="range" id="subBoxOpacity" min="0" max="100" step="5" value="60" />
                 <span id="subBoxOpacityVal">60%</span>
+              </label>
+              <label>외곽선 색
+                <input type="color" id="subOutlineColor" value="#000000" />
+              </label>
+              <label>외곽선 두께
+                <input type="range" id="subOutline" min="0" max="24" step="1" value="6" />
+                <span id="subOutlineVal">6 px</span>
               </label>
             </div>
             <label class="toggle">
