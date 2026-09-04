@@ -417,6 +417,8 @@ onReady(() => {
     hint.textContent = `* 영상이 일시 서버를 거칩니다 (HTTPS, 처리 후 1시간 내 자동 삭제). 백엔드: ${BACKEND_URL}`;
   }
   wireQueueStageOptions();
+  // 탭을 새로 고쳤거나 닫았다 열었으면, 서버에서 아직 돌고 있는 작업에 다시 붙는다.
+  resumeActiveJob().catch((e) => console.warn("이전 작업 복구 실패:", e));
 });
 
 // 큐 모드에서만 의미 있는 후속 단계 옵션(메타데이터/업로드) 카드를 토글하고,
@@ -1745,14 +1747,35 @@ async function runQueueModePipeline() {
   // 전 단계 패널 초기화
   renderJobPipeline(makeInitialJobState(jobId));
 
+  rememberJob(jobId);
+  await followJob(jobId, pollIntervalMs);
+  runBtn.disabled = false;
+}
+
+// ── 작업 따라가기 ────────────────────────────────────────────────────────────
+//
+// 총 경과 시간으로는 끊지 않는다. 예전엔 30분 고정 제한이었는데, 8.2GB 원본은
+// 인코딩에만 47분이 걸려서 멀쩡히 돌고 있는 작업을 실패로 표시해 버렸다 —
+// 서버는 끝까지 정상으로 완주했는데 화면만 포기한 것이다. 판단 기준은 "얼마나
+// 오래 걸렸나"가 아니라 "진행이 멈췄나"여야 한다.
+const STALL_LIMIT_MS = 20 * 60 * 1000;
+
+// 진행이 있었는지 판단할 지문. 단계 상태와 퍼센트가 그대로면 멈춘 것으로 본다.
+function jobProgressSignature(job) {
+  return Object.entries(job.stages || {})
+    .map(([k, s]) => `${k}:${s.status}:${s.progress?.pct ?? ""}:${s.progress?.phase ?? ""}`)
+    .join("|");
+}
+
+async function followJob(jobId, pollIntervalMs = 3000) {
   const POLL_MS = Math.max(1500, pollIntervalMs);
-  const MAX_TOTAL_MS = 30 * 60 * 1000; // 30분 (Render Free cold start 여유)
-  const startedAt = Date.now();
   let consecutiveErrors = 0;
-  while (Date.now() - startedAt < MAX_TOTAL_MS) {
+  let signature = null;
+  let movedAt = Date.now();
+  for (;;) {
     await new Promise((r) => setTimeout(r, POLL_MS));
     const polled = await pollJobOnce(jobId);
-    if (polled.gone) throw new Error(JOB_GONE_MESSAGE);
+    if (polled.gone) { forgetJob(jobId); throw new Error(JOB_GONE_MESSAGE); }
     if (!polled.job) {
       // 일시적인 네트워크 오류는 넘어가되, 계속 실패하면 화면이 조용히 얼어붙지
       // 않도록 포기한다.
@@ -1767,14 +1790,73 @@ async function runQueueModePipeline() {
     const job = polled.job;
     renderJobPipeline(job);
     setStatus(`큐 모드: ${job.status}${terminalLabel(job)}`);
+
     if (job.status === "done" || job.status === "partial" || job.status === "failed") {
+      forgetJob(jobId);
       // 인코딩 결과를 다운로드 링크/미리보기로 연결
       await wireQueueResults(job);
-      runBtn.disabled = false;
-      return;
+      return job;
+    }
+
+    const sig = jobProgressSignature(job);
+    if (sig !== signature) {
+      signature = sig;
+      movedAt = Date.now();
+    } else if (Date.now() - movedAt > STALL_LIMIT_MS) {
+      throw new Error(
+        `작업이 ${Math.round(STALL_LIMIT_MS / 60000)}분 동안 한 발짝도 나가지 못했습니다. ` +
+        `백엔드가 멈춘 것으로 보입니다 (작업 ID: ${jobId}).`
+      );
     }
   }
-  throw new Error("큐 모드 timeout (30분 초과). 백엔드 로그 확인 필요.");
+}
+
+// ── 새로고침해도 작업을 놓치지 않기 ──────────────────────────────────────────
+//
+// 작업은 서버에서 도는데 진행 상황을 보는 건 이 탭뿐이다. 예전엔 탭을 새로
+// 고치면 작업 ID를 잃어버려서, 한 시간짜리 작업이 서버에서 멀쩡히 끝나도
+// 결과를 받아올 방법이 없었다. ID 만 남겨 두면 다시 붙을 수 있다.
+const ACTIVE_JOB_KEY = "activeJobId";
+function rememberJob(jobId) {
+  try { localStorage.setItem(ACTIVE_JOB_KEY, jobId); } catch {}
+}
+function forgetJob(jobId) {
+  try {
+    if (!jobId || localStorage.getItem(ACTIVE_JOB_KEY) === jobId) {
+      localStorage.removeItem(ACTIVE_JOB_KEY);
+    }
+  } catch {}
+}
+
+async function resumeActiveJob() {
+  let jobId = null;
+  try { jobId = localStorage.getItem(ACTIVE_JOB_KEY); } catch {}
+  if (!jobId || !BACKEND_URL) return;
+
+  const polled = await pollJobOnce(jobId);
+  if (polled.gone || !polled.job) { forgetJob(jobId); return; }
+
+  const job = polled.job;
+  resultSection.hidden = false;
+  $("jobPipelineBlock").hidden = false;
+  renderJobPipeline(job);
+  appendLog(`이전 작업에 다시 연결: ${jobId}`);
+
+  if (job.status === "done" || job.status === "partial" || job.status === "failed") {
+    forgetJob(jobId);
+    setStatus(`이전 작업 결과를 불러왔습니다: ${job.status}${terminalLabel(job)}`);
+    await wireQueueResults(job);
+    return;
+  }
+  setStatus(`진행 중이던 작업에 다시 연결했습니다: ${job.status}`);
+  runBtn.disabled = true;
+  try {
+    await followJob(jobId);
+  } catch (e) {
+    setStatus(`오류: ${e?.message || e}`);
+  } finally {
+    runBtn.disabled = false;
+  }
 }
 
 // 작업 목록은 서버 메모리에만 있다. 백엔드가 재시작되면 (재배포, 메모리 초과 등)
@@ -2053,28 +2135,9 @@ async function retryJobStage(jobId, stage) {
   }
 }
 
-async function pollUntilTerminal(jobId) {
-  const POLL_MS = 3000;
-  const MAX = 30 * 60 * 1000;
-  const t0 = Date.now();
-  let errors = 0;
-  while (Date.now() - t0 < MAX) {
-    await new Promise((r) => setTimeout(r, POLL_MS));
-    const polled = await pollJobOnce(jobId);
-    if (polled.gone) throw new Error(JOB_GONE_MESSAGE);
-    if (!polled.job) {
-      if (++errors >= POLL_FAIL_LIMIT) throw new Error("상태 조회가 계속 실패합니다.");
-      continue;
-    }
-    errors = 0;
-    const job = polled.job;
-    renderJobPipeline(job);
-    if (job.status === "done" || job.status === "partial" || job.status === "failed") {
-      await wireQueueResults(job);
-      return;
-    }
-  }
-}
+// 단계 재시도 후에도 같은 규칙으로 따라간다. 예전엔 여기도 30분 제한이었고,
+// 넘기면 오류도 없이 조용히 빠져나가 화면이 영원히 "진행 중"으로 남았다.
+const pollUntilTerminal = (jobId) => followJob(jobId);
 
 // 큐 모드 결과를 기존 결과 UI 에 연결: 편집본을 미리보기 비디오에, SRT/VTT 를
 // 다운로드 버튼에, 썸네일을 썸네일 그리드에.

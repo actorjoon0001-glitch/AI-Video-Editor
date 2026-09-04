@@ -422,6 +422,9 @@ const JOB_GC_INTERVAL_MS = 5 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs.entries()) {
+    // 돌고 있는 작업은 나이와 무관하게 남긴다 — 30분 넘게 걸리는 자막 작업이
+    // 끝나기도 전에 기록이 사라지면 클라이언트는 "작업 없음"만 보게 된다.
+    if (job.status === "pending" || job.status === "running") continue;
     const finishedAt = job.completedAt || job.createdAt;
     if (finishedAt && now - finishedAt > JOB_TTL_MS) jobs.delete(id);
   }
@@ -555,6 +558,11 @@ const PIPELINE_JOB_TTL_MS = 60 * 60 * 1000; // 1h
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of pipelineJobs.entries()) {
+    // 아직 돌고 있는 작업은 아무리 오래됐어도 건드리지 않는다. TTL 은 "결과를
+    // 언제까지 보관하나"지 "작업을 언제 죽이나"가 아니다. 예전엔 completedAt 이
+    // 없으면 createdAt 으로 재서, 한 시간 넘게 걸리는 작업이 실행 도중에 기록도
+    // 산출물도 함께 지워질 수 있었다 — 8GB 원본이면 인코딩만 47분이다.
+    if (job.status === "running" || job.status === "queued") continue;
     const t = job.completedAt || job.createdAt;
     if (now - t > PIPELINE_JOB_TTL_MS) {
       pipelineJobs.delete(id);
