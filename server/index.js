@@ -12,7 +12,7 @@ import multer from "multer";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { mkdir, unlink, stat, writeFile, truncate, open as openFile } from "fs/promises";
-import { existsSync, statfsSync, createWriteStream } from "fs";
+import { existsSync, statfsSync, createWriteStream, readFileSync } from "fs";
 import { pipeline } from "stream/promises";
 import os from "os";
 import path from "path";
@@ -156,6 +156,51 @@ function diskAndMemory() {
     out.totalMemMb = Math.round(os.totalmem() / 1024 / 1024);
     out.freeMemMb = Math.round(os.freemem() / 1024 / 1024);
   } catch {}
+  Object.assign(out, cgroupMemory());
+  return out;
+}
+
+// 컨테이너가 죽는 이유를 추측하지 않고 실제로 보기 위한 것.
+//
+// os.totalmem() 은 호스트 전체(60GB+)를 알려줘서 아무 쓸모가 없고, process RSS 는
+// 커널이 우리 대신 들고 있는 페이지 캐시를 포함하지 않는다. 컨테이너 한도에
+// 실제로 잡히는 값은 cgroup 의 memory.current 뿐이다. 그 안에서 anon(프로세스)
+// 인지 file(페이지 캐시)인지까지 갈라 봐야 어디를 고칠지 알 수 있다.
+const CG = "/sys/fs/cgroup";
+const readNum = (p) => {
+  const t = readFileSync(p, "utf8").trim();
+  return t === "max" ? Infinity : Number(t);
+};
+const toMb = (b) => (Number.isFinite(b) ? Math.round(b / 1024 / 1024) : "max");
+function cgroupMemory() {
+  const out = {};
+  try {
+    // cgroup v2
+    out.cgLimitMb = toMb(readNum(`${CG}/memory.max`));
+    out.cgUsedMb = toMb(readNum(`${CG}/memory.current`));
+    try { out.cgPeakMb = toMb(readNum(`${CG}/memory.peak`)); } catch {}
+    const stat = Object.fromEntries(
+      readFileSync(`${CG}/memory.stat`, "utf8").trim().split("\n").map((l) => l.split(" "))
+    );
+    out.cgAnonMb = toMb(Number(stat.anon));
+    out.cgFileMb = toMb(Number(stat.file));          // 페이지 캐시 전체
+    out.cgDirtyMb = toMb(Number(stat.file_dirty));   // 아직 디스크로 안 내려간 부분
+    out.cgWritebackMb = toMb(Number(stat.file_writeback));
+    const ev = Object.fromEntries(
+      readFileSync(`${CG}/memory.events`, "utf8").trim().split("\n").map((l) => l.split(" "))
+    );
+    out.cgOomKill = Number(ev.oom_kill);
+    out.cgMaxEvents = Number(ev.max);                // 한도에 부딪힌 횟수
+  } catch {
+    try {
+      // cgroup v1 로 물러선다
+      const base = `${CG}/memory`;
+      out.cgLimitMb = toMb(readNum(`${base}/memory.limit_in_bytes`));
+      out.cgUsedMb = toMb(readNum(`${base}/memory.usage_in_bytes`));
+    } catch (e) {
+      out.cgError = String(e?.message || e).slice(0, 120);
+    }
+  }
   return out;
 }
 app.get("/healthz", (req, res) => res.json(healthBody()));
