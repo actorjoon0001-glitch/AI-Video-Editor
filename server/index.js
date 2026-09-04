@@ -11,7 +11,7 @@ import cors from "cors";
 import multer from "multer";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { mkdir, unlink, stat, writeFile, truncate } from "fs/promises";
+import { mkdir, unlink, stat, writeFile, truncate, open as openFile } from "fs/promises";
 import { existsSync, statfsSync, createWriteStream } from "fs";
 import { pipeline } from "stream/promises";
 import os from "os";
@@ -733,6 +733,19 @@ app.put("/api/uploads/:id", async (req, res) => {
     });
     await pipeline(req, ws);
     if (written === 0) return res.status(400).json({ error: "빈 조각" });
+
+    // 조각마다 디스크로 강제로 밀어낸다.
+    //
+    // 안 하면 커널이 쓴 데이터를 "더티 페이지"로 메모리에 쌓아두는데, 컨테이너
+    // 환경에서는 그것도 메모리 한도에 포함된다. 프로세스 RSS 는 96MB 로 멀쩡한데
+    // 컨테이너가 통째로 죽는 일이 실제로 벌어졌다 (3GB 업로드 중 2976MB 지점,
+    // 502 + 재시작). 더티 페이지는 회수할 수 없어서 OOM 을 부르지만, 한 번
+    // 디스크에 내려간 페이지는 커널이 필요할 때 그냥 버릴 수 있다.
+    //
+    // 16MB fsync 는 수십~수백 ms — 조각 하나 전송 시간(수 초)에 비하면 무시할 만하다.
+    const fh = await openFile(u.path, "r+");
+    try { await fh.datasync(); } finally { await fh.close(); }
+
     u.received = startAt + written;
     u.updatedAt = Date.now();
     res.json({ received: u.received, total: u.total });
