@@ -8,9 +8,12 @@ FROM node:20-bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# fonts-nanum: 자막 번인용 한글 폰트. slim 이미지에는 폰트가 하나도 없어서
-# 이게 없으면 libass 가 한글 글리프를 못 찾아 자막이 □□□ 로 나온다.
-# fonts-noto-cjk 는 100MB 가 넘어 이미지가 무거워지므로 나눔고딕(약 10MB)만 넣는다.
+# 자막 번인용 한글 폰트. slim 이미지에는 폰트가 하나도 없어서 이게 없으면
+# libass 가 한글 글리프를 못 찾아 자막이 □□□ 로 나온다.
+#   fonts-nanum       — 나눔고딕/명조 (약 10MB)
+#   fonts-nanum-extra — 바른고딕·스퀘어·펜·붓 등 (약 30MB). 자막 서체를 고를 수
+#                       있으려면 고를 게 있어야 한다.
+# fonts-noto-cjk 는 100MB 가 넘어 이미지가 무거워지므로 넣지 않는다.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         python3 \
@@ -18,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-venv \
         ca-certificates \
         fonts-nanum \
+        fonts-nanum-extra \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 

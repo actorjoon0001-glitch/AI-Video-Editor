@@ -140,6 +140,7 @@ let lastEditPlan = null;
 // ── Sliders ──────────────────────────────────────────────────────────────────
 const sliders = [
   ["silenceDb", "silenceDbVal", (v) => `${v} dB`],
+  ["subOutline", "subOutlineVal", (v) => `${v} px`],
   ["minSilence", "minSilenceVal", (v) => `${parseFloat(v).toFixed(1)} s`],
   ["padding", "paddingVal", (v) => `${parseFloat(v).toFixed(2)} s`],
   ["shortLen", "shortLenVal", (v) => `${v} s`],
@@ -436,6 +437,22 @@ function wireQueueStageOptions() {
       metaHint.textContent = health.metadataProvider === "claude"
         ? "* Claude 로 생성합니다 — 자막 내용만 근거로 제목/설명/태그를 씁니다."
         : "* 서버에 ANTHROPIC_API_KEY 가 없어 로컬 키워드 분석으로 생성합니다 (품질은 낮지만 자막에 없는 내용은 만들지 않습니다).";
+    }
+
+    // 서체 목록은 서버가 실제로 설치돼 있다고 확인한 것만 준다.
+    const fontSel = $("subFont");
+    if (fontSel && Array.isArray(health.subtitleFonts) && health.subtitleFonts.length) {
+      const keep = fontSel.value;
+      fontSel.innerHTML = "";
+      for (const f of health.subtitleFonts) {
+        const o = document.createElement("option");
+        o.value = f.key;
+        o.textContent = f.label;
+        fontSel.appendChild(o);
+      }
+      // 저장해 둔 선택이 아직 유효하면 되살린다.
+      if (health.subtitleFonts.some((f) => f.key === keep)) fontSel.value = keep;
+      renderSubtitleStylePreview();
     }
 
     const upload = $("ytUpload");
@@ -1046,17 +1063,31 @@ async function fetchEditPlan(file, fillerMode) {
 // 자막 모델은 UI 선택을 따른다. 예전엔 큐 모드가 "tiny" 를 하드코딩해서,
 // 서버 메모리를 늘려도 자막 품질이 그대로였다.
 // 자막 번인 스타일. 백엔드 buildForceStyle() 과 키를 맞춘다.
+// 미리보기에서 쓸 CSS 글꼴 이름. 서버의 fontconfig 이름과 대체로 같다.
+const PREVIEW_FONT_STACK = {
+  gothic: "NanumGothic",
+  barungothic: "NanumBarunGothic",
+  square: "NanumSquare",
+  squareround: "NanumSquareRound",
+  myeongjo: "NanumMyeongjo",
+  gothicbold: "NanumGothicExtraBold",
+  pen: "'Nanum Pen Script'",
+  brush: "'Nanum Brush Script'",
+};
+
 function subtitleStyleFromUI() {
   return {
     // 크기/여백은 "1080p 기준 픽셀". 서버가 ASS 단위로 환산한다.
     fontSize: parseInt($("subFontSize")?.value, 10) || 54,
+    font: $("subFont")?.value || "gothic",
     color: $("subColor")?.value || "#ffffff",
     background: $("subBackground")?.value || "outline",
     boxColor: $("subBoxColor")?.value || "#000000",
     boxOpacity: parseInt($("subBoxOpacity")?.value, 10) || 60,
     marginV: parseInt($("subMarginV")?.value, 10) || 60,
     bold: $("subBold")?.checked === true,
-    outline: 6,
+    outlineColor: $("subOutlineColor")?.value || "#000000",
+    outline: parseInt($("subOutline")?.value, 10) || 0,
   };
 }
 
@@ -1070,6 +1101,9 @@ function renderSubtitleStylePreview() {
   const scale = box.clientHeight / 1080;
   el.style.fontSize = `${Math.max(5, st.fontSize * scale)}px`;
   el.style.color = st.color;
+  // 미리보기 서체는 "있으면 보여주는" 수준이다. 실제 번인은 서버 폰트를 쓰므로,
+  // 보는 사람 PC 에 나눔 계열이 없으면 여기서만 기본 글꼴로 보인다.
+  el.style.fontFamily = `${PREVIEW_FONT_STACK[st.font] || "NanumGothic"}, sans-serif`;
   el.style.fontWeight = st.bold ? "700" : "500";
   el.style.marginBottom = `${Math.max(0, st.marginV * scale)}px`;
   if (st.background === "box") {
@@ -1081,8 +1115,9 @@ function renderSubtitleStylePreview() {
   } else {
     el.style.background = "transparent";
     el.style.padding = "0";
+    const c = st.outlineColor;
     const w = Math.max(1, st.outline * scale).toFixed(1);
-    el.style.textShadow = `0 0 ${w}px #000, ${w}px ${w}px ${w}px #000, -${w}px -${w}px ${w}px #000`;
+    el.style.textShadow = `0 0 ${w}px ${c}, ${w}px ${w}px ${w}px ${c}, -${w}px -${w}px ${w}px ${c}`;
   }
 }
 
@@ -1262,6 +1297,8 @@ async function checkBackendHealth() {
       metadataProvider: body.metadataProvider || null,
       youtube: body.youtube === true,
       youtubeAllowsPublic: body.youtubeAllowsPublic === true,
+      // 설치돼 있다고 확인된 자막 서체. 화이트리스트라 빠뜨리면 목록이 안 채워진다.
+      subtitleFonts: Array.isArray(body.subtitleFonts) ? body.subtitleFonts : null,
       // 업로드 상한·여유 디스크. 이걸 빠뜨려서, 서버에서 상한을 10GB 로 올린 뒤에도
       // 프론트는 계속 기본값 500MB 로 판정하고 "상한은 500MB" 경고를 띄웠다.
       limits: body.limits || null,
@@ -2391,9 +2428,9 @@ const PREF_CHECKBOXES = [
   "genMetadata", "ytUpload", "loudnorm", "safeMode", "subBold", "silenceAuto",
 ];
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol",
-  "subFontSize", "subMarginV", "subBoxOpacity"];
+  "subFontSize", "subMarginV", "subBoxOpacity", "subOutline"];
 const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel", "glossary",
-  "subColor", "subBackground", "subBoxColor"];
+  "subColor", "subBackground", "subBoxColor", "subFont", "subOutlineColor"];
 const PREF_CHIPS = ["preset", "ratio", "quality", "mode", "speed", "filler"];
 
 function readPrefs() {
@@ -2527,7 +2564,8 @@ onReady(() => {
   wirePrefPersistence();
   wireTopbar();
   for (const id of ["subFontSize", "subMarginV", "subColor", "subBackground",
-                    "subBoxColor", "subBoxOpacity", "subBold"]) {
+                    "subBoxColor", "subBoxOpacity", "subBold",
+                    "subFont", "subOutlineColor", "subOutline"]) {
     $(id)?.addEventListener("input", renderSubtitleStylePreview);
     $(id)?.addEventListener("change", renderSubtitleStylePreview);
   }
