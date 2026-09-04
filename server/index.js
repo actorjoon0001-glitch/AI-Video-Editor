@@ -17,7 +17,7 @@ import { pipeline } from "stream/promises";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
-import { generateMetadata, metadataProvider } from "./metadata.js";
+import { generateMetadata, metadataProvider, fillDescriptionTemplate, descriptionVarsFrom } from "./metadata.js";
 import { uploadVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy } from "./youtube.js";
 import { detectKeeps } from "./silence.js";
 import { dropCache, startPageCacheJanitor } from "./pagecache.js";
@@ -1036,9 +1036,27 @@ function sanitizeJobOptions(opts) {
     burn: opts.burn === true,
     metadata: opts.metadata === true,
     metadataPersona: String(opts.metadataPersona || "").slice(0, 500),
+    // 설명글 템플릿과 채널 고정값. 코드가 아니라 사용자가 들고 있어야 문구를
+    // 고칠 때마다 배포하지 않는다.
+    descriptionTemplate: String(opts.descriptionTemplate || "").slice(0, 8000),
+    channel: sanitizeChannel(opts.channel),
     upload: opts.upload === true,
     privacy: sanitizePrivacy(opts.privacy),
     publishAt: sanitizePublishAt(opts.publishAt),
+  };
+}
+
+// 설명글에 들어갈 채널 고정값. 길이만 제한하고 내용은 그대로 둔다 — 링크 형태를
+// 우리가 단정하면 사용자가 쓰려는 주소를 막게 된다.
+function sanitizeChannel(v) {
+  const o = v && typeof v === "object" ? v : {};
+  const s = (x, n) => String(x || "").trim().slice(0, n);
+  return {
+    inquiryUrl: s(o.inquiryUrl, 300),
+    catalogUrl: s(o.catalogUrl, 300),
+    houseNo: s(o.houseNo, 40),
+    email: s(o.email, 200),
+    instagram: s(o.instagram, 300),
   };
 }
 
@@ -1491,6 +1509,16 @@ async function burnStageFor(job, editedPath) {
 async function metadataStageFor(job) {
   const segments = job.stages.transcribe?.result?.segments || [];
   const meta = await generateMetadata(segments, { persona: job.options.metadataPersona });
+
+  // 설명글은 모델이 통째로 쓰지 않는다. 모델은 조각(한 줄 요약·소개·제원·챕터)만
+  // 만들고, 채널 고유의 문구와 링크는 사용자가 UI 에서 관리하는 템플릿이 갖는다.
+  // 템플릿이 없으면 조각을 최소한으로 이어 붙여 예전 형태를 유지한다.
+  const vars = descriptionVarsFrom(meta, job.options.channel || {});
+  meta.description = job.options.descriptionTemplate
+    ? fillDescriptionTemplate(job.options.descriptionTemplate, vars)
+    : [meta.oneLiner, "", meta.intro, "",
+       ...(meta.chapters || []).map((c) => `${c.time} ${c.title}`)]
+        .join("\n").replace(/\n{3,}/g, "\n\n").trim();
   const metaPath = path.join(TMP, `${job.id}.metadata.json`);
   await writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
   job.artifacts.push(metaPath);
