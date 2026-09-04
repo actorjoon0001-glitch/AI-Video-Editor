@@ -144,6 +144,7 @@ function healthBody() {
       { method: "POST", path: "/api/jobs" },
       { method: "POST", path: "/api/uploads" },
       { method: "PUT",  path: "/api/uploads/:id" },
+      { method: "DELETE", path: "/api/uploads/:id" },
       { method: "POST", path: "/api/uploads/:id/complete" },
       { method: "GET",  path: "/api/jobs/:id" },
       { method: "POST", path: "/api/jobs/:id/stages/:stage/retry" },
@@ -768,6 +769,24 @@ app.get("/api/uploads/:id", async (req, res) => {
   const u = await findUpload(String(req.params.id).replace(/[^a-f0-9-]/gi, ""));
   if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
   res.json({ received: u.received, total: u.total });
+});
+
+// 업로드 취소. 중간에 그만둔 파일은 디스크에 그대로 남아 다음 작업이 쓸 자리를
+// 먹는다 (TTL 청소는 6시간 뒤에나 돈다). 사용자가 취소하거나 다른 파일을 고르면
+// 바로 치울 수 있게 한다.
+app.delete("/api/uploads/:id", async (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const u = await findUpload(id);
+  if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
+  if (u.writing) return res.status(409).json({ error: "조각을 쓰는 중입니다. 잠시 후 다시 시도하세요." });
+  uploads.delete(id);
+  const freedMb = Math.round(u.received / 1024 / 1024);
+  await Promise.all([
+    unlink(u.path).catch(() => {}),
+    unlink(`${u.path}.json`).catch(() => {}),
+  ]);
+  console.log(`[upload ${id}] 취소 — ${freedMb}MB 회수`);
+  res.json({ deleted: true, freedMb });
 });
 
 // 조각 append. offset 을 함께 받아, 중복 전송(재시도)이면 조용히 무시한다.
