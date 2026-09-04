@@ -405,13 +405,9 @@ function onReady(fn) {
   }
 }
 
-// 백엔드 URL 미설정 시 토글 비활성
 onReady(() => {
-  const cb = $("serverMode");
-  const hint = $("serverModeHint");
-  if (!cb) return;
+  const hint = $("backendHint");
   if (!BACKEND_URL) {
-    cb.disabled = true;
     if (hint) hint.textContent = "* 백엔드 URL 이 설정되지 않았습니다. localStorage.setItem('backendUrl','https://...') 또는 코드 DEFAULT_BACKEND_URL 변경 필요.";
   } else if (hint) {
     hint.textContent = `* 영상이 일시 서버를 거칩니다 (HTTPS, 처리 후 1시간 내 자동 삭제). 백엔드: ${BACKEND_URL}`;
@@ -431,12 +427,6 @@ function wireQueueStageOptions() {
   let capsLoaded = false;
   const sync = async () => {
     card.hidden = !queue.checked;
-    // 큐 모드가 우선순위를 가지므로 고속 모드는 의미가 없다 — 비활성 표시.
-    const server = $("serverMode");
-    if (server && BACKEND_URL) {
-      server.disabled = queue.checked;
-      if (queue.checked) server.checked = false;
-    }
     if (!queue.checked || capsLoaded) return;
     capsLoaded = true;
     const health = await checkBackendHealth();
@@ -453,7 +443,14 @@ function wireQueueStageOptions() {
     if (upload && !health.youtube) {
       upload.checked = false;
       upload.disabled = true;
-      if (ytHint) ytHint.textContent = "* 서버에 YouTube 자격 증명(YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN)이 없어 업로드를 쓸 수 없습니다.";
+      // 헬스체크 자체가 안 됐을 때와 자격 증명이 없을 때는 원인이 다르다.
+      // 둘 다 "자격 증명이 없다"고 말하면, 잠깐 네트워크가 끊긴 것뿐인데
+      // 키를 다시 발급하러 가게 된다.
+      if (ytHint) {
+        ytHint.textContent = health.ok
+          ? "* 서버에 YouTube 자격 증명(YOUTUBE_CLIENT_ID / SECRET / REFRESH_TOKEN)이 없어 업로드를 쓸 수 없습니다."
+          : `* 백엔드 상태를 확인하지 못해 업로드를 껐습니다 — ${health.error || "응답 없음"}`;
+      }
     }
     const publicOpt = $("ytPrivacy")?.querySelector('option[value="public"]');
     if (publicOpt && health.youtube && !health.youtubeAllowsPublic) {
@@ -510,17 +507,10 @@ runBtn.addEventListener("click", () => {
   }
   const note = $("idleNote"); if (note) note.hidden = true;
   const useQueue = $("queueMode")?.checked && BACKEND_URL;
-  const useServer = $("serverMode")?.checked && BACKEND_URL;
   const userSafe = $("safeMode")?.checked === true;
-  // 큐 모드가 우선. 그 다음 고속(server) 모드. 둘 다 아니면 브라우저 fallback 체인.
-  let promise;
-  if (useQueue) {
-    promise = runQueueModePipeline();
-  } else if (useServer) {
-    promise = runServerPipeline();
-  } else {
-    promise = runWithFallback({ userSafe });
-  }
+  // 큐 모드가 아니면 브라우저 fallback 체인. 서버 직접 인코딩은 더 이상 사용자가
+  // 고르는 모드가 아니라, 브라우저 엔진이 전부 멈췄을 때의 마지막 수단이다.
+  const promise = useQueue ? runQueueModePipeline() : runWithFallback({ userSafe });
   promise.catch(onError);
 });
 
@@ -2397,7 +2387,7 @@ function renderMetadata(metaStage, uploadStage) {
 // 칩 선택/텍스트 입력을 전부 localStorage 에 넣고 다음 방문에 그대로 복원한다.
 const PREFS_KEY = "aive.prefs.v1";
 const PREF_CHECKBOXES = [
-  "queueMode", "autoSubtitles", "burnSubtitles", "serverMode",
+  "queueMode", "autoSubtitles", "burnSubtitles",
   "genMetadata", "ytUpload", "loudnorm", "safeMode", "subBold", "silenceAuto",
 ];
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol",
