@@ -22,6 +22,9 @@ import { uploadVideo, updateVideo, youtubeConfigured, youtubeAllowsPublic, sanit
 import { detectKeeps } from "./silence.js";
 import { dropCache, startPageCacheJanitor } from "./pagecache.js";
 import { composeThumbnailCard } from "./thumbcard.js";
+import {
+  storeConfigured, saveJob, listJobs, loadJob, deleteExpired, STORE_RETENTION_DAYS,
+} from "./store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -130,6 +133,9 @@ function healthBody() {
     whisperModel: process.env.WHISPER_MODEL || "tiny",
     // 큐 모드 후속 stage 가용성 — 프론트가 옵션을 켤지 말지 판단하는 데 쓴다.
     metadataProvider: metadataProvider(),
+    // 작업 기록을 어디에 두는지. memory 면 재시작과 함께 사라진다.
+    store: storeConfigured() ? "supabase" : "memory",
+    storeRetentionDays: STORE_RETENTION_DAYS,
     // 실제로 설치돼 확인된 자막 서체만. 프론트는 이 목록으로 선택지를 만든다.
     subtitleFonts: subtitleFonts.map(({ key, label }) => ({ key, label })),
     youtube: youtubeConfigured(),
@@ -149,6 +155,7 @@ function healthBody() {
       { method: "PUT",  path: "/api/uploads/:id" },
       { method: "DELETE", path: "/api/uploads/:id" },
       { method: "POST", path: "/api/uploads/:id/complete" },
+      { method: "GET",  path: "/api/jobs" },
       { method: "GET",  path: "/api/jobs/:id" },
       { method: "POST", path: "/api/jobs/:id/stages/:stage/retry" },
       { method: "POST", path: "/api/jobs/:id/subtitles" },
@@ -642,7 +649,10 @@ export async function sweepOldSources() {
   }
 }
 
-setInterval(() => { sweepOldSources().catch(() => {}); }, 60 * 60 * 1000).unref();
+setInterval(() => {
+  sweepOldSources().catch(() => {});
+  deleteExpired().catch(() => {});
+}, 60 * 60 * 1000).unref();
 
 function newPipelineJob(id, options) {
   const stages = {};
@@ -776,7 +786,9 @@ app.post("/api/jobs", upload.single("video"), async (req, res) => {
   }
   const safeOpts = sanitizeJobOptions(options);
   const job = newPipelineJob(id, safeOpts);
+  job.sourceName = req.file?.originalname || "";
   pipelineJobs.set(id, job);
+  saveJob(job);
 
   res.status(202).json({
     jobId: id,
@@ -993,7 +1005,9 @@ app.post("/api/uploads/:id/complete", express.json({ limit: "4mb" }), async (req
   const id = randomUUID();
   const safeOpts = sanitizeJobOptions(req.body?.options || {});
   const job = newPipelineJob(id, safeOpts);
+  job.sourceName = u.name || "";
   pipelineJobs.set(id, job);
+  saveJob(job);
   console.log(`[upload ${uploadId}] 완료 → job ${id} (${(u.total / 1024 / 1024).toFixed(1)}MB)`);
 
   res.status(202).json({ jobId: id, statusUrl: `/api/jobs/${id}`, pollIntervalMs: 3000 });
@@ -1001,16 +1015,83 @@ app.post("/api/uploads/:id/complete", express.json({ limit: "4mb" }), async (req
   enqueueJob(id, u.path);
 });
 
-app.get("/api/jobs/:id", (req, res) => {
+// 보관된 작업 목록. 서버 메모리가 아니라 Supabase 를 본다 — 재시작해도, 새로
+// 고쳐도 남아 있어야 하는 게 이 목록의 존재 이유다.
+app.get("/api/jobs", async (req, res) => {
+  if (!storeConfigured()) {
+    return res.json({ store: "memory", retentionDays: null, jobs: [], note: "Supabase 미설정 — 기록이 서버 재시작과 함께 사라집니다." });
+  }
+  try {
+    const rows = await listJobs(Number(req.query.limit) || 50);
+    const jobs = rows.map((r) => ({
+      id: r.id,
+      createdAt: r.created_at,
+      expiresAt: r.expires_at,
+      // 화면에 "보관 N일 남음" 으로 쓰려고 서버에서 계산해 둔다 — 시계가 어긋난
+      // 브라우저에서도 같은 숫자가 보이게.
+      daysLeft: Math.max(0, Math.ceil((new Date(r.expires_at) - Date.now()) / 86400000)),
+      status: r.status,
+      title: r.title,
+      videoId: r.video_id,
+      videoUrl: r.video_url,
+      privacy: r.privacy,
+      // 파일이 아직 있으면 다시 만들 수 있고, 없으면 기록만 남은 것이다.
+      filesAvailable: pipelineJobs.has(r.id),
+    }));
+    res.json({ store: "supabase", retentionDays: STORE_RETENTION_DAYS, jobs });
+  } catch (e) {
+    res.status(502).json({ error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/jobs/:id", async (req, res) => {
   const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
   const job = pipelineJobs.get(id);
-  if (!job) {
-    return res.status(404).json({
-      error: "작업을 찾을 수 없거나 만료됐습니다 (1시간 보관). 다시 업로드해 주세요.",
-    });
+  if (job) return res.json(jobResponse(job));
+
+  // 메모리에 없으면 보관된 기록을 돌려준다. 파일은 없어도 제목·설명·태그와
+  // 유튜브 링크는 그대로 쓸 수 있다 — 그게 대개 다시 필요한 것들이다.
+  if (storeConfigured()) {
+    try {
+      const row = await loadJob(id);
+      if (row) {
+        return res.json({
+          jobId: row.id,
+          status: row.status || "done",
+          archived: true,
+          canRerun: false,
+          expiresAt: row.expires_at,
+          daysLeft: Math.max(0, Math.ceil((new Date(row.expires_at) - Date.now()) / 86400000)),
+          options: row.payload?.options || {},
+          stages: archivedStages(row),
+          createdAt: row.payload?.createdAt || Date.parse(row.created_at),
+          completedAt: row.payload?.completedAt || null,
+        });
+      }
+    } catch (e) {
+      console.warn(`[store] 기록 조회 실패 (${id}): ${e?.message || e}`);
+    }
   }
-  res.json(jobResponse(job));
+  res.status(404).json({
+    error: "작업을 찾을 수 없거나 보관 기간이 지났습니다.",
+  });
 });
+
+// 보관된 기록을 화면이 아는 모양(stages)으로 되살린다. 파일이 없으므로 다운로드
+// 링크는 빼고, 글자로 남은 결과만 채운다.
+function archivedStages(row) {
+  const p = row.payload || {};
+  const out = {};
+  for (const [name, s] of Object.entries(p.stages || {})) {
+    out[name] = { status: s.status, note: s.note, error: s.error };
+  }
+  if (p.metadata && out.metadata) out.metadata.result = p.metadata;
+  if (p.upload && out.upload) out.upload.result = p.upload;
+  if (p.srt && out.transcribe) {
+    out.transcribe.result = { srt: p.srt, segmentCount: p.subtitleLines || 0 };
+  }
+  return out;
+}
 
 app.post("/api/jobs/:id/stages/:stage/retry", async (req, res) => {
   const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
@@ -1110,6 +1191,8 @@ app.post("/api/jobs/:id/rerun", express.json({ limit: "4mb" }), async (req, res)
   const newId = randomUUID();
   const job = newPipelineJob(newId, merged);
   pipelineJobs.set(newId, job);
+  job.sourceName = prev.sourceName || "";
+  saveJob(job);
   console.log(`[job ${id}] → 다시 만들기 job ${newId}${silenceChanged ? " (무음 재탐지)" : ""}`);
 
   res.status(202).json({ jobId: newId, statusUrl: `/api/jobs/${newId}`, pollIntervalMs: 3000 });
@@ -1377,6 +1460,7 @@ async function runJobPipeline(id, inputPath) {
   job.status = computeJobStatus(job);
   job.completedAt = Date.now();
   console.log(`[job ${id}] complete: ${job.status}`);
+  saveJob(job);
 }
 
 // 선행 조건을 먼저 확인해서, 못 도는 stage 는 "왜 건너뛰었는지"를 남기고
@@ -1443,6 +1527,7 @@ async function runStage(job, name, fn) {
       completedAt: Date.now(),
     };
     console.log(`[job ${job.id}] stage ${name} done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    saveJob(job);
   } catch (e) {
     console.error(`[job ${job.id}] stage ${name} failed:`, e);
     job.stages[name] = {
@@ -1451,6 +1536,9 @@ async function runStage(job, name, fn) {
       startedAt: t0,
       completedAt: Date.now(),
     };
+    // 실패 사유까지 담긴 뒤에 기록해야 한다. 앞에서 저장하면 "running" 인
+    // 상태가 남아, 서버가 죽었을 때와 단계가 실패했을 때를 구분할 수 없다.
+    saveJob(job);
   }
 }
 
