@@ -1876,6 +1876,16 @@ async function followJob(jobId, pollIntervalMs = 3000) {
     consecutiveErrors = 0;
     const job = polled.job;
     renderJobPipeline(job);
+
+    // 보관된 기록이 돌아왔다는 건 이 작업이 더 이상 서버 메모리에 없다는 뜻이다.
+    // 계속 폴링해 봐야 같은 기록만 오므로 여기서 멈춘다.
+    if (job.archived) {
+      forgetJob(jobId);
+      setStatus(job.message || "보관된 기록입니다 — 서버에는 더 이상 작업이 없습니다.");
+      await wireQueueResults(job);
+      return job;
+    }
+
     // 서버는 한 번에 하나만 돌린다. 순서를 기다리는 중이면 그렇다고 말해 준다 —
     // 안 그러면 아무 단계도 안 움직여서 멈춘 것처럼 보인다.
     const waiting = job.queuedBehind > 0

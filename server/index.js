@@ -1055,10 +1055,17 @@ app.get("/api/jobs/:id", async (req, res) => {
     try {
       const row = await loadJob(id);
       if (row) {
+        // 기록이 queued/running 에서 멈춰 있다는 건 그 상태로 서버가 사라졌다는
+        // 뜻이다. 그대로 돌려주면 화면이 영영 "대기 중" 을 붙잡고 폴링한다.
+        const interrupted = row.status === "running" || row.status === "queued";
         return res.json({
           jobId: row.id,
-          status: row.status || "done",
+          status: interrupted ? "failed" : (row.status || "done"),
           archived: true,
+          interrupted,
+          message: interrupted
+            ? "작업 도중 서버가 재시작돼 중단됐습니다. 기록만 남아 있습니다."
+            : null,
           canRerun: false,
           expiresAt: row.expires_at,
           daysLeft: Math.max(0, Math.ceil((new Date(row.expires_at) - Date.now()) / 86400000)),
