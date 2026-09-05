@@ -393,6 +393,47 @@
             <a id="uploadedLink" class="btn primary" target="_blank" rel="noopener">업로드된 영상 열기</a>
             <span class="meta-label" id="uploadedStatus"></span>
           </div>
+
+          <details class="settings-card settings-card--nested" id="ytEditCard" hidden>
+            <summary>올린 영상 고치기</summary>
+            <p class="hint-row">
+              * 제목·설명·태그·썸네일은 <b>올라간 영상에 그대로 덮어쓸 수 있습니다</b> (URL 유지, 재인코딩 없음).
+              영상 화면 자체는 유튜브가 교체를 허용하지 않아, 아래 <b>다시 만들기</b>로 새 비공개 영상을 만들어야 합니다.
+            </p>
+            <label>제목
+              <select id="ytEditTitlePick"></select>
+            </label>
+            <label>제목 직접 입력
+              <input type="text" id="ytEditTitle" maxlength="100" />
+            </label>
+            <label>설명
+              <textarea id="ytEditDesc" rows="10" spellcheck="false"></textarea>
+            </label>
+            <label>태그 (쉼표로 구분)
+              <input type="text" id="ytEditTags" />
+            </label>
+            <div class="substyle-grid">
+              <label>썸네일
+                <select id="ytEditThumb">
+                  <option value="">그대로 두기</option>
+                  <option value="card">문구 얹은 카드</option>
+                  <option value="raw">원본 사진</option>
+                </select>
+              </label>
+              <label>공개 범위
+                <select id="ytEditPrivacy">
+                  <option value="">그대로 두기</option>
+                  <option value="private">비공개</option>
+                  <option value="unlisted">일부 공개</option>
+                </select>
+              </label>
+            </div>
+            <div class="run-row">
+              <button type="button" class="btn primary" id="ytEditApply">유튜브에 덮어쓰기</button>
+              <button type="button" class="btn ghost" id="jobRerun">설정 바꿔서 다시 만들기</button>
+            </div>
+            <p class="hint-row" id="ytEditStatus"></p>
+          </details>
         </div>
 
         <div class="job-pipeline" id="jobPipelineBlock" hidden>
