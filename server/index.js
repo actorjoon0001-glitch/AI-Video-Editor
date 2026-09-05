@@ -1179,6 +1179,9 @@ async function runJobPipeline(id, inputPath) {
     const sizeBytes = (await stat(editedPath)).size;
     return {
       _path: editedPath,
+      // 뒤이어 도는 번인이 진행률의 분모로 쓴다. 인코딩에 걸린 시간(durationMs)이
+      // 아니라 만들어진 영상의 길이다.
+      durationSec: expectedSec,
       url: `/api/jobs/${id}/files/edited.mp4`,
       sizeBytes,
       durationMs: Date.now() - t0,
@@ -1497,6 +1500,12 @@ async function burnStageFor(job, editedPath) {
 
   const escapedSrt = srtPath.replace(/\\/g, "/").replace(/:/g, "\\:");
   const t0 = Date.now();
+
+  // 번인은 편집과 같은 길이를 통째로 다시 인코딩한다 — 즉 편집만큼 오래 걸린다.
+  // 진행률을 안 내보내면 그동안 "진행 중"만 떠서 멎은 것과 구분이 안 된다.
+  const totalSec = job.stages.edit?.result?.durationSec || 0;
+  job.stages.burn.progress = { outTimeSec: 0, totalSec, pct: 0 };
+
   await runFFmpeg([
     "-i", editedPath,
     "-vf", `subtitles='${escapedSrt}':force_style='${buildForceStyle(job.options.subtitleStyle)}'`,
@@ -1504,8 +1513,16 @@ async function burnStageFor(job, editedPath) {
     "-crf", String(QUALITY_CRF[job.options.quality] ?? 20),
     "-c:a", "copy",
     "-movflags", "+faststart",
+    "-progress", "pipe:2",
     "-y", out,
-  ]);
+  ], {
+    // 편집 단계와 같은 기준 — 전체 제한이 아니라 "5분 동안 아무 진전이 없으면".
+    timeoutMs: 5 * 60 * 1000,
+    onProgress: ({ outTimeSec }) => {
+      const pct = totalSec > 0 ? Math.min(99, Math.round((outTimeSec / totalSec) * 100)) : 0;
+      job.stages.burn.progress = { outTimeSec, totalSec, pct };
+    },
+  });
   return {
     _path: out,
     url: `/api/jobs/${job.id}/files/burned.mp4`,
