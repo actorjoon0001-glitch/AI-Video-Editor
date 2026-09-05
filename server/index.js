@@ -11,14 +11,14 @@ import cors from "cors";
 import multer from "multer";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { mkdir, unlink, stat, writeFile, truncate, open as openFile } from "fs/promises";
+import { mkdir, unlink, stat, writeFile, truncate, readdir, open as openFile } from "fs/promises";
 import { existsSync, statfsSync, createWriteStream, readFileSync } from "fs";
 import { pipeline } from "stream/promises";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { generateMetadata, metadataProvider, fillDescriptionTemplate, descriptionVarsFrom } from "./metadata.js";
-import { uploadVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy } from "./youtube.js";
+import { uploadVideo, updateVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy } from "./youtube.js";
 import { detectKeeps } from "./silence.js";
 import { dropCache, startPageCacheJanitor } from "./pagecache.js";
 import { composeThumbnailCard } from "./thumbcard.js";
@@ -152,6 +152,8 @@ function healthBody() {
       { method: "GET",  path: "/api/jobs/:id" },
       { method: "POST", path: "/api/jobs/:id/stages/:stage/retry" },
       { method: "POST", path: "/api/jobs/:id/subtitles" },
+      { method: "POST", path: "/api/jobs/:id/youtube" },
+      { method: "POST", path: "/api/jobs/:id/rerun" },
       { method: "GET",  path: "/api/jobs/:id/files/:name" },
       { method: "GET",  path: "/api/health" },
       { method: "GET",  path: "/healthz" },
@@ -577,6 +579,71 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref();
 
+// 원본 영상 보관.
+//
+// 지금까지 .upload 파일은 아무도 안 지웠다 — 작업 산출물 목록에 없어서 정리
+// 대상이 아니었다. 8GB 원본 두어 개면 20GB 디스크가 찬다.
+// 그렇다고 작업이 끝나자마자 지우면 "설정 바꿔서 다시 만들기" 를 할 때마다
+// 8GB 를 다시 올려야 한다. 하루는 남겨 두고, 그 뒤에 치운다.
+const SOURCE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// 하루가 지나도 안 지워지는 상황이 있다 — 8GB 짜리를 연달아 올리면 24시간이
+// 오기 전에 20GB 가 먼저 찬다. 그래서 나이 말고 남은 용량으로도 한 번 더 건다.
+const SOURCE_FREE_FLOOR_MB = 6000;
+
+export async function sweepOldSources() {
+  let names;
+  try {
+    names = await readdir(TMP);
+  } catch (e) {
+    return console.warn(`[cleanup] 작업 폴더를 읽지 못했습니다: ${e?.message || e}`);
+  }
+
+  const inUse = (file) => [...pipelineJobs.values()].some((j) => j.inputPath === file);
+  const sources = [];
+  for (const name of names) {
+    if (!name.endsWith(".upload")) continue;
+    const file = path.join(TMP, name);
+    try {
+      sources.push({ file, name, st: await stat(file) });
+    } catch {}
+  }
+
+  const now = Date.now();
+  const remove = async ({ file, name, st }, why) => {
+    try {
+      await unlink(file);
+      console.log(`[cleanup] 원본 삭제 (${(st.size / 1024 / 1024).toFixed(0)}MB, ${why}): ${name}`);
+      return true;
+    } catch (e) {
+      console.warn(`[cleanup] ${name} 정리 실패: ${e?.message || e}`);
+      return false;
+    }
+  };
+
+  const left = [];
+  for (const src of sources) {
+    if (inUse(src.file)) continue;
+    if (now - src.st.mtimeMs > SOURCE_TTL_MS) await remove(src, "24시간 경과");
+    else left.push(src);
+  }
+
+  // 아직 하루가 안 됐어도, 다음 업로드가 들어올 자리가 없으면 오래된 것부터
+  // 비운다. 자리가 없어 업로드가 실패하는 쪽이 재편집을 못 하는 것보다 나쁘다.
+  left.sort((a, b) => a.st.mtimeMs - b.st.mtimeMs);
+  for (const src of left) {
+    let freeMb = 0;
+    try {
+      const fs = statfsSync(TMP);
+      freeMb = (fs.bavail * fs.bsize) / 1024 / 1024;
+    } catch { break; }
+    if (freeMb >= SOURCE_FREE_FLOOR_MB) break;
+    await remove(src, `여유 공간 ${Math.round(freeMb)}MB`);
+  }
+}
+
+setInterval(() => { sweepOldSources().catch(() => {}); }, 60 * 60 * 1000).unref();
+
 function newPipelineJob(id, options) {
   const stages = {};
   for (const name of STAGE_NAMES) {
@@ -620,6 +687,8 @@ function jobResponse(job) {
     status: computeJobStatus(job),
     // 아직 시작 못 한 작업이 왜 조용한지 알 수 있게 — 앞에 몇 개 남았는지.
     queuedBehind: job.startedAt ? 0 : (job.queuedBehind || 0),
+    // 원본이 아직 디스크에 있으면 재업로드 없이 다시 만들 수 있다.
+    canRerun: Boolean(job.inputPath && existsSync(job.inputPath)),
     options: job.options,
     stages,
     createdAt: job.createdAt,
@@ -906,6 +975,9 @@ app.put("/api/uploads/:id", async (req, res) => {
 
 // 조립 완료 → 기존 작업 파이프라인으로 넘긴다.
 app.post("/api/uploads/:id/complete", express.json({ limit: "4mb" }), async (req, res) => {
+  // 새 원본이 자리 잡기 전에 오래된 것부터 치운다.
+  sweepOldSources().catch(() => {});
+
   const uploadId = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
   const u = await findUpload(uploadId);
   if (!u) return res.status(404).json({ error: "업로드 세션을 찾을 수 없습니다." });
@@ -970,6 +1042,78 @@ app.post("/api/jobs/:id/stages/:stage/retry", async (req, res) => {
 
   // 백그라운드: 단일 stage 만 재실행
   retryJobStage(id, stage).catch((e) => console.error(`[job ${id}] retry crash:`, e));
+});
+
+// 이미 올라간 영상의 제목·설명·태그·공개범위를 덮어쓴다.
+//
+// 영상 파일은 못 바꾼다 — 유튜브가 교체를 허용하지 않는다. 화면을 고치려면
+// /rerun 으로 다시 만들어 새 영상으로 올려야 한다. 여기서 되는 건 글자와
+// 썸네일뿐이고, 그거야말로 영상을 보고 나서 제일 자주 고치는 것들이다.
+app.post("/api/jobs/:id/youtube", express.json({ limit: "1mb" }), async (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const job = pipelineJobs.get(id);
+  if (!job) return res.status(404).json({ error: "작업을 찾을 수 없거나 만료됐습니다." });
+
+  const videoId = job.stages.upload?.result?.videoId;
+  if (!videoId) return res.status(400).json({ error: "이 작업에서 업로드된 영상이 없습니다." });
+
+  const b = req.body || {};
+  // 썸네일은 이미 만들어 둔 것 중에서 고른다 — 카드본이 기본, 원본 사진도 가능.
+  let thumbnailPath = null;
+  if (b.thumbnail === "card" || b.thumbnail === "raw") {
+    const p = path.join(TMP, `${id}.${b.thumbnail === "card" ? "thumb_card" : "thumb_0"}.jpg`);
+    if (!existsSync(p)) return res.status(400).json({ error: "선택한 썸네일 파일이 없습니다 (보관 기간이 지났을 수 있습니다)." });
+    thumbnailPath = p;
+  }
+
+  try {
+    const out = await updateVideo({
+      videoId,
+      title: typeof b.title === "string" ? b.title : null,
+      description: typeof b.description === "string" ? b.description : null,
+      tags: Array.isArray(b.tags) ? b.tags : null,
+      privacy: b.privacy ? sanitizePrivacy(b.privacy) : null,
+      thumbnailPath,
+    });
+    // 작업 기록도 같이 갱신해야 화면이 옛 제목을 계속 보여주지 않는다.
+    const st = job.stages.upload.result;
+    st.title = out.title;
+    st.privacyStatus = out.privacyStatus;
+    console.log(`[job ${id}] 유튜브 수정 — ${out.videoId} (${out.privacyStatus})`);
+    res.json(out);
+  } catch (e) {
+    console.error(`[job ${id}] 유튜브 수정 실패:`, e);
+    res.status(502).json({ error: String(e?.message || e) });
+  }
+});
+
+// 설정만 바꿔 처음부터 다시 만든다. 원본이 서버에 남아 있으므로 8GB 를 다시
+// 올릴 필요가 없다. 결과는 새 작업이고, 유튜브에는 새 비공개 영상으로 올라간다.
+app.post("/api/jobs/:id/rerun", express.json({ limit: "4mb" }), async (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const prev = pipelineJobs.get(id);
+  if (!prev) return res.status(404).json({ error: "작업을 찾을 수 없거나 만료됐습니다." });
+  if (!prev.inputPath || !existsSync(prev.inputPath)) {
+    return res.status(410).json({ error: "원본 영상이 서버에서 지워졌습니다. 다시 업로드해 주세요." });
+  }
+
+  // 안 보낸 항목은 이전 설정을 그대로 쓴다 — 컷 기준만 바꾸고 싶은데 자막
+  // 설정까지 다시 채워 보내야 한다면 그게 더 불편하다.
+  const merged = sanitizeJobOptions({ ...prev.options, ...(req.body?.options || {}) });
+  // keeps 를 물려받으면 새 무음 기준이 무시된다. 무음 관련 설정이 바뀌었으면
+  // 다시 찾게 한다.
+  const silenceChanged = ["noiseDb", "minSilence", "padding"].some(
+    (k) => merged[k] !== prev.options[k]
+  );
+  if (silenceChanged) merged.keeps = [];
+
+  const newId = randomUUID();
+  const job = newPipelineJob(newId, merged);
+  pipelineJobs.set(newId, job);
+  console.log(`[job ${id}] → 다시 만들기 job ${newId}${silenceChanged ? " (무음 재탐지)" : ""}`);
+
+  res.status(202).json({ jobId: newId, statusUrl: `/api/jobs/${newId}`, pollIntervalMs: 3000 });
+  enqueueJob(newId, prev.inputPath);
 });
 
 // 교정한 자막을 되돌려 받는다. 프론트에서 오타를 고친 뒤 이걸 호출하면
@@ -1122,6 +1266,8 @@ async function pumpJobQueue() {
 async function runJobPipeline(id, inputPath) {
   const job = pipelineJobs.get(id);
   if (!job) return;
+  // 설정만 바꿔 다시 만들 때 원본을 다시 올리지 않아도 되도록 기억해 둔다.
+  job.inputPath = inputPath;
   job.status = "running";
   job.queuedBehind = 0;
   job.startedAt = Date.now();
@@ -1198,12 +1344,12 @@ async function runJobPipeline(id, inputPath) {
     }
     job.status = computeJobStatus(job);
     job.completedAt = Date.now();
-    try { await unlink(inputPath); } catch {}
     return;
   }
 
-  // 입력 원본 정리. 이후 stage 들은 editedPath 만 본다.
-  try { await unlink(inputPath); } catch {}
+  // 원본은 여기서 지우지 않는다. 예전엔 편집이 끝나자마자 지웠는데, 그러면
+  // 결과를 보고 나서 컷 기준이나 자막 모양만 바꾸고 싶을 때 8GB 를 처음부터
+  // 다시 올려야 했다. 하루 동안 남겨 두고 sweepOldSources() 가 치운다.
 
   // ── transcribe ── (비치명적)
   if (job.options.transcribe) {

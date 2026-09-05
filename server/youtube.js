@@ -236,3 +236,83 @@ function request(url, { method = "GET", headers = {}, body = null } = {}) {
     req.end();
   });
 }
+
+// 이미 올라간 영상의 제목·설명·태그·공개범위를 덮어쓴다.
+//
+// 영상 파일 자체는 바꿀 수 없다 — 유튜브가 교체를 허용하지 않는다. 화면 내용을
+// 고치려면 새 영상으로 다시 올려야 한다.
+//
+// videos.update 는 part 로 지정한 덩어리를 통째로 갈아끼운다. 보내지 않은 필드는
+// 유지되는 게 아니라 지워진다 — categoryId 를 빼먹으면 카테고리가 날아가고,
+// 설명만 고치려다 제목이 사라진다. 그래서 지금 값을 먼저 읽어와서 바꿀 것만
+// 덮어쓴 뒤 통째로 돌려보낸다.
+export async function updateVideo({
+  videoId,
+  title = null,
+  description = null,
+  tags = null,
+  privacy = null,
+  thumbnailPath = null,
+}) {
+  if (!youtubeConfigured()) {
+    throw new Error(
+      "YouTube 자격 증명이 없습니다. YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET / YOUTUBE_REFRESH_TOKEN 을 설정하세요."
+    );
+  }
+  const id = String(videoId || "").trim();
+  if (!id) throw new Error("videoId 가 필요합니다.");
+
+  const accessToken = await getAccessToken();
+
+  const cur = await request(
+    `https://www.googleapis.com/youtube/v3/videos?part=snippet,status&id=${encodeURIComponent(id)}`,
+    { headers: { authorization: `Bearer ${accessToken}` } }
+  );
+  if (cur.status !== 200) {
+    throw new Error(`영상 정보를 못 읽었습니다 (HTTP ${cur.status}): ${cur.text.slice(0, 200)}`);
+  }
+  const item = JSON.parse(cur.text).items?.[0];
+  if (!item) throw new Error(`영상을 찾을 수 없습니다 (${id}). 내 채널의 영상인지 확인해 주세요.`);
+
+  const snippet = { ...item.snippet };
+  if (title != null) {
+    const t = String(title).trim().slice(0, 100);
+    if (!t) throw new Error("제목은 비울 수 없습니다.");
+    snippet.title = t;
+  }
+  if (description != null) snippet.description = String(description).slice(0, 5000);
+  if (tags != null) snippet.tags = tags.map(String).slice(0, 30);
+
+  const status = { ...item.status };
+  if (privacy != null) status.privacyStatus = sanitizePrivacy(privacy);
+  // 예약 게시가 걸린 영상을 공개로 바꾸면 유튜브가 거절한다. 예약을 먼저 푼다.
+  if (status.publishAt && status.privacyStatus !== "private") delete status.publishAt;
+
+  const res = await request("https://www.googleapis.com/youtube/v3/videos?part=snippet,status", {
+    method: "PUT",
+    headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
+    body: Buffer.from(JSON.stringify({ id, snippet, status }), "utf8"),
+  });
+  if (res.status !== 200) {
+    throw new Error(`수정 실패 (HTTP ${res.status}): ${res.text.slice(0, 300)}`);
+  }
+  const updated = JSON.parse(res.text);
+
+  const out = {
+    videoId: id,
+    url: `https://youtu.be/${id}`,
+    title: updated.snippet?.title || snippet.title,
+    privacyStatus: updated.status?.privacyStatus || status.privacyStatus,
+    thumbnailSet: false,
+  };
+  if (thumbnailPath) {
+    try {
+      await setThumbnail(accessToken, id, thumbnailPath);
+      out.thumbnailSet = true;
+    } catch (e) {
+      // 썸네일이 실패해도 제목·설명 수정까지 되돌릴 수는 없다.
+      out.thumbnailError = String(e?.message || e);
+    }
+  }
+  return out;
+}

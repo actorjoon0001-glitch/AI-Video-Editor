@@ -1809,23 +1809,7 @@ async function runQueueModePipeline() {
     noiseDb,
     minSilence,
     padding,
-    ratio: state.ratio,
-    speed: state.speed,
-    loudnorm: $("loudnorm").checked,
-    transcribe: $("autoSubtitles")?.checked === true,
-    thumbnails: true,
-    fillerMode: state.filler || "off",
-    language: "ko",
-    model: selectedWhisperModel(),
-    glossary: $("glossary")?.value?.trim() || "",
-    subtitleStyle: subtitleStyleFromUI(),
-    burn: $("burnSubtitles")?.checked === true,
-    metadata: $("genMetadata")?.checked === true,
-    metadataPersona: $("metaPersona")?.value?.trim() || "",
-    descriptionTemplate: $("descTemplate")?.value || "",
-    channel: descriptionChannelFromUI(),
-    upload: $("ytUpload")?.checked === true,
-    privacy: $("ytPrivacy")?.value || "private",
+    ...rerunOptions(),
   };
 
   const totalMb = (sourceFile.size / 1024 / 1024).toFixed(1);
@@ -1870,6 +1854,7 @@ function jobProgressSignature(job) {
 }
 
 async function followJob(jobId, pollIntervalMs = 3000) {
+  lastJobId = jobId;
   const POLL_MS = Math.max(1500, pollIntervalMs);
   let consecutiveErrors = 0;
   let signature = null;
@@ -1924,7 +1909,11 @@ async function followJob(jobId, pollIntervalMs = 3000) {
 // 고치면 작업 ID를 잃어버려서, 한 시간짜리 작업이 서버에서 멀쩡히 끝나도
 // 결과를 받아올 방법이 없었다. ID 만 남겨 두면 다시 붙을 수 있다.
 const ACTIVE_JOB_KEY = "activeJobId";
+// 작업이 끝나면 localStorage 에서 지운다. 그런데 "올린 영상 고치기" 는 바로 그
+// 끝난 작업을 대상으로 하므로, 화면이 살아 있는 동안은 따로 들고 있어야 한다.
+let lastJobId = null;
 function rememberJob(jobId) {
+  lastJobId = jobId;
   try { localStorage.setItem(ACTIVE_JOB_KEY, jobId); } catch {}
 }
 function forgetJob(jobId) {
@@ -2473,6 +2462,8 @@ function renderMetadata(metaStage, uploadStage) {
       : (m.thumbnailCopy || "-");
   }
 
+  wireYouTubeEdit(metaStage, uploadStage);
+
   const upRow = $("metaUploadRow");
   const up = uploadStage?.status === "done" ? uploadStage.result : null;
   if (upRow) {
@@ -2497,6 +2488,151 @@ function renderMetadata(metaStage, uploadStage) {
       upRow.hidden = true;
     }
   }
+}
+
+// 화면에서 고를 수 있는 작업 설정. 처음 실행할 때와 "다시 만들기" 가 같은 값을
+// 쓰도록 한 곳에 모아 둔다 — 갈라져 있으면 한쪽에만 새 옵션을 추가하게 된다.
+// 무음 관련 값과 keeps 는 원본 길이에 딸린 것이라 여기 넣지 않는다.
+function rerunOptions() {
+  return {
+    ratio: state.ratio,
+    speed: state.speed,
+    loudnorm: $("loudnorm").checked,
+    transcribe: $("autoSubtitles")?.checked === true,
+    thumbnails: true,
+    fillerMode: state.filler || "off",
+    language: "ko",
+    model: selectedWhisperModel(),
+    glossary: $("glossary")?.value?.trim() || "",
+    subtitleStyle: subtitleStyleFromUI(),
+    burn: $("burnSubtitles")?.checked === true,
+    metadata: $("genMetadata")?.checked === true,
+    metadataPersona: $("metaPersona")?.value?.trim() || "",
+    descriptionTemplate: $("descTemplate")?.value || "",
+    channel: descriptionChannelFromUI(),
+    upload: $("ytUpload")?.checked === true,
+    privacy: $("ytPrivacy")?.value || "private",
+    // 무음 기준도 같이 보낸다. 서버는 이 값이 바뀌었을 때만 keeps 를 버리고
+    // 무음을 다시 찾는다.
+    noiseDb: silenceThresholdSetting(),
+    minSilence: parseFloat($("minSilence").value),
+    padding: parseFloat($("padding").value),
+  };
+}
+
+// ── 올린 영상 고치기 ────────────────────────────────────────────────────────
+//
+// 비공개로 올려 두고 확인한 뒤에 손보는 게 실제 순서다. 그런데 유튜브는 영상
+// 파일 교체를 허용하지 않으므로, 고칠 수 있는 것과 다시 만들어야 하는 것이
+// 갈린다. 글자와 썸네일은 덮어쓰고, 화면이 달라져야 하면 새로 만든다.
+let ytEditWired = false;
+
+function wireYouTubeEdit(metaStage, uploadStage) {
+  const card = $("ytEditCard");
+  if (!card) return;
+  const up = uploadStage?.status === "done" ? uploadStage.result : null;
+  card.hidden = !up?.videoId;
+  if (!up?.videoId) return;
+
+  const meta = metaStage?.status === "done" ? metaStage.result : null;
+  // 값은 매번 현재 작업 기준으로 다시 채운다 (다른 작업을 열었을 수도 있다).
+  const pick = $("ytEditTitlePick");
+  if (pick) {
+    pick.innerHTML = "";
+    for (const t of meta?.titles || []) {
+      const o = document.createElement("option");
+      o.value = t; o.textContent = t;
+      pick.appendChild(o);
+    }
+    pick.value = up.title || (meta?.titles || [])[0] || "";
+  }
+  if ($("ytEditTitle")) $("ytEditTitle").value = up.title || "";
+  if ($("ytEditDesc")) $("ytEditDesc").value = meta?.description || "";
+  if ($("ytEditTags")) $("ytEditTags").value = (meta?.tags || []).join(", ");
+
+  if (ytEditWired) return;
+  ytEditWired = true;
+
+  pick?.addEventListener("change", () => {
+    if ($("ytEditTitle")) $("ytEditTitle").value = pick.value;
+  });
+
+  $("ytEditApply")?.addEventListener("click", async () => {
+    const jobId = currentJobId();
+    if (!jobId) return;
+    const btn = $("ytEditApply");
+    const note = $("ytEditStatus");
+    btn.disabled = true;
+    if (note) note.textContent = "유튜브에 반영하는 중...";
+    try {
+      const body = {
+        title: $("ytEditTitle")?.value.trim() || undefined,
+        description: $("ytEditDesc")?.value ?? undefined,
+        tags: ($("ytEditTags")?.value || "")
+          .split(",").map((t) => t.trim()).filter(Boolean),
+        thumbnail: $("ytEditThumb")?.value || undefined,
+        privacy: $("ytEditPrivacy")?.value || undefined,
+      };
+      const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}/youtube`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      if (note) {
+        note.textContent = `반영됨 — "${j.title}" (${j.privacyStatus})` +
+          (j.thumbnailSet ? " · 썸네일 교체됨" : "") +
+          (j.thumbnailError ? ` · 썸네일 실패: ${j.thumbnailError}` : "");
+      }
+      appendLog(`유튜브 수정 반영: ${j.title}`);
+    } catch (e) {
+      if (note) note.textContent = `실패: ${e?.message || e}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("jobRerun")?.addEventListener("click", async () => {
+    const jobId = currentJobId();
+    if (!jobId) return;
+    const btn = $("jobRerun");
+    const note = $("ytEditStatus");
+    btn.disabled = true;
+    if (note) note.textContent = "원본을 다시 쓰는 중...";
+    try {
+      // 왼쪽 패널의 현재 설정을 그대로 보낸다 — 컷 기준이든 자막 모양이든
+      // 화면에서 바꾼 대로 다시 만들어진다.
+      const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}/rerun`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ options: rerunOptions() }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      if (note) note.textContent = "";
+      appendLog(`다시 만들기 시작: ${j.jobId}`);
+      rememberJob(j.jobId);
+      renderJobPipeline(makeInitialJobState(j.jobId));
+      runBtn.disabled = true;
+      try {
+        await followJob(j.jobId, j.pollIntervalMs);
+      } finally {
+        runBtn.disabled = false;
+      }
+    } catch (e) {
+      if (note) note.textContent = `다시 만들기 실패: ${e?.message || e}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+// 화면에 떠 있는 작업이 곧 고치려는 대상이다. localStorage 는 새로고침으로
+// 돌아왔을 때만 쓰는 보조 수단이라 뒤에 둔다.
+function currentJobId() {
+  if (lastJobId) return lastJobId;
+  try { return localStorage.getItem(ACTIVE_JOB_KEY); } catch { return null; }
 }
 
 // ── 개인용 설정 저장 ────────────────────────────────────────────────────────
