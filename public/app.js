@@ -2038,7 +2038,7 @@ async function uploadJobChunked(file, options, totalMb) {
   const create = await fetch(`${BACKEND_URL}/api/uploads`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ totalBytes: file.size }),
+    body: JSON.stringify({ totalBytes: file.size, name: file.name }),
   });
   if (!create.ok) {
     const t = await create.text().catch(() => "");
@@ -2635,6 +2635,106 @@ function currentJobId() {
   try { return localStorage.getItem(ACTIVE_JOB_KEY); } catch { return null; }
 }
 
+// ── 작업창 ─────────────────────────────────────────────────────────────────
+//
+// 작업 목록이 서버 메모리에만 있던 동안은 새로고침 한 번, 배포 한 번에 통째로
+// 사라졌다. 끝난 영상의 유튜브 링크조차 못 찾는 일이 실제로 있었다.
+// 이제 서버가 Supabase 에 기록을 남기므로, 여기서는 그걸 읽어 보여주기만 한다.
+async function loadArchive() {
+  const list = $("archiveList");
+  const note = $("archiveNote");
+  const hint = $("archiveHint");
+  if (!list || !BACKEND_URL) return;
+
+  list.innerHTML = "";
+  if (note) note.textContent = "불러오는 중...";
+  try {
+    const r = await fetch(`${BACKEND_URL}/api/jobs?limit=50`);
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+
+    if (body.store !== "supabase") {
+      if (note) note.textContent = body.note || "기록 저장소가 설정되지 않았습니다.";
+      if (hint) hint.textContent = "";
+      return;
+    }
+    if (hint) hint.textContent = `${body.retentionDays}일 보관`;
+    if (!body.jobs.length) {
+      if (note) note.textContent = "아직 보관된 작업이 없습니다.";
+      return;
+    }
+    if (note) note.textContent = "";
+
+    for (const j of body.jobs) {
+      const li = document.createElement("li");
+      li.className = "job-archive-item";
+
+      const when = new Date(j.createdAt).toLocaleString("ko-KR", {
+        month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+      });
+      const head = document.createElement("div");
+      head.className = "archive-head";
+      head.textContent = j.title || j.id.slice(0, 8);
+      li.appendChild(head);
+
+      const sub = document.createElement("div");
+      sub.className = "archive-sub";
+      // 파일이 남아 있는지가 "다시 만들 수 있는지" 를 가른다. 기록만 남았을 때
+      // 그걸 안 알려주면 버튼을 눌러 보고 나서야 알게 된다.
+      sub.textContent = [
+        when,
+        j.status,
+        `보관 ${j.daysLeft}일 남음`,
+        j.filesAvailable ? "다시 만들기 가능" : "기록만 남음",
+      ].join(" · ");
+      li.appendChild(sub);
+
+      const row = document.createElement("div");
+      row.className = "archive-actions";
+      if (j.videoUrl) {
+        const a = document.createElement("a");
+        a.className = "btn ghost btn-sm";
+        a.href = j.videoUrl; a.target = "_blank"; a.rel = "noopener";
+        a.textContent = `유튜브 열기 (${j.privacy || "?"})`;
+        row.appendChild(a);
+      }
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "btn ghost btn-sm";
+      open.textContent = "결과 열기";
+      open.addEventListener("click", () => openArchivedJob(j.id));
+      row.appendChild(open);
+      li.appendChild(row);
+
+      list.appendChild(li);
+    }
+  } catch (e) {
+    if (note) note.textContent = `목록을 못 불러왔습니다: ${e?.message || e}`;
+  }
+}
+
+// 보관된 작업을 결과 패널에 되살린다. 파일이 지워졌으면 다운로드 링크는 없고
+// 글자로 남은 것(제목 후보·설명·태그·자막·유튜브 링크)만 보인다.
+async function openArchivedJob(jobId) {
+  try {
+    const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`);
+    const job = await r.json();
+    if (!r.ok) throw new Error(job.error || `HTTP ${r.status}`);
+    lastJobId = jobId;
+    resultSection.hidden = false;
+    $("jobPipelineBlock").hidden = false;
+    renderJobPipeline(job);
+    await wireQueueResults(job);
+    setStatus(
+      job.archived
+        ? `보관된 기록 (${job.daysLeft}일 남음) — 영상 파일은 서버에 없습니다.`
+        : `작업 ${job.status}`
+    );
+  } catch (e) {
+    setStatus(`기록을 못 열었습니다: ${e?.message || e}`);
+  }
+}
+
 // ── 개인용 설정 저장 ────────────────────────────────────────────────────────
 // 혼자 쓰는 도구라 매번 같은 값을 다시 고르는 게 제일 번거롭다. 체크박스/슬라이더/
 // 칩 선택/텍스트 입력을 전부 localStorage 에 넣고 다음 방문에 그대로 복원한다.
@@ -2820,6 +2920,15 @@ onReady(() => {
   // 템플릿은 저장된 값이 있으면 그걸, 없으면 기본 템플릿을 넣는다.
   const tpl = $("descTemplate");
   if (tpl && !tpl.value.trim()) tpl.value = DEFAULT_DESC_TEMPLATE;
+  $("archiveRefresh")?.addEventListener("click", loadArchive);
+  // 펼칠 때 처음 한 번만 읽는다 — 화면을 열자마자 매번 부를 이유는 없다.
+  $("archiveCard")?.addEventListener("toggle", (e) => {
+    if (e.target.open && !e.target.dataset.loaded) {
+      e.target.dataset.loaded = "1";
+      loadArchive();
+    }
+  });
+
   $("descTemplateReset")?.addEventListener("click", () => {
     if (!tpl) return;
     tpl.value = DEFAULT_DESC_TEMPLATE;

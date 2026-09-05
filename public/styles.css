@@ -1185,3 +1185,36 @@ textarea:focus { outline: none; border-color: var(--accent); }
   border-radius: 4px;
   padding: 1px 4px;
 }
+
+/* 작업창 — 보관된 작업 목록 */
+.job-archive {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.job-archive-item {
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+.archive-head {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.archive-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.archive-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
