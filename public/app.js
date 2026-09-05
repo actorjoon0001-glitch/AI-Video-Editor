@@ -2519,7 +2519,7 @@ function readPrefs() {
 }
 
 function savePrefs() {
-  const p = {};
+  const p = { _defaults: PREF_DEFAULTS_VERSION };
   for (const id of PREF_CHECKBOXES) if ($(id)) p[id] = $(id).checked;
   for (const id of PREF_RANGES) if ($(id)) p[id] = $(id).value;
   for (const id of PREF_TEXTS) if ($(id)) p[id] = $(id).value;
@@ -2559,9 +2559,28 @@ function restorePrefs() {
     });
     state.preset = preset;
   }
+  applyDefaultMigrations(p);
+
   // 큐 모드 카드 표시 여부는 change 리스너가 정하므로, 복원 후 한 번 알린다.
   $("queueMode")?.dispatchEvent(new Event("change", { bubbles: true }));
   renderSubtitleStylePreview();
+}
+
+// 기본값을 바꿔도, 이미 저장된 설정이 있는 브라우저에는 영영 닿지 않는다.
+// 저장된 값이 우선이라는 규칙 자체는 맞지만, 그 규칙 때문에 "이제부터 기본으로
+// 켜 두자"고 정한 항목이 정작 쓰는 사람 화면에서는 계속 꺼져 있었다.
+// 그래서 새 기본값을 한 번만 강제로 밀어 넣고, 그 뒤로는 다시 저장된 값이
+// 우선한다 — 여기서 끄면 그 선택은 그대로 유지된다.
+const PREF_DEFAULTS_VERSION = 2;
+const FORCED_ON_V2 = ["burnSubtitles", "genMetadata", "ytUpload"];
+
+function applyDefaultMigrations(p) {
+  if ((p._defaults || 0) >= PREF_DEFAULTS_VERSION) return;
+  for (const id of FORCED_ON_V2) {
+    const el = $(id);
+    if (el && !el.disabled) el.checked = true;
+  }
+  savePrefs();
 }
 
 function wirePrefPersistence() {
