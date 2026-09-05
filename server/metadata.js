@@ -17,7 +17,9 @@ const SYSTEM_PROMPT = `당신은 한국 유튜브 채널의 메타데이터 카�
 
 - titles: 제목 후보 5개. 각 30자 이하, 클릭 유도하되 낚시는 금지.
 - one_liner: 영상을 한 줄로 요약. 40자 이하, 마침표 없이.
-- intro: 집/영상 소개 2~4문장. 설명글 맨 위에 들어갑니다.
+- intro: 집/영상 소개 2~4문장. one_liner 바로 아래에 이어 붙으므로, one_liner 에
+  쓴 표현과 숫자를 되풀이하지 마세요. 요약이 "무엇인지"를 말했다면 소개는 그
+  다음에 궁금할 것(내부 구성, 실제로 확인한 것, 특이점)을 말합니다.
 - spec: 영상에 나온 집의 제원. 각 항목은 문자열이며, 자막에서 확인되지 않으면
   반드시 빈 문자열("")로 둡니다. 추측해서 채우지 마세요.
     area_pyeong  평수 숫자만 (예: "10")
@@ -150,61 +152,102 @@ function normalize(data) {
 //   #해시태그 안에 빈 값이 있으면 그 태그만 지운다
 //   그 밖에는 빈 문자열로 바꾸고, 마지막에 연속 빈 줄을 정리한다
 export function fillDescriptionTemplate(template, vars) {
-  const missing = new Set(
-    Object.entries(vars).filter(([, v]) => !String(v ?? "").trim()).map(([k]) => k)
-  );
-
-  const isBullet = (l) => /^\s*[·•-]\s/.test(l);
   const isRule = (l) => /^[\s━─=_-]+$/.test(l) && l.trim().length > 2;
-  const dropped = (l) => [...missing].some((k) => l.includes(`{${k}}`));
+  const value = (k) => String(vars[k] ?? "").trim();
+  const placeholders = (l) => [...l.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
 
-  // 1) 값이 빈 항목 줄을 버린다.
-  const kept = String(template).split("\n").filter((l) => !(isBullet(l) && dropped(l)));
-
-  // 2) 항목이 하나도 안 남은 소제목은 같이 버린다. "📍 이 집 정보" 만 덩그러니
-  //    남고 그 아래가 비어 있으면 그게 더 이상해 보인다.
-  const orig = String(template).split("\n");
-  const headersToDrop = new Set();
-  for (let i = 0; i < orig.length; i++) {
-    if (!isBullet(orig[i])) continue;
-    let j = i;
-    while (j < orig.length && isBullet(orig[j])) j++;
-    const block = orig.slice(i, j);
-    if (block.every(dropped)) {
-      // 블록 바로 위의 비어 있지 않은 줄이 소제목이면 그것도 지운다.
-      for (let k = i - 1; k >= 0; k--) {
-        if (!orig[k].trim()) continue;
-        if (!isRule(orig[k])) headersToDrop.add(orig[k]);
-        break;
-      }
+  // 1) 빈 값이 낀 해시태그는 그 태그만 지운다. 줄 단위로 지우면 옆에 붙은
+  //    멀쩡한 태그까지 같이 날아간다.
+  const stripTags = (l) => {
+    let s = l;
+    for (const k of placeholders(l)) {
+      if (!value(k)) s = s.replace(new RegExp(`#\\S*\\{${k}\\}\\S*\\s?`, "g"), "");
     }
-    i = j;
-  }
-  const lines = kept.filter((l) => !headersToDrop.has(l));
+    return s;
+  };
 
-  let out = lines.join("\n");
-  // 빈 값이 낀 해시태그 제거 (#{평수}평주택 → 통째로).
-  for (const k of missing) {
-    out = out.replace(new RegExp(`#\\S*\\{${k}\\}\\S*\\s?`, "g"), "");
-  }
-  out = out.replace(/\{([^}]+)\}/g, (_, key) => String(vars[key] ?? "").trim());
-  // 치환하면서 생긴 빈 줄 뭉치와, 사이 내용이 사라져 붙어 버린 구분선을 정리한다.
-  return out
+  // 2) 자리표시자가 하나도 값을 못 만든 줄은 버린다.
+  //
+  //    기준을 "치환 후 글자가 남았는가" 로 잡으면 안 된다 — "🔗 문의 : " 나
+  //    "👉 ?h=" 는 링크가 비어도 라벨과 h 가 글자로 남아 살아남는다. 실제로
+  //    그렇게 껍데기만 올라간 적이 있다.
+  //    반대로 "하나라도 비면 줄째 삭제" 도 안 된다 — 평수는 알아냈는데 ㎡ 만 못
+  //    뽑은 면적 줄이 아는 값까지 데리고 사라진다.
+  //    그래서 그 줄의 자리표시자 중 값을 만든 게 하나라도 있으면 남긴다.
+  const substitute = (l) => l.replace(/\{([^}]+)\}/g, (_, k) => value(k));
+
+  const orig = String(template).split("\n");
+  const stripped = orig.map(stripTags);
+  const rendered = stripped.map(substitute);
+  const keep = stripped.map((l) => {
+    const keys = placeholders(l);
+    if (keys.length === 0) return true;                 // 고정 문구는 그대로
+    return keys.some((k) => value(k));
+  });
+
+  // 3) 값이 들어갈 줄이 전부 사라진 덩어리는 제목까지 통째로 버린다. 안 그러면
+  //    "📍 이 집 정보" 나 "📮 촬영 요청 · 협업 문의" 만 덩그러니 남는다.
+  //
+  //    두 가지 크기로 본다. 빈 줄로 나뉜 문단 단위로 한 번 — 해시태그처럼 같은
+  //    구역에 있지만 상관없는 줄까지 데려가지 않기 위해서다. 그다음 구분선으로
+  //    나뉜 구역 단위로 한 번 — 링크가 다 빠진 안내 구역은 자리표시자가 없는
+  //    안내 문구까지 같이 사라져야 말이 되기 때문이다.
+  //    자리표시자가 아예 없는 덩어리(채널 소개 문구 등)는 어느 쪽에도 안 걸린다.
+  const dropEmptyGroups = (isBoundary) => {
+    let start = 0;
+    for (let i = 0; i <= orig.length; i++) {
+      if (i < orig.length && !isBoundary(orig[i])) continue;
+      const idx = [];
+      for (let j = start; j < i; j++) if (placeholders(stripped[j]).length) idx.push(j);
+      if (idx.length && idx.every((j) => !keep[j])) {
+        for (let j = start; j < i; j++) keep[j] = false;
+      }
+      start = i + 1;
+    }
+  };
+  dropEmptyGroups((l) => !l.trim());
+  dropEmptyGroups(isRule);
+
+  return rendered
+    .filter((_, i) => keep[i])
+    .join("\n")
     .replace(/[ \t]+$/gm, "")
     .replace(/\n{3,}/g, "\n\n")
+    // 사이 내용이 사라져 붙어 버린 구분선을 하나로 합친다.
     .replace(/^([\s━─=_-]{3,})(?:\n+[\s━─=_-]{3,})+$/gm, "$1")
     .replace(/\n{3,}/g, "\n\n")
+    // 줄이 빠지면서 구분선에 본문이 달라붙는다. 한 줄 띄워 원래 리듬을 되돌린다.
+    .replace(/^([━─=_-]{3,})\n(?!\n)/gm, "$1\n\n")
     .trim();
 }
 
 // 템플릿에 넣을 값들. 채널 고정값(링크·이메일)은 호출자가 넘긴다.
+const PYEONG_TO_M2 = 3.305785;
+
+// 평과 ㎡ 는 서로 계산되는 값이다. 한쪽만 들렸다고 면적 줄을 통째로 버리면
+// 아는 값까지 같이 사라진다 — 실제로 "10평" 을 알아낸 영상에서 ㎡ 를 못 뽑아
+// 면적 줄이 사라졌다. 추측이 아니라 환산이므로 채워도 된다.
+function deriveArea(spec = {}) {
+  const num = (v) => {
+    const n = parseFloat(String(v || "").replace(/[^\d.]/g, ""));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const py = num(spec.areaPyeong);
+  const m2 = num(spec.areaM2);
+  return {
+    pyeong: spec.areaPyeong || (m2 ? String(Math.round(m2 / PYEONG_TO_M2)) : ""),
+    m2: spec.areaM2 || (py ? String(Math.round(py * PYEONG_TO_M2)) : ""),
+  };
+}
+
 export function descriptionVarsFrom(meta, channel = {}) {
   const ch = meta.chapters || [];
+  const area = deriveArea(meta.spec);
   return {
     한줄요약: meta.oneLiner || "",
     집소개: meta.intro || "",
-    평수: meta.spec?.areaPyeong || "",
-    제곱미터: meta.spec?.areaM2 || "",
+    평수: area.pyeong,
+    제곱미터: area.m2,
     공법: meta.spec?.method || "",
     구성: meta.spec?.composition || "",
     가격: meta.spec?.price || "",
