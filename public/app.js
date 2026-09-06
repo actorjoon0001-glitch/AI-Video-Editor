@@ -1724,11 +1724,9 @@ const JOB_STAGE_ICON = {
 
 async function runQueueModePipeline() {
   if (pickedFiles.length === 0) return;
-  if (pickedFiles.length > 1) {
-    throw new Error(
-      "큐 모드는 단일 영상만 지원합니다. 다중 영상은 일반 모드에서 자동 병합 후 시도하세요."
-    );
-  }
+  // 예전엔 여기서 다중 영상을 막고 "일반 모드에서 병합하라" 고 안내했다. 그
+  // 일반 모드는 브라우저 ffmpeg 라 큰 파일에서 못 쓰는 길이라 실질적으로 막힌
+  // 것이나 같았다. 이제 클립을 각각 올린 뒤 서버가 이어 붙인다.
   if (!BACKEND_URL) throw new Error("백엔드 URL 미설정");
 
   runBtn.disabled = true;
@@ -2073,6 +2071,27 @@ const CHUNK_RETRIES = 5;
 const CHUNK_UPLOAD_THRESHOLD_MB = 200;
 
 async function uploadJobChunked(file, options, totalMb) {
+  const { uploadId, started } = await uploadFileChunked(file, totalMb);
+  setStatus("큐 모드: 업로드 완료 — 서버가 작업을 등록하는 중...");
+  const done = await fetch(`${BACKEND_URL}/api/uploads/${uploadId}/complete`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ options }),
+  });
+  if (!done.ok) {
+    const t = await done.text().catch(() => "");
+    throw new Error(`작업 등록 실패 (HTTP ${done.status}): ${t.slice(0, 200)}`);
+  }
+  const body = await done.json();
+  if (!body.jobId) throw new Error("서버 응답에 jobId 가 없습니다.");
+  appendLog(`업로드 완료 — ${((Date.now() - started) / 1000).toFixed(0)}초, 평균 ${(file.size / 1024 / 1024 / ((Date.now() - started) / 1000)).toFixed(1)} MB/s`);
+  return body;
+}
+
+// 파일 하나를 조각으로 올리고 uploadId 만 돌려준다. 작업 등록과 나눠 둔 이유는
+// 여러 클립을 이어 붙일 때 — 전부 올라간 뒤에야 합칠 수 있기 때문이다.
+// label 은 "(2/3) " 처럼 몇 번째 클립인지 진행 문구에 붙이는 용도다.
+async function uploadFileChunked(file, totalMb, label = "") {
   const started = Date.now();
   const create = await fetch(`${BACKEND_URL}/api/uploads`, {
     method: "POST",
@@ -2150,20 +2169,7 @@ async function uploadJobChunked(file, options, totalMb) {
     setBar(10 + pct * 0.2);
   }
 
-  setStatus("큐 모드: 업로드 완료 — 서버가 작업을 등록하는 중...");
-  const done = await fetch(`${BACKEND_URL}/api/uploads/${uploadId}/complete`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ options }),
-  });
-  if (!done.ok) {
-    const t = await done.text().catch(() => "");
-    throw new Error(`작업 등록 실패 (HTTP ${done.status}): ${t.slice(0, 200)}`);
-  }
-  const body = await done.json();
-  if (!body.jobId) throw new Error("서버 응답에 jobId 가 없습니다.");
-  appendLog(`업로드 완료 — ${((Date.now() - started) / 1000).toFixed(0)}초, 평균 ${(file.size / 1024 / 1024 / ((Date.now() - started) / 1000)).toFixed(1)} MB/s`);
-  return body;
+  return { uploadId, started };
 }
 
 function makeInitialJobState(jobId) {
@@ -3896,6 +3902,10 @@ function renderStats({ inputDuration, outputDuration, cutTime, cuts, ratio, spee
 
 function onError(err) {
   console.error(err);
+  // 오류 문구는 진행 패널 안에 쓰인다. 패널이 닫혀 있으면 아무것도 안 보이고
+  // 버튼만 안 먹는 것처럼 된다 — 실제로 ReferenceError 하나가 그렇게 조용히
+  // 사라졌다. 무슨 일이 있어도 오류는 화면에 남아야 한다.
+  if (progress) progress.hidden = false;
   // 브라우저의 NotReadableError 원문은 "permission problems" 라고만 해서 실제 원인
   // (파일이 너무 크거나, 외장/네트워크 드라이브가 끊겼거나, 파일이 바뀜)을 알 수 없다.
   const name = err?.name || "";
