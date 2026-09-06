@@ -155,6 +155,7 @@ function healthBody() {
       { method: "PUT",  path: "/api/uploads/:id" },
       { method: "DELETE", path: "/api/uploads/:id" },
       { method: "POST", path: "/api/uploads/:id/complete" },
+      { method: "POST", path: "/api/uploads/merge" },
       { method: "GET",  path: "/api/jobs" },
       { method: "GET",  path: "/api/jobs/:id" },
       { method: "POST", path: "/api/jobs/:id/stages/:stage/retry" },
@@ -1043,6 +1044,86 @@ app.get("/api/jobs", async (req, res) => {
     res.status(502).json({ error: String(e?.message || e) });
   }
 });
+
+// 여러 클립을 이어 붙여 하나의 작업으로 만든다.
+//
+// 화면은 예전부터 "업로드 순서대로 자동 병합됩니다" 라고 적어 뒀지만, 그 병합은
+// 브라우저 ffmpeg 경로에만 있었다. 큐 모드는 pickedFiles[0] 하나만 보내서,
+// 세 개를 고르면 조용히 첫 번째만 편집됐다 — 약속이 지켜지지 않는 쪽이 더 나쁘다.
+app.post("/api/uploads/merge", express.json({ limit: "4mb" }), async (req, res) => {
+  const ids = (Array.isArray(req.body?.uploadIds) ? req.body.uploadIds : [])
+    .map((v) => String(v).replace(/[^a-f0-9-]/gi, ""))
+    .filter(Boolean);
+  if (ids.length < 2) return res.status(400).json({ error: "합칠 업로드가 2개 이상 필요합니다." });
+
+  const parts = [];
+  for (const uid of ids) {
+    const u = await findUpload(uid);
+    if (!u) return res.status(404).json({ error: `업로드 세션을 찾을 수 없습니다 (${uid}).` });
+    if (u.received !== u.total) {
+      return res.status(400).json({ error: `아직 다 올라오지 않았습니다 (${uid}).` });
+    }
+    parts.push(u);
+  }
+
+  const id = randomUUID();
+  const merged = path.join(TMP, `${id}.upload`);
+  try {
+    await concatVideos(parts.map((p) => p.path), merged);
+  } catch (e) {
+    console.error(`[merge ${id}] 실패:`, e);
+    try { await unlink(merged); } catch {}
+    return res.status(500).json({ error: `영상을 이어 붙이지 못했습니다: ${String(e?.message || e).slice(0, 300)}` });
+  }
+
+  // 조각 원본은 합친 뒤에는 필요 없다. 합본이 곧 이 작업의 원본이다.
+  for (const uid of ids) uploads.delete(uid);
+  await Promise.all(parts.flatMap((p) => [
+    unlink(p.path).catch(() => {}),
+    unlink(`${p.path}.json`).catch(() => {}),
+  ]));
+
+  const safeOpts = sanitizeJobOptions(req.body?.options || {});
+  const job = newPipelineJob(id, safeOpts);
+  job.sourceName = parts.map((p) => p.name).filter(Boolean).join(" + ") ||
+    `${parts.length}개 영상 병합`;
+  pipelineJobs.set(id, job);
+  saveJob(job);
+  const mb = (await stat(merged)).size / 1024 / 1024;
+  console.log(`[merge ${id}] ${parts.length}개 → ${mb.toFixed(1)}MB`);
+
+  res.status(202).json({ jobId: id, statusUrl: `/api/jobs/${id}`, pollIntervalMs: 3000 });
+  enqueueJob(id, merged);
+});
+
+// 같은 카메라로 이어 찍은 클립이면 재인코딩 없이 붙는다 (-c copy). 코덱이나
+// 해상도가 다르면 concat demuxer 가 거부하므로, 그때만 다시 인코딩한다 —
+// 되는 경우까지 항상 재인코딩하면 몇 분씩 그냥 버리게 된다.
+async function concatVideos(inputs, out) {
+  const listPath = `${out}.list.txt`;
+  await writeFile(
+    listPath,
+    inputs.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"),
+    "utf8"
+  );
+  const base = ["-nostdin", "-f", "concat", "-safe", "0", "-i", listPath];
+  // 결과 파일 이름은 <id>.upload 다 — 확장자가 없으니 ffmpeg 가 컨테이너를
+  // 못 고르고 "Error initializing the muxer" 로 끝난다. 형식을 직접 지정한다.
+  const tail = ["-f", "mp4", "-movflags", "+faststart", "-y", out];
+  try {
+    await runFFmpeg([...base, "-c", "copy", ...tail]);
+  } catch (e) {
+    console.warn(`[merge] 무손실 병합 실패 — 다시 인코딩합니다: ${e?.message || e}`);
+    await runFFmpeg([
+      ...base,
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+      "-c:a", "aac", "-b:a", "160k",
+      ...tail,
+    ]);
+  } finally {
+    await unlink(listPath).catch(() => {});
+  }
+}
 
 app.get("/api/jobs/:id", async (req, res) => {
   const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
