@@ -752,6 +752,9 @@ function sanitizeStageResult(name, result) {
       url: result.url,
       sizeBytes: result.sizeBytes,
       durationMs: result.durationMs,
+      quality: result.quality || null,
+      downgradedFrom: result.downgradedFrom || null,
+      sourceHeight: result.sourceHeight || null,
     };
   }
   if (name === "transcribe") {
@@ -1619,7 +1622,7 @@ async function runJobPipeline(id, inputPath) {
     const expectedSec = keptSec / (job.options.speed || 1);
     job.stages.edit.progress = { outTimeSec: 0, totalSec: expectedSec, pct: 0 };
 
-    await processVideo(inputPath, editedPath, job.options, {
+    const enc = await processVideo(inputPath, editedPath, job.options, {
       // 5분 동안 ffmpeg 가 진행 신호를 하나도 못 내면 멎은 것으로 보고 중단한다.
       // 이게 없으면 프론트가 30분 타임아웃까지 "running" 만 보고 있게 된다.
       timeoutMs: 5 * 60 * 1000,
@@ -1630,6 +1633,8 @@ async function runJobPipeline(id, inputPath) {
         job.stages.edit.progress = { outTimeSec, totalSec: expectedSec, pct };
       },
     });
+    // 요청한 화질보다 낮게 뽑혔으면 뒤따르는 번인도 같은 CRF 를 써야 한다.
+    job.options.quality = enc.quality;
     const sizeBytes = (await stat(editedPath)).size;
     return {
       _path: editedPath,
@@ -1639,6 +1644,10 @@ async function runJobPipeline(id, inputPath) {
       url: `/api/jobs/${id}/files/edited.mp4`,
       sizeBytes,
       durationMs: Date.now() - t0,
+      quality: enc.quality,
+      // 원본보다 큰 화질을 골랐으면 조용히 내리지 말고 그 사실을 남긴다.
+      downgradedFrom: enc.quality !== enc.requestedQuality ? enc.requestedQuality : null,
+      sourceHeight: enc.sourceHeight || null,
     };
   });
 
@@ -2199,6 +2208,30 @@ function probeDurationSec(file) {
   });
 }
 
+// 원본이 "몇 p" 인지. 세로로 찍은 영상은 height 가 긴 쪽이라 그것만 보면
+// 1080x1920 짜리를 1920p 로 오해한다 — 720p/1080p 는 늘 짧은 변 기준이다.
+// 못 읽으면 0 을 돌려준다. 여기서 실패했다고 인코딩까지 막을 이유는 없고,
+// 0 이면 화질을 낮추지 않고 요청대로 간다.
+function probeVideoHeight(file) {
+  return new Promise((resolve) => {
+    const p = spawn("ffprobe", [
+      "-v", "error",
+      "-select_streams", "v:0",
+      "-show_entries", "stream=width,height",
+      "-of", "csv=p=0",
+      file,
+    ], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    p.stdout.on("data", (d) => { out += d.toString(); });
+    p.on("error", () => resolve(0));
+    p.on("exit", (code) => {
+      if (code !== 0) return resolve(0);
+      const [w, h] = out.trim().split("\n")[0].split(",").map((n) => parseInt(n, 10) || 0);
+      resolve(w && h ? Math.min(w, h) : 0);
+    });
+  });
+}
+
 const server = app.listen(PORT, () => {
   console.log(`AI Video Editor backend listening on :${PORT}`);
   console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
@@ -2253,7 +2286,14 @@ const SELECT_FILTER_THRESHOLD = 30;
 
 async function processVideo(input, output, opts, { onProgress, timeoutMs } = {}) {
   const { keeps, ratio, speed, loudnorm } = opts;
-  const quality = QUALITY_SIZES[opts.quality] ? opts.quality : "1080p";
+  const asked = QUALITY_SIZES[opts.quality] ? opts.quality : "1080p";
+  // 원본보다 큰 화질을 고르면 여기서 내린다. 안 그러면 없는 화질을 만드느라
+  // 몇 시간을 더 쓰고 결과는 똑같다.
+  const sourceHeight = await probeVideoHeight(input);
+  const quality = capQualityToSource(asked, sourceHeight);
+  if (quality !== asked) {
+    console.log(`[encode] 원본 ${sourceHeight}p — ${asked} 요청을 ${quality} 로 낮춥니다 (확대해도 화질은 안 늘어납니다).`);
+  }
 
   const ratioFilter = ratioToFilter(ratio, quality);
   let filter;
@@ -2322,14 +2362,41 @@ async function processVideo(input, output, opts, { onProgress, timeoutMs } = {})
   ];
 
   await runFFmpeg(args, { onProgress, timeoutMs });
+  // 실제로 쓴 화질을 돌려준다 — 요청과 다를 수 있고, 다르면 화면에 알려야 한다.
+  return { quality, requestedQuality: asked, sourceHeight };
 }
 
 // 출력 해상도표. 세로 기준(720p/1080p)으로 비율마다 목표 크기를 잡는다.
 const QUALITY_SIZES = {
-  "720p":  { "16:9": [1280, 720],  "9:16": [720, 1280],   "1:1": [720, 720] },
-  "1080p": { "16:9": [1920, 1080], "9:16": [1080, 1920],  "1:1": [1080, 1080] },
+  "720p":  { "16:9": [1280, 720],   "9:16": [720, 1280],   "1:1": [720, 720] },
+  "1080p": { "16:9": [1920, 1080],  "9:16": [1080, 1920],  "1:1": [1080, 1080] },
+  "1440p": { "16:9": [2560, 1440],  "9:16": [1440, 2560],  "1:1": [1440, 1440] },
+  "4k":    { "16:9": [3840, 2160],  "9:16": [2160, 3840],  "1:1": [2160, 2160] },
 };
-const QUALITY_CRF = { "720p": 21, "1080p": 20 };
+// 해상도가 올라가면 같은 CRF 에서도 눈에 보이는 결점이 줄어든다. 한 단계마다
+// 1 씩 올려서 파일 크기와 인코딩 시간을 아낀다.
+const QUALITY_CRF = { "720p": 21, "1080p": 20, "1440p": 21, "4k": 22 };
+
+// 화질 순서. 원본보다 큰 값을 고르면 이 순서를 따라 내려간다.
+const QUALITY_ORDER = ["720p", "1080p", "1440p", "4k"];
+
+// 원본에 없는 화질은 만들어 낼 수 없다.
+//
+// 1080p 로 찍은 걸 4K 로 뽑으면 픽셀만 늘어나고 화질은 그대로인데, 인코딩은
+// 세 배 가까이 오래 걸린다 — 10분짜리면 두 시간을 더 태우고 얻는 게 없다.
+// 그래서 원본 세로 해상도를 넘는 선택은 조용히 한 단계씩 낮춘다.
+function capQualityToSource(quality, sourceHeight) {
+  if (!sourceHeight || !QUALITY_SIZES[quality]) return quality;
+  let q = quality;
+  for (;;) {
+    const target = Math.min(...QUALITY_SIZES[q]["16:9"]);
+    // 살짝 모자란 원본(1080p 라고 하지만 1078px 같은 경우)까지 내리지는 않는다.
+    if (target <= sourceHeight * 1.02) return q;
+    const i = QUALITY_ORDER.indexOf(q);
+    if (i <= 0) return q;
+    q = QUALITY_ORDER[i - 1];
+  }
+}
 
 function ratioToFilter(ratio, quality = "1080p") {
   const table = QUALITY_SIZES[quality] || QUALITY_SIZES["1080p"];

@@ -170,8 +170,34 @@ function bindChips(attr, key) {
           document.querySelector('[data-ratio="9:16"]').click();
         }
       }
+      if (attr === "quality") renderQualityHint();
     });
   });
+}
+
+// 화질을 올리면 얼마나 더 걸리는지 미리 말해 준다.
+//
+// 숫자는 렌더와 같은 조건(CPU 1개)에서 4K 원본으로 잰 값이다 — 편집 인코딩과
+// 자막 번인을 합친 배수. 4K 를 눌러 놓고 몇 시간 뒤에야 알게 되면 늦다.
+const QUALITY_COST = {
+  "720p":  { x: 3.3, label: "가장 빠름" },
+  "1080p": { x: 5.3, label: "권장" },
+  "1440p": { x: 8.4, label: "1080p 보다 약 1.6배 오래" },
+  "4k":    { x: 15.0, label: "1080p 보다 약 3배 오래" },
+};
+
+function renderQualityHint() {
+  const el = $("qualityHint");
+  if (!el) return;
+  const c = QUALITY_COST[state.quality];
+  if (!c) { el.textContent = ""; return; }
+  // 10분 영상 기준으로 환산해서 보여준다 — 배수만 말하면 감이 안 온다.
+  const mins = Math.round((10 * c.x) / 5) * 5;
+  el.innerHTML =
+    `* ${c.label} — 10분 영상 기준 서버 처리 약 <b>${mins}분</b> (편집 + 자막 번인, 자막 인식 시간 별도).` +
+    (state.quality === "1440p" || state.quality === "4k"
+      ? " 원본이 그보다 낮으면 자동으로 낮춰서 뽑습니다 — 없는 화질은 만들어지지 않고 시간만 더 듭니다."
+      : "");
 }
 bindChips("preset", "preset");
 bindChips("ratio", "ratio");
@@ -2245,7 +2271,12 @@ function jobStageDetailText(key, s) {
     if (key === "edit") {
       const mb = s.result.sizeBytes ? ` · ${(s.result.sizeBytes / 1024 / 1024).toFixed(1)} MB` : "";
       const t = s.result.durationMs ? ` · ${(s.result.durationMs / 1000).toFixed(1)}s` : "";
-      return `완료${mb}${t}`;
+      const q = s.result.quality ? ` · ${s.result.quality}` : "";
+      // 요청한 화질보다 낮게 나왔으면 그 이유까지 — 조용히 다르면 버그로 보인다.
+      const down = s.result.downgradedFrom
+        ? ` (원본이 ${s.result.sourceHeight}p 라 ${s.result.downgradedFrom} → ${s.result.quality})`
+        : "";
+      return `완료${q}${down}${mb}${t}`;
     }
     if (key === "transcribe") {
       return `${s.result.segmentCount || 0}줄 · ${s.result.language || "?"} · ${((s.result.durationMs || 0) / 1000).toFixed(1)}s`;
@@ -3045,6 +3076,7 @@ function restorePrefs() {
   // 큐 모드 카드 표시 여부는 change 리스너가 정하므로, 복원 후 한 번 알린다.
   $("queueMode")?.dispatchEvent(new Event("change", { bubbles: true }));
   renderSubtitleStylePreview();
+  renderQualityHint();
 }
 
 // 기본값을 바꿔도, 이미 저장된 설정이 있는 브라우저에는 영영 닿지 않는다.
@@ -3665,8 +3697,10 @@ function atempoChain(speed) {
 // 백엔드 server/index.js 의 같은 이름 함수와 표를 맞춰 둔다 — 어느 경로로
 // 처리하든 같은 옵션이면 같은 해상도가 나와야 한다.
 const QUALITY_SIZES = {
-  "720p":  { "16:9": [1280, 720],  "9:16": [720, 1280],  "1:1": [720, 720] },
-  "1080p": { "16:9": [1920, 1080], "9:16": [1080, 1920], "1:1": [1080, 1080] },
+  "720p":  { "16:9": [1280, 720],   "9:16": [720, 1280],   "1:1": [720, 720] },
+  "1080p": { "16:9": [1920, 1080],  "9:16": [1080, 1920],  "1:1": [1080, 1080] },
+  "1440p": { "16:9": [2560, 1440],  "9:16": [1440, 2560],  "1:1": [1440, 1440] },
+  "4k":    { "16:9": [3840, 2160],  "9:16": [2160, 3840],  "1:1": [2160, 2160] },
 };
 
 function ratioToFilter(ratio, quality) {
