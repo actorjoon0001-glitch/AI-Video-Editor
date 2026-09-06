@@ -1740,9 +1740,10 @@ const STAGE_LABELS = [
   ["edit",       "1. 편집 (cut + ratio + speed + loudnorm)"],
   ["transcribe", "2. 자막 (Whisper)"],
   ["burn",       "3. 자막 번인"],
-  ["thumbnail",  "4. 썸네일 추출"],
-  ["metadata",   "5. 메타데이터 (제목/설명/태그)"],
-  ["upload",     "6. YouTube 업로드"],
+  ["shorts",     "4. 세로본 (릴스 · 틱톡)"],
+  ["thumbnail",  "5. 썸네일 추출"],
+  ["metadata",   "6. 메타데이터 (제목/설명/태그)"],
+  ["upload",     "7. YouTube 업로드"],
 ];
 const JOB_STAGE_ICON = {
   queued: "·", running: "⏳", done: "✓", failed: "✗", skipped: "⊘", review: "✋",
@@ -2288,6 +2289,13 @@ function jobStageDetailText(key, s) {
       const mb = s.result.sizeBytes ? ` · ${(s.result.sizeBytes / 1024 / 1024).toFixed(1)} MB` : "";
       return `자막 합성 완료${mb} · ${((s.result.durationMs || 0) / 1000).toFixed(1)}s`;
     }
+    if (key === "shorts") {
+      const r = s.result;
+      const from = fmtClock(r.startSec || 0);
+      return `${from} 부터 ${Math.round(r.lengthSec || 0)}초 · ` +
+        `${r.fit === "crop" ? "좌우 잘라내기" : "흐린 배경"}` +
+        `${r.withSubtitles ? " · 자막 포함" : " · 자막 없음"}`;
+    }
     if (key === "metadata") {
       const via = s.result.source === "claude" ? `Claude(${s.result.model})` : "로컬 키워드 분석";
       return `제목 후보 ${s.result.titles?.length || 0}개 · 태그 ${s.result.tags?.length || 0}개 · ${via}`;
@@ -2383,6 +2391,7 @@ async function wireQueueResults(job) {
     burnedBtn.classList.remove("disabled");
     burnedBtn.removeAttribute("aria-disabled");
   }
+  renderShorts(job.stages.shorts);
   renderReview(job);
   renderMetadata(job.stages.metadata, job.stages.upload);
   // 서버가 무음을 찾았으면 그 결과로 타임라인을 그린다 (브라우저는 분석을 안 했다).
@@ -2501,6 +2510,32 @@ async function applySubtitleEdits() {
     appendLog("자막 교정본 적용");
   } catch (e) {
     status.textContent = `적용 실패: ${e?.message || e}`;
+  }
+}
+
+// 세로본 — 릴스·틱톡에 올릴 9:16 결과물. 어느 구간을 골랐는지까지 보여야
+// "왜 하필 저 장면이지" 를 눌러 보지 않고도 판단할 수 있다.
+function renderShorts(stage) {
+  const block = $("shortsBlock");
+  if (!block) return;
+  const r = stage?.status === "done" ? stage.result : null;
+  if (!r?.url) { block.hidden = true; return; }
+  block.hidden = false;
+
+  const v = $("shortsVideo");
+  if (v) { v.src = BACKEND_URL + r.url; v.load(); }
+  const dl = $("shortsDownloadBtn");
+  if (dl) dl.href = BACKEND_URL + r.url;
+
+  const hint = $("shortsHint");
+  if (hint) hint.textContent = `1080×1920 · ${((r.sizeBytes || 0) / 1024 / 1024).toFixed(1)} MB`;
+  const note = $("shortsNote");
+  if (note) {
+    note.textContent = [
+      `본편 ${fmtClock(r.startSec || 0)} 부터 ${Math.round(r.lengthSec || 0)}초`,
+      r.fit === "crop" ? "좌우를 잘라 꽉 채움" : "화면 전체 유지 (배경 흐림)",
+      r.withSubtitles ? "자막 포함" : "자막 없음",
+    ].join(" · ");
   }
 }
 
@@ -2781,6 +2816,9 @@ function rerunOptions() {
     glossary: $("glossary")?.value?.trim() || "",
     subtitleStyle: subtitleStyleFromUI(),
     burn: $("burnSubtitles")?.checked === true,
+    shorts: $("makeShorts")?.checked === true,
+    shortsLengthSec: parseInt($("shortsLength")?.value, 10) || 60,
+    shortsFit: $("shortsFit")?.value || "blur",
     metadata: $("genMetadata")?.checked === true,
     metadataPersona: $("metaPersona")?.value?.trim() || "",
     descriptionTemplate: $("descTemplate")?.value || "",
@@ -3017,13 +3055,15 @@ async function openArchivedJob(jobId) {
 const PREFS_KEY = "aive.prefs.v1";
 const PREF_CHECKBOXES = [
   "queueMode", "autoSubtitles", "burnSubtitles",
-  "genMetadata", "ytUpload", "ytReview", "loudnorm", "safeMode", "subBold", "silenceAuto",
+  "genMetadata", "ytUpload", "ytReview", "makeShorts",
+  "loudnorm", "safeMode", "subBold", "silenceAuto",
 ];
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol",
   "subFontSize", "subMarginV", "subBoxOpacity", "subOutline"];
 const PREF_TEXTS = ["metaPersona", "ytPrivacy", "whisperModel", "glossary",
   "subColor", "subBackground", "subBoxColor", "subFont", "subOutlineColor",
-  "descTemplate", "chInquiry", "chCatalog", "chEmail", "chInstagram", "chHouseNo"];
+  "descTemplate", "chInquiry", "chCatalog", "chEmail", "chInstagram", "chHouseNo",
+  "shortsLength", "shortsFit"];
 const PREF_CHIPS = ["preset", "ratio", "quality", "mode", "speed", "filler"];
 
 function readPrefs() {

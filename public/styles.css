@@ -437,11 +437,23 @@ a { color: inherit; }
 }
 
 /* Thumbnails */
+/* 세로본 — 미리보기가 세로라 옆에 설명을 세운다 */
+.shorts-row { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+.shorts-video {
+  width: 240px;
+  aspect-ratio: 9 / 16;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  background: #000;
+}
+.shorts-side { flex: 1 1 220px; display: grid; gap: 10px; align-content: start; }
+
 .thumbs-block,
 .edit-plan,
 .subtitle-debug,
 .meta-block,
 .review-block,
+.shorts-block,
 .job-pipeline {
   margin-top: 24px;
   padding-top: 20px;
