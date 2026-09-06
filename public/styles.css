@@ -15,6 +15,13 @@
   --danger: #ff7a7a;
   --shadow-lg: 0 24px 80px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.3);
+  /* 화면 폭에 맞춰 늘어나는 본문 상한. 1560px 로 묶어 두면 넓은 모니터에서
+     양옆이 수백 px 씩 비고, 정작 미리보기와 타임라인은 좁게 나온다. */
+  --shell-max: 1560px;
+}
+
+@media (min-width: 1700px) {
+  :root { --shell-max: min(2600px, 96vw); }
 }
 
 * { box-sizing: border-box; }
@@ -171,7 +178,7 @@ a { color: inherit; }
 /* ── 작업대 레이아웃 ──────────────────────────────────────────────────── */
 /* 개인용 단일 화면 도구. 왼쪽은 소스+설정(스티키), 오른쪽은 진행+결과. */
 .wb {
-  max-width: 1560px;
+  max-width: var(--shell-max);
   margin: 0 auto;
   padding: 20px 24px 64px;
   display: grid;
@@ -181,6 +188,13 @@ a { color: inherit; }
 }
 
 .wb-col { min-width: 0; }
+
+/* 넓은 화면에서는 설정 열을 조금 넓히고 미리보기를 더 크게 쓴다. 남는 폭을
+   빈 여백으로 두는 것보다 실제로 보는 것(영상·컷 타임라인)에 주는 게 낫다. */
+@media (min-width: 1700px) {
+  .wb { grid-template-columns: minmax(400px, 520px) minmax(0, 1fr); gap: 28px; }
+  .result video { max-height: min(70vh, 760px); }
+}
 
 .wb-left {
   position: sticky;
@@ -224,7 +238,7 @@ a { color: inherit; }
 }
 
 .topbar-inner {
-  max-width: 1560px;
+  max-width: var(--shell-max);
   margin: 0 auto;
   padding: 12px 24px;
   display: flex;
@@ -265,7 +279,7 @@ a { color: inherit; }
 .pill[data-state="bad"]::before  { background: var(--danger); }
 
 .backend-panel {
-  max-width: 1560px;
+  max-width: var(--shell-max);
   margin: 0 auto;
   padding: 0 24px 14px;
   display: flex;
