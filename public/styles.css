@@ -441,11 +441,81 @@ a { color: inherit; }
 .edit-plan,
 .subtitle-debug,
 .meta-block,
+.review-block,
 .job-pipeline {
   margin-top: 24px;
   padding-top: 20px;
   border-top: 1px solid var(--border-soft);
 }
+
+/* 업로드 전 검토 — 여기서 확인한 것이 그대로 올라간다. 결과 패널에서 제일
+   먼저 눈에 들어와야 해서 테두리를 준다. */
+.review-block {
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  padding: 18px;
+  background: rgba(255, 255, 255, .02);
+}
+
+/* minmax(0, 1fr) 이어야 한다. 그냥 1fr 은 최소값이 min-content 라, 안에 있는
+   썸네일 격자가 칸보다 넓어지면 칸 밖으로 삐져나가 옆 칸을 덮는다. */
+.review-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 22px;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 900px) {
+  .review-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+.review-side {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  align-content: start;
+}
+.review-side > * { min-width: 0; }
+.review-side label { font-size: 12px; color: var(--muted); display: grid; gap: 6px; }
+.review-side textarea { resize: vertical; min-height: 180px; }
+
+.review-card-img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  background: #000;
+}
+
+.review-frames {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 8px;
+}
+
+.review-frames img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  cursor: pointer;
+  opacity: .65;
+  transition: opacity .15s ease, border-color .15s ease;
+}
+
+.review-frames img:hover { opacity: 1; }
+.review-frames img.picked { border-color: var(--accent); opacity: 1; }
+
+.review-lines {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.review-count { color: var(--muted); font-size: 11px; margin-left: 6px; }
 
 /* YouTube 메타데이터 패널 */
 .meta-field { margin-bottom: 16px; }
@@ -522,7 +592,9 @@ a { color: inherit; }
 .job-stage.done .icon    { color: #34d399; }
 .job-stage.failed .icon  { color: #f87171; }
 .job-stage.skipped .icon { color: #6b7280; }
+.job-stage.review .icon  { color: var(--accent); }
 .job-stage.failed { border-color: rgba(248, 113, 113, 0.4); }
+.job-stage.review { border-color: var(--accent); }
 
 /* 자막 진단 패널 — 단계별 상태 + 사유 */
 .sub-banner {

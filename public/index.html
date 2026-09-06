@@ -227,6 +227,10 @@
             <input type="checkbox" id="ytUpload" checked />
             <span>YouTube 자동 업로드 — 1순위 제목으로 게시</span>
           </label>
+          <label class="toggle">
+            <input type="checkbox" id="ytReview" checked />
+            <span>올리기 전에 검토 — 제목·설명·태그·썸네일을 확인하고 눌러야 업로드</span>
+          </label>
           <label>공개 범위
             <select id="ytPrivacy">
               <option value="private" selected>비공개</option>
@@ -356,6 +360,64 @@
           <a id="srtDownloadBtn" class="btn disabled" download="subtitles.srt" aria-disabled="true" role="button">SRT</a>
           <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT</a>
           <a id="burnedDownloadBtn" class="btn disabled" download="subtitled.mp4" aria-disabled="true" role="button" hidden>자막 번인본</a>
+        </div>
+
+        <!-- 올리기 전에 멈춰 서는 자리. 유튜브는 올린 뒤 영상 파일을 못 바꾸므로,
+             화면이 틀렸다는 걸 알아챌 마지막 기회가 여기다. -->
+        <div class="review-block" id="reviewBlock" hidden>
+          <h4 class="thumbs-title">업로드 전 검토
+            <span class="thumbs-hint">확인하고 버튼을 눌러야 올라갑니다</span>
+          </h4>
+          <div class="review-grid">
+            <div class="review-side">
+              <span class="meta-label">올라갈 썸네일</span>
+              <img class="review-card-img" id="reviewCardImg" alt="썸네일 미리보기" />
+              <p class="hint-row" id="reviewCardNote"></p>
+              <span class="meta-label">배경 사진 고르기</span>
+              <div class="review-frames" id="reviewFrames"></div>
+              <div class="review-lines">
+                <label>1줄<input type="text" id="reviewLine1" maxlength="24" /></label>
+                <label>2줄<input type="text" id="reviewLine2" maxlength="24" /></label>
+                <label>3줄<input type="text" id="reviewLine3" maxlength="24" /></label>
+              </div>
+              <div class="row">
+                <button type="button" class="btn" id="reviewRedraw">썸네일 다시 그리기</button>
+                <label>올릴 썸네일
+                  <select id="reviewThumbPick">
+                    <option value="card">문구 얹은 카드</option>
+                    <option value="raw">고른 사진 그대로</option>
+                    <option value="none">썸네일 넣지 않기</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="review-side">
+              <label>제목 후보
+                <select id="reviewTitlePick"></select>
+              </label>
+              <label>제목 <span class="review-count" id="reviewTitleCount"></span>
+                <input type="text" id="reviewTitle" maxlength="100" />
+              </label>
+              <label>설명 <span class="review-count" id="reviewDescCount"></span>
+                <textarea id="reviewDesc" rows="14" spellcheck="false"></textarea>
+              </label>
+              <label>태그 (쉼표로 구분)
+                <input type="text" id="reviewTags" />
+              </label>
+              <label>공개 범위
+                <select id="reviewPrivacy">
+                  <option value="private">비공개</option>
+                  <option value="unlisted">일부 공개</option>
+                  <option value="public">전체 공개</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div class="run-row">
+            <button type="button" class="btn primary" id="reviewApprove">이대로 업로드</button>
+            <button type="button" class="btn ghost" id="reviewSkip">업로드 안 함</button>
+            <span class="meta-label" id="reviewStatus"></span>
+          </div>
         </div>
 
         <div class="subedit-block" id="subEditBlock" hidden>

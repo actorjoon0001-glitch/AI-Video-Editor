@@ -568,6 +568,8 @@ const RETRYABLE_STAGES = new Set(["transcribe", "burn", "thumbnail", "metadata"]
 
 const pipelineJobs = new Map();   // id → job state
 const PIPELINE_JOB_TTL_MS = 60 * 60 * 1000; // 1h
+// 검토 대기는 사람을 기다리는 중이라 한 시간으로는 부족하다 (원본 보관과 같은 하루).
+const REVIEW_JOB_TTL_MS = 24 * 60 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of pipelineJobs.entries()) {
@@ -577,7 +579,10 @@ setInterval(() => {
     // 산출물도 함께 지워질 수 있었다 — 8GB 원본이면 인코딩만 47분이다.
     if (job.status === "running" || job.status === "queued") continue;
     const t = job.completedAt || job.createdAt;
-    if (now - t > PIPELINE_JOB_TTL_MS) {
+    // 검토 대기는 사람을 기다리는 중이다. 한 시간 만에 치우면 점심 먹고 온
+    // 사이에 확인하려던 영상과 썸네일이 사라진다.
+    const ttl = job.status === "review" ? REVIEW_JOB_TTL_MS : PIPELINE_JOB_TTL_MS;
+    if (now - t > ttl) {
       pipelineJobs.delete(id);
       // 산출물도 같이 정리
       for (const f of job.artifacts || []) {
@@ -672,6 +677,9 @@ function newPipelineJob(id, options) {
 
 function computeJobStatus(job) {
   const states = STAGE_NAMES.map((n) => job.stages[n].status);
+  // "검토 대기" 는 진행 중도 완료도 아니다. running 이라고 하면 화면이 계속
+  // 기다리게 되고, done 이라고 하면 아직 안 올라간 걸 올라갔다고 하게 된다.
+  if (states.includes("review")) return "review";
   if (states.some((s) => s === "running" || s === "queued")) return "running";
   const failed = states.filter((s) => s === "failed").length;
   const done = states.filter((s) => s === "done").length;
@@ -701,10 +709,39 @@ function jobResponse(job) {
     // 원본이 아직 디스크에 있으면 재업로드 없이 다시 만들 수 있다.
     canRerun: Boolean(job.inputPath && existsSync(job.inputPath)),
     options: job.options,
+    review: job.stages.upload?.status === "review" ? reviewResponse(job).review : null,
     stages,
     createdAt: job.createdAt,
     startedAt: job.startedAt,
     completedAt: job.completedAt,
+  };
+}
+
+// 검토 화면이 필요한 것 전부. 카드 URL 은 파일 이름이 늘 같으므로 판 번호를
+// 붙인다 — 안 그러면 문구를 고쳐도 브라우저가 옛 그림을 계속 보여준다.
+function reviewResponse(job) {
+  const rv = job.review;
+  if (!rv) return { review: null };
+  const frames = job.stages.thumbnail?.result?.urls || [];
+  return {
+    review: {
+      title: rv.title,
+      titles: job.stages.metadata?.result?.titles || [],
+      description: rv.description,
+      tags: rv.tags,
+      privacy: rv.privacy,
+      thumbnail: rv.thumbnail,
+      frameIndex: rv.frameIndex,
+      frameUrls: frames,
+      lines: rv.lines,
+      card: rv.card,
+      cardUrl: rv.card && !rv.card.error
+        ? `/api/jobs/${job.id}/files/thumb_card.jpg?v=${rv.cardVersion}`
+        : null,
+      videoUrl: job.stages.burn?.status === "done"
+        ? job.stages.burn.result?.url
+        : job.stages.edit?.result?.url,
+    },
   };
 }
 
@@ -1256,6 +1293,101 @@ app.post("/api/jobs/:id/youtube", express.json({ limit: "1mb" }), async (req, re
   }
 });
 
+// ── 업로드 전 검토 ──────────────────────────────────────────────────────────
+
+function reviewJobOr404(req, res) {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const job = pipelineJobs.get(id);
+  if (!job) {
+    res.status(404).json({ error: "작업을 찾을 수 없거나 만료됐습니다." });
+    return null;
+  }
+  if (!job.review || job.stages.upload?.status !== "review") {
+    res.status(409).json({ error: "이 작업은 업로드 검토 대기 상태가 아닙니다." });
+    return null;
+  }
+  return job;
+}
+
+// 검토 화면에서 고친 값을 담아 둔다. 아직 올리지는 않는다.
+// 프레임이나 문구가 바뀌면 썸네일 카드를 다시 그려서 바로 볼 수 있게 한다.
+app.post("/api/jobs/:id/review", express.json({ limit: "1mb" }), async (req, res) => {
+  const job = reviewJobOr404(req, res);
+  if (!job) return;
+
+  const b = req.body || {};
+  const rv = job.review;
+  const frameCount = job.stages.thumbnail?.result?.urls?.length || 0;
+
+  if (typeof b.title === "string") rv.title = b.title.trim().slice(0, 100);
+  if (typeof b.description === "string") rv.description = b.description.slice(0, 5000);
+  if (Array.isArray(b.tags)) {
+    rv.tags = b.tags.map((t) => String(t).trim()).filter(Boolean).slice(0, 40);
+  }
+  if (b.privacy) rv.privacy = sanitizePrivacy(b.privacy);
+  if (["card", "raw", "none"].includes(b.thumbnail)) rv.thumbnail = b.thumbnail;
+
+  // 카드를 다시 그려야 하는 변경인지 먼저 판단한다 — 매번 다시 그리면 문구를
+  // 한 글자 고칠 때마다 파이썬을 띄우게 된다.
+  let redraw = false;
+  if (b.frameIndex != null && frameCount > 0) {
+    const i = Math.max(0, Math.min(frameCount - 1, parseInt(b.frameIndex, 10) || 0));
+    if (i !== rv.frameIndex) { rv.frameIndex = i; redraw = true; }
+  }
+  if (Array.isArray(b.lines)) {
+    const next = [0, 1, 2].map((i) => String(b.lines[i] ?? "").trim().slice(0, 24));
+    if (next.join("\u0000") !== rv.lines.join("\u0000")) { rv.lines = next; redraw = true; }
+  }
+  if (b.redraw === true) redraw = true;
+  // 지난번에 카드를 못 만들었으면 지금은 값이 그대로여도 다시 그려 본다.
+  // 안 그러면 실패한 문구를 고쳐도 옛 에러 메시지가 그대로 남는다.
+  if (rv.card?.error) redraw = true;
+
+  if (redraw && frameCount > 0) await rebuildReviewCard(job);
+  saveJob(job);
+  res.json(reviewResponse(job));
+});
+
+// 확인 끝. 지금 올린다.
+app.post("/api/jobs/:id/review/approve", express.json({ limit: "1mb" }), async (req, res) => {
+  const job = reviewJobOr404(req, res);
+  if (!job) return;
+  if (!job.review.title) {
+    return res.status(400).json({ error: "제목이 비어 있습니다." });
+  }
+
+  const editedPath = path.join(TMP, `${job.id}.edited.mp4`);
+  if (!existsSync(editedPath)) {
+    return res.status(410).json({ error: "편집본이 서버에서 지워졌습니다. 다시 만들어 주세요." });
+  }
+
+  job.stages.upload = { status: "queued" };
+  job.status = "running";
+  res.status(202).json({ ok: true, statusUrl: `/api/jobs/${job.id}`, pollIntervalMs: 3000 });
+
+  // 업로드는 네트워크 대기라 인코딩 큐를 막지 않는다. 바로 시작한다.
+  runStage(job, "upload", () => uploadStageFor(job, editedPath))
+    .then(() => {
+      job.status = computeJobStatus(job);
+      job.completedAt = Date.now();
+      saveJob(job);
+    })
+    .catch((e) => console.error(`[job ${job.id}] 승인 업로드 실패:`, e));
+});
+
+// 안 올리기로 했다. 영상과 기록은 그대로 두고 업로드만 접는다.
+app.post("/api/jobs/:id/review/skip", async (req, res) => {
+  const job = reviewJobOr404(req, res);
+  if (!job) return;
+  job.review = null;
+  job.stages.upload = { status: "skipped", note: "검토 후 업로드하지 않음" };
+  job.status = computeJobStatus(job);
+  job.completedAt = Date.now();
+  saveJob(job);
+  console.log(`[job ${job.id}] 검토 후 업로드 취소`);
+  res.json({ ok: true });
+});
+
 // 설정만 바꿔 처음부터 다시 만든다. 원본이 서버에 남아 있으므로 8GB 를 다시
 // 올릴 필요가 없다. 결과는 새 작업이고, 유튜브에는 새 비공개 영상으로 올라간다.
 app.post("/api/jobs/:id/rerun", express.json({ limit: "4mb" }), async (req, res) => {
@@ -1365,6 +1497,11 @@ function sanitizeJobOptions(opts) {
     descriptionTemplate: String(opts.descriptionTemplate || "").slice(0, 8000),
     channel: sanitizeChannel(opts.channel),
     upload: opts.upload === true,
+    // 올리기 전에 한 번 보고 고칠 기회를 준다. 유튜브는 올린 뒤에 영상 파일을
+    // 못 바꾸므로, 화면을 다시 만들어야 하는 실수는 올리기 전에 잡는 게 유일한
+    // 방법이다. 제목·설명·썸네일은 나중에도 고칠 수 있지만 그것도 여기서 미리
+    // 보는 편이 훨씬 싸다.
+    reviewBeforeUpload: opts.reviewBeforeUpload !== false,
     privacy: sanitizePrivacy(opts.privacy),
     publishAt: sanitizePublishAt(opts.publishAt),
   };
@@ -1543,7 +1680,13 @@ async function runJobPipeline(id, inputPath) {
   await runOptionalStage(job, "metadata", () => metadataStageFor(job));
 
   // ── upload ── (비치명적) 명시적 opt-in + 자격 증명이 있을 때만.
-  await runOptionalStage(job, "upload", () => uploadStageFor(job, editedPath));
+  // 검토를 켜 뒀고 실제로 올릴 수 있는 상태라면, 올리기 직전에 멈춰 세운다.
+  const skipUpload = stageSkipReason(job, "upload");
+  if (!skipUpload && job.options.reviewBeforeUpload) {
+    await prepareReview(job);
+  } else {
+    await runOptionalStage(job, "upload", () => uploadStageFor(job, editedPath));
+  }
 
   job.status = computeJobStatus(job);
   job.completedAt = Date.now();
@@ -1672,6 +1815,14 @@ async function transcribeStageFor(job, editedPath) {
   };
 }
 
+// 썸네일로 쓸 프레임을 뽑는다.
+//
+// 예전엔 480:-2 로 줄여서 저장했다. 목록에 늘어놓고 고르는 용도로만 생각한
+// 크기였는데, 유튜브에 올리는 카드도 같은 파일을 썼다 — 1920 원본을 480 으로
+// 줄였다가 1280 으로 다시 늘리니 화질의 1/16 만 남았고, 뭘 찍어도 뿌옇게
+// 나왔다. 유튜브 썸네일 규격이 1280x720 이므로 그 이상으로 뽑는다.
+const THUMB_WIDTH = 1280;
+
 async function thumbnailStageFor(job, editedPath) {
   const count = job.options.thumbnailCount || 6;
   // 영상 길이를 빠르게 ffprobe 로 (ffmpeg 호출 파싱 대신 ffprobe 정확).
@@ -1685,8 +1836,9 @@ async function thumbnailStageFor(job, editedPath) {
       "-ss", t.toFixed(2),
       "-i", editedPath,
       "-frames:v", "1",
-      "-q:v", "3",
-      "-vf", "scale=480:-2",
+      "-q:v", "2",
+      // 원본보다 크게 늘리지는 않는다 — 없는 화질이 생기지는 않는다.
+      "-vf", `scale='min(${THUMB_WIDTH},iw)':-2`,
       "-y", out,
     ]);
     job.artifacts.push(out);
@@ -1873,54 +2025,152 @@ async function metadataStageFor(job) {
   return { ...meta, url: `/api/jobs/${job.id}/files/metadata.json` };
 }
 
-// YouTube 업로드. 자막 번인본이 있으면 그쪽을 올린다 (사용자가 번인을 요청한
-// 이상 그게 최종 산출물이므로).
-async function uploadStageFor(job, editedPath) {
-  const burned = job.stages.burn?.status === "done" ? job.stages.burn.result?._path : null;
-  const videoPath = burned && existsSync(burned) ? burned : editedPath;
+// ── 업로드 전 검토 ──────────────────────────────────────────────────────────
+//
+// 유튜브에 올라간 영상은 파일을 못 바꾼다. 제목·설명·태그·썸네일은 나중에도
+// 덮어쓸 수 있지만, 화면이 틀렸으면 새 영상으로 다시 올리는 수밖에 없다.
+// 그래서 마지막에 한 번 멈춰서, 실제로 올라갈 것들을 그대로 보여주고 고치게
+// 한다. 여기서 만들어 두는 값이 곧 uploadStageFor 가 쓰는 값이다.
+
+// 추출된 프레임 파일 경로. 없는 번호를 고르면 null.
+function reviewFramePath(job, index) {
+  const n = job.stages.thumbnail?.result?.urls?.length || 0;
+  const i = Math.max(0, Math.min(n - 1, Number(index) || 0));
+  if (n === 0) return null;
+  const p = path.join(TMP, `${job.id}.thumb_${i}.jpg`);
+  return existsSync(p) ? p : null;
+}
+
+// 고른 프레임 위에 문구를 얹은 카드를 만든다. 실패해도 던지지 않는다 —
+// 카드는 덤이고, 못 만들면 원본 사진으로 올리면 된다.
+async function rebuildReviewCard(job) {
+  const rv = job.review;
+  if (!rv) return null;
+  const frame = reviewFramePath(job, rv.frameIndex);
+  if (!frame) {
+    rv.card = { error: "썸네일 프레임이 없습니다." };
+    return rv.card;
+  }
+  const cardPath = path.join(TMP, `${job.id}.thumb_card.jpg`);
+  const card = await composeThumbnailCard({
+    image: frame,
+    out: cardPath,
+    line1: rv.lines[0] || "",
+    line2: rv.lines[1] || null,
+    line3: rv.lines[2] || null,
+    pythonBin: PYTHON_BIN,
+  });
+  if (card.ok) {
+    if (!job.artifacts.includes(cardPath)) job.artifacts.push(cardPath);
+    rv.cardVersion = (rv.cardVersion || 0) + 1;
+    rv.card = { font: card.font, sizes: card.sizes, bytes: card.bytes };
+    console.log(`[job ${job.id}] 썸네일 카드 생성 (${card.font}, ${card.sizes.join("/")}px)`);
+  } else {
+    rv.card = { error: card.error };
+    console.warn(`[job ${job.id}] 썸네일 카드 실패: ${card.error}`);
+  }
+  return rv.card;
+}
+
+async function prepareReview(job) {
+  const meta = job.stages.metadata?.status === "done" ? job.stages.metadata.result : {};
+  const frames = job.stages.thumbnail?.result?.urls || [];
+  job.review = {
+    title: uploadTitleFor(job) || "",
+    description: meta.description || "",
+    tags: Array.isArray(meta.tags) ? meta.tags : [],
+    privacy: job.options.privacy,
+    // 프레임이 아예 없으면 얹을 자리도 없다.
+    thumbnail: frames.length ? "card" : "none",
+    frameIndex: 0,
+    lines: [
+      meta.thumbnailLine1 || meta.thumbnailCopy || "",
+      meta.thumbnailLine2 || meta.thumbnailSubcopy || "",
+      meta.thumbnailLine3 || "",
+    ],
+    cardVersion: 0,
+    card: null,
+  };
+  if (frames.length) await rebuildReviewCard(job);
+  job.stages.upload = { status: "review", note: "검토 대기 — 확인 후 업로드하세요." };
+  job.status = "review";
+  console.log(`[job ${job.id}] 업로드 전 검토 대기`);
+  saveJob(job);
+}
+
+// 검토에서 고른 값을 실제 업로드 인자로 바꾼다. 검토를 끄고 돌렸으면 review 가
+// 없으므로, 그때는 메타데이터 단계 결과를 그대로 쓰고 카드도 여기서 만든다.
+async function uploadInputsFor(job) {
   const meta = job.stages.metadata?.result || {};
+  if (job.review) {
+    const rv = job.review;
+    const thumbnailPath =
+      rv.thumbnail === "card" ? path.join(TMP, `${job.id}.thumb_card.jpg`)
+      : rv.thumbnail === "raw" ? reviewFramePath(job, rv.frameIndex)
+      : null;
+    return {
+      title: rv.title || uploadTitleFor(job),
+      description: rv.description || "",
+      tags: rv.tags || [],
+      privacy: rv.privacy || job.options.privacy,
+      thumbnailPath,
+      thumbnailCard: rv.card,
+    };
+  }
+
   // 추출된 사진은 그대로 두고, 그 위에 문구를 얹은 카드를 한 장 더 만든다.
   // 원본이 남아 있어야 문구만 바꿔 다시 만들 수 있다.
   const rawThumb = job.stages.thumbnail?.status === "done"
     ? path.join(TMP, `${job.id}.thumb_0.jpg`)
     : null;
-  let thumb = rawThumb && existsSync(rawThumb) ? rawThumb : null;
+  let thumbnailPath = rawThumb && existsSync(rawThumb) ? rawThumb : null;
   let thumbnailCard = null;
-  if (thumb) {
+  if (thumbnailPath) {
+    job.review = {
+      frameIndex: 0,
+      lines: [
+        meta.thumbnailLine1 || meta.thumbnailCopy || "",
+        meta.thumbnailLine2 || meta.thumbnailSubcopy || "",
+        meta.thumbnailLine3 || "",
+      ],
+      cardVersion: 0,
+    };
+    thumbnailCard = await rebuildReviewCard(job);
     const cardPath = path.join(TMP, `${job.id}.thumb_card.jpg`);
-    const card = await composeThumbnailCard({
-      image: thumb,
-      out: cardPath,
-      line1: meta.thumbnailLine1 || meta.thumbnailCopy || "",
-      line2: meta.thumbnailLine2 || meta.thumbnailSubcopy || null,
-      line3: meta.thumbnailLine3 || null,
-      pythonBin: PYTHON_BIN,
-    });
-    if (card.ok) {
-      job.artifacts.push(cardPath);
-      thumb = cardPath;
-      thumbnailCard = { font: card.font, sizes: card.sizes, bytes: card.bytes };
-      console.log(`[job ${job.id}] 썸네일 카드 생성 (${card.font}, ${card.sizes.join("/")}px)`);
-    } else {
-      // 카드는 덤이다. 못 만들어도 사진으로 올린다.
-      thumbnailCard = { error: card.error };
-      console.warn(`[job ${job.id}] 썸네일 카드 실패 — 원본 사진으로 올립니다: ${card.error}`);
-    }
+    // 카드는 덤이다. 못 만들어도 사진으로 올린다.
+    if (thumbnailCard && !thumbnailCard.error && existsSync(cardPath)) thumbnailPath = cardPath;
+    job.review = null;
   }
-
-  const result = await uploadVideo({
-    videoPath,
+  return {
     title: uploadTitleFor(job),
     description: meta.description || "",
     tags: meta.tags || [],
     privacy: job.options.privacy,
+    thumbnailPath,
+    thumbnailCard,
+  };
+}
+
+// YouTube 업로드. 자막 번인본이 있으면 그쪽을 올린다 (사용자가 번인을 요청한
+// 이상 그게 최종 산출물이므로).
+async function uploadStageFor(job, editedPath) {
+  const burned = job.stages.burn?.status === "done" ? job.stages.burn.result?._path : null;
+  const videoPath = burned && existsSync(burned) ? burned : editedPath;
+  const inputs = await uploadInputsFor(job);
+
+  const result = await uploadVideo({
+    videoPath,
+    title: inputs.title,
+    description: inputs.description,
+    tags: inputs.tags,
+    privacy: inputs.privacy,
     publishAtIso: job.options.publishAt,
-    thumbnailPath: thumb && existsSync(thumb) ? thumb : null,
+    thumbnailPath: inputs.thumbnailPath && existsSync(inputs.thumbnailPath) ? inputs.thumbnailPath : null,
     onProgress: ({ uploaded, total }) => {
       console.log(`[job ${job.id}] upload ${((uploaded / total) * 100).toFixed(0)}%`);
     },
   });
-  return { ...result, thumbnailCard };
+  return { ...result, thumbnailCard: inputs.thumbnailCard };
 }
 
 function uploadTitleFor(job) {

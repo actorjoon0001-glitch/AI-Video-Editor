@@ -1719,7 +1719,7 @@ const STAGE_LABELS = [
   ["upload",     "6. YouTube 업로드"],
 ];
 const JOB_STAGE_ICON = {
-  queued: "·", running: "⏳", done: "✓", failed: "✗", skipped: "⊘",
+  queued: "·", running: "⏳", done: "✓", failed: "✗", skipped: "⊘", review: "✋",
 };
 
 async function runQueueModePipeline() {
@@ -1919,6 +1919,14 @@ async function followJob(jobId, pollIntervalMs = 3000) {
       ? ` — 앞선 작업 ${job.queuedBehind}개가 끝나면 시작합니다`
       : "";
     setStatus(`큐 모드: ${job.status}${terminalLabel(job)}${waiting}`);
+
+    // 검토 대기는 사람 차례다. 폴링을 멈추고 검토 패널을 띄운다. 다만 기억은
+    // 지우지 않는다 — 새로고침하고 돌아와도 검토하던 작업으로 다시 붙어야 한다.
+    if (job.status === "review") {
+      setStatus("업로드 전 검토 — 확인하고 '이대로 업로드'를 누르세요.");
+      await wireQueueResults(job);
+      return job;
+    }
 
     if (job.status === "done" || job.status === "partial" || job.status === "failed") {
       forgetJob(jobId);
@@ -2344,6 +2352,7 @@ async function wireQueueResults(job) {
     burnedBtn.classList.remove("disabled");
     burnedBtn.removeAttribute("aria-disabled");
   }
+  renderReview(job);
   renderMetadata(job.stages.metadata, job.stages.upload);
   // 서버가 무음을 찾았으면 그 결과로 타임라인을 그린다 (브라우저는 분석을 안 했다).
   const det = job.stages?.detect?.result;
@@ -2464,6 +2473,196 @@ async function applySubtitleEdits() {
   }
 }
 
+// ── 업로드 전 검토 ──────────────────────────────────────────────────────────
+//
+// 유튜브에 한 번 올라간 영상은 파일을 못 바꾼다. 제목·설명·태그·썸네일이야
+// 나중에 덮어쓸 수 있지만, 화면이 잘못 나갔으면 새 영상으로 다시 올리는 수밖에
+// 없다. 그래서 마지막에 한 번 멈춰서 실제로 올라갈 것들을 그대로 보여준다.
+//
+// 이 패널이 손대는 값은 서버에 있는 review 객체 하나뿐이고, "이대로 업로드"가
+// 그 값으로 올린다 — 화면에 보이는 것과 올라가는 것이 갈라질 자리가 없다.
+let reviewWired = false;
+let reviewJobId = null;
+
+function renderReview(job) {
+  const block = $("reviewBlock");
+  if (!block) return;
+  const rv = job.review;
+  if (!rv) {
+    block.hidden = true;
+    reviewJobId = null;
+    return;
+  }
+  block.hidden = false;
+  reviewJobId = job.jobId;
+
+  const pick = $("reviewTitlePick");
+  if (pick) {
+    pick.innerHTML = "";
+    for (const t of rv.titles || []) {
+      const o = document.createElement("option");
+      o.value = t; o.textContent = t;
+      pick.appendChild(o);
+    }
+    // 후보에 없는 제목을 직접 써 뒀을 수 있다. 그때는 아무것도 고르지 않는다.
+    pick.value = (rv.titles || []).includes(rv.title) ? rv.title : "";
+  }
+  setValue("reviewTitle", rv.title || "");
+  setValue("reviewDesc", rv.description || "");
+  setValue("reviewTags", (rv.tags || []).join(", "));
+  setValue("reviewPrivacy", rv.privacy || "private");
+  setValue("reviewThumbPick", rv.thumbnail || "card");
+  [0, 1, 2].forEach((i) => setValue(`reviewLine${i + 1}`, rv.lines?.[i] || ""));
+  updateReviewCounts();
+
+  renderReviewFrames(rv);
+  renderReviewCard(rv);
+
+  const status = $("reviewStatus");
+  if (status) status.textContent = "";
+  wireReviewOnce();
+}
+
+function setValue(id, v) {
+  const el = $(id);
+  if (el) el.value = v;
+}
+
+function updateReviewCounts() {
+  const t = $("reviewTitle")?.value || "";
+  const d = $("reviewDesc")?.value || "";
+  // 유튜브 제목은 100자가 상한이고, 목록에서는 60자쯤에서 잘려 보인다.
+  const tc = $("reviewTitleCount");
+  if (tc) tc.textContent = `${t.length}/100자${t.length > 60 ? " · 목록에선 잘려 보입니다" : ""}`;
+  const dc = $("reviewDescCount");
+  if (dc) dc.textContent = `${d.length}자`;
+}
+
+function renderReviewFrames(rv) {
+  const grid = $("reviewFrames");
+  if (!grid) return;
+  grid.innerHTML = "";
+  (rv.frameUrls || []).forEach((u, i) => {
+    const img = document.createElement("img");
+    img.src = BACKEND_URL + u;
+    img.alt = `배경 후보 ${i + 1}`;
+    img.className = i === rv.frameIndex ? "picked" : "";
+    img.addEventListener("click", () => sendReviewPatch({ frameIndex: i }));
+    grid.appendChild(img);
+  });
+}
+
+function renderReviewCard(rv) {
+  const img = $("reviewCardImg");
+  const note = $("reviewCardNote");
+  if (img) {
+    // 카드를 못 만들었으면 고른 사진이라도 보여준다 — 빈 자리보다는 낫다.
+    const fallback = rv.frameUrls?.[rv.frameIndex];
+    const src = rv.cardUrl || fallback;
+    img.hidden = !src;
+    if (src) img.src = BACKEND_URL + src;
+  }
+  if (note) {
+    note.textContent = rv.card?.error
+      ? `문구를 못 얹었습니다 (${rv.card.error}) — 사진만 올라갑니다.`
+      : rv.card?.font
+        ? `${rv.card.font} · ${(rv.card.sizes || []).join("/")}px · ${Math.round((rv.card.bytes || 0) / 1024)}KB`
+        : "";
+  }
+}
+
+// 화면의 값을 서버 review 로 보낸다. 응답이 곧 새 상태라 그대로 다시 그린다.
+async function sendReviewPatch(extra = {}, { quiet = false } = {}) {
+  if (!reviewJobId) return null;
+  const status = $("reviewStatus");
+  if (!quiet && status) status.textContent = "반영하는 중...";
+  const body = {
+    title: $("reviewTitle")?.value ?? undefined,
+    description: $("reviewDesc")?.value ?? undefined,
+    tags: ($("reviewTags")?.value || "").split(",").map((t) => t.trim()).filter(Boolean),
+    privacy: $("reviewPrivacy")?.value || undefined,
+    thumbnail: $("reviewThumbPick")?.value || undefined,
+    lines: [0, 1, 2].map((i) => $(`reviewLine${i + 1}`)?.value || ""),
+    ...extra,
+  };
+  try {
+    const r = await fetch(`${BACKEND_URL}/api/jobs/${reviewJobId}/review`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    renderReviewFrames(j.review);
+    renderReviewCard(j.review);
+    if (status) status.textContent = quiet ? "" : "반영됨";
+    return j.review;
+  } catch (e) {
+    if (status) status.textContent = `반영 실패: ${e?.message || e}`;
+    return null;
+  }
+}
+
+function wireReviewOnce() {
+  if (reviewWired) return;
+  reviewWired = true;
+
+  $("reviewTitlePick")?.addEventListener("change", (e) => {
+    if (e.target.value) setValue("reviewTitle", e.target.value);
+    updateReviewCounts();
+  });
+  $("reviewTitle")?.addEventListener("input", updateReviewCounts);
+  $("reviewDesc")?.addEventListener("input", updateReviewCounts);
+  $("reviewRedraw")?.addEventListener("click", () => sendReviewPatch({ redraw: true }));
+
+  $("reviewApprove")?.addEventListener("click", async () => {
+    const btn = $("reviewApprove");
+    const status = $("reviewStatus");
+    if (!reviewJobId) return;
+    // 먼저 화면의 값을 저장한다. 이걸 빼먹으면 방금 고친 제목이 아니라 예전
+    // 제목으로 올라간다 — 화면과 결과가 갈라지는 제일 흔한 방식이다.
+    btn.disabled = true;
+    const saved = await sendReviewPatch({}, { quiet: true });
+    if (!saved) { btn.disabled = false; return; }
+
+    const jobId = reviewJobId;
+    if (status) status.textContent = "업로드 시작...";
+    try {
+      const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}/review/approve`, { method: "POST" });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      $("reviewBlock").hidden = true;
+      appendLog(`업로드 승인: ${saved.title}`);
+      runBtn.disabled = true;
+      try {
+        await followJob(jobId, j.pollIntervalMs);
+      } finally {
+        runBtn.disabled = false;
+      }
+    } catch (e) {
+      if (status) status.textContent = `업로드 실패: ${e?.message || e}`;
+      $("reviewBlock").hidden = false;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("reviewSkip")?.addEventListener("click", async () => {
+    if (!reviewJobId) return;
+    const status = $("reviewStatus");
+    try {
+      const r = await fetch(`${BACKEND_URL}/api/jobs/${reviewJobId}/review/skip`, { method: "POST" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      forgetJob(reviewJobId);
+      $("reviewBlock").hidden = true;
+      appendLog("검토 후 업로드 취소 — 영상과 자막은 그대로 남아 있습니다.");
+      setStatus("업로드하지 않았습니다. 편집본과 자막은 그대로 받을 수 있습니다.");
+    } catch (e) {
+      if (status) status.textContent = `취소 실패: ${e?.message || e}`;
+    }
+  });
+}
+
 // 메타데이터 패널 — 제목 후보/설명/태그/썸네일 카피 + 업로드 결과 링크.
 function renderMetadata(metaStage, uploadStage) {
   const block = $("metaBlock");
@@ -2556,6 +2755,7 @@ function rerunOptions() {
     descriptionTemplate: $("descTemplate")?.value || "",
     channel: descriptionChannelFromUI(),
     upload: $("ytUpload")?.checked === true,
+    reviewBeforeUpload: $("ytReview")?.checked !== false,
     privacy: $("ytPrivacy")?.value || "private",
     // 무음 기준도 같이 보낸다. 서버는 이 값이 바뀌었을 때만 keeps 를 버리고
     // 무음을 다시 찾는다.
@@ -2786,7 +2986,7 @@ async function openArchivedJob(jobId) {
 const PREFS_KEY = "aive.prefs.v1";
 const PREF_CHECKBOXES = [
   "queueMode", "autoSubtitles", "burnSubtitles",
-  "genMetadata", "ytUpload", "loudnorm", "safeMode", "subBold", "silenceAuto",
+  "genMetadata", "ytUpload", "ytReview", "loudnorm", "safeMode", "subBold", "silenceAuto",
 ];
 const PREF_RANGES = ["silenceDb", "minSilence", "padding", "shortLen", "bgmVol",
   "subFontSize", "subMarginV", "subBoxOpacity", "subOutline"];
