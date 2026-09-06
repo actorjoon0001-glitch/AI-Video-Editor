@@ -39,9 +39,13 @@ LINE_SPECS = [
     (404, 84, (0xFF, 0xFF, 0xFF)),
 ]
 
-MAX_CHARS = 7
-SHRINK_STEP = 8
-SHRINK_TRIES = 3
+# 글자 수 상한은 "디자인 규칙"이 아니라 안전장치다. 7자로 잡아 뒀더니 손으로
+# 문구를 고칠 때 여덟 글자만 써도 카드가 통째로 안 만들어졌다 — 폭에 안 맞으면
+# 줄이면 되는 것을 거절로 처리한 셈이다. 이제 문장 한 줄이 통째로 들어온 경우만
+# 막고, 길이는 아래 fit_line 이 크기를 줄여서 맞춘다.
+MAX_CHARS = 16
+SHRINK_STEP = 6
+MIN_SIZE = 44                      # 이보다 작아지면 피드에서 안 읽힌다
 MAX_BYTES = 2 * 1024 * 1024
 
 
@@ -102,18 +106,21 @@ def panel_layer():
 
 
 def fit_line(text, size, font_path):
-    """폭에 맞을 때까지 크기를 줄인다. 글자 수는 줄인다고 달라지지 않으므로
-    글자 수 초과는 여기서 다루지 않고 호출 전에 막는다."""
-    for attempt in range(SHRINK_TRIES + 1):
-        s = size - SHRINK_STEP * attempt
-        if s <= 0:
-            break
+    """폭에 맞을 때까지 크기를 줄인다.
+
+    읽을 수 있는 하한(MIN_SIZE)까지 내려가 보고, 거기서도 안 맞을 때만 실패한다.
+    예전엔 세 번만 줄여 보고 포기해서, 조금 긴 문구를 쓰면 카드 자체가 안
+    만들어졌다 — 줄이면 되는 일을 거절로 처리한 것이다.
+    """
+    s = size
+    while s >= MIN_SIZE:
         font = ImageFont.truetype(font_path, s)
         w = font.getbbox(text, stroke_width=STROKE_W)[2]
         if TEXT_X + w <= TEXT_RIGHT:
             return font, s
+        s -= SHRINK_STEP
     raise CardError(
-        f'"{text}" 가 {SHRINK_TRIES}번 줄여도 패널 폭({TEXT_RIGHT - TEXT_X}px)을 넘습니다.'
+        f'"{text}" 는 {MIN_SIZE}px 로 줄여도 패널 폭({TEXT_RIGHT - TEXT_X}px)을 넘습니다 — 더 짧게 써 주세요.'
     )
 
 
