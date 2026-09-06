@@ -1741,17 +1741,27 @@ async function runQueueModePipeline() {
 
   // 1) 브라우저에서 무음 감지 → keeps 산출
   const sourceFile = pickedFiles[0];
+  // 여러 클립을 고르면 서버가 이어 붙인다. 붙기 전 상태로는 브라우저가 무음을
+  // 찾아 봐야 첫 클립 기준이라 맞지 않으므로, 감지도 서버에 맡긴다.
+  const multi = pickedFiles.length > 1;
   const noiseDb = silenceThresholdSetting();
   const minSilence = parseFloat($("minSilence").value);
   const padding = parseFloat($("padding").value);
-  const duration = await measureDurationFromFile(sourceFile);
-  if (duration <= 0) throw new Error("브라우저가 영상 길이를 못 읽었습니다.");
+  let duration = 0;
+  for (const f of pickedFiles) {
+    const d = await measureDurationFromFile(f);
+    if (d <= 0) throw new Error(`브라우저가 영상 길이를 못 읽었습니다 (${f.name}).`);
+    duration += d;
+  }
+  if (multi) {
+    appendLog(`${pickedFiles.length}개 클립 병합 예정 — 총 ${fmtClock(duration)}, 무음 감지는 합본에서 수행`);
+  }
 
   // 큰 파일은 브라우저가 분석하다 죽는다 (file.arrayBuffer() 가 파일 전체를 램에
   // 올린다 — 8GB 원본에서 NotReadableError). 서버에 맡기고 keeps 를 비워 보내면
   // detect 단계가 직접 찾는다.
-  const sourceMb = sourceFile.size / 1024 / 1024;
-  const serverDetect = state.mode !== "short" && sourceMb > BROWSER_ANALYSIS_LIMIT_MB;
+  const sourceMb = pickedFiles.reduce((n, f) => n + f.size, 0) / 1024 / 1024;
+  const serverDetect = multi || (state.mode !== "short" && sourceMb > BROWSER_ANALYSIS_LIMIT_MB);
 
   let keeps;
   if (serverDetect) {
@@ -1813,12 +1823,31 @@ async function runQueueModePipeline() {
   };
 
   const totalMb = (sourceFile.size / 1024 / 1024).toFixed(1);
-  // 큰 파일은 조각으로 올린다 — 한 번에 올리면 중간에 한 번만 끊겨도 처음부터다.
-  // 작은 파일은 왕복이 늘 뿐이라 기존 단일 요청(XHR, 진행률·타임아웃 지원)을 쓴다.
+
   let uploadResult;
-  if (sourceFile.size > CHUNK_UPLOAD_THRESHOLD_MB * 1024 * 1024) {
+  if (multi) {
+    // 클립을 하나씩 올린 뒤 서버에 합치라고 알린다. 합본이 이 작업의 원본이 된다.
+    const uploadIds = [];
+    for (let i = 0; i < pickedFiles.length; i++) {
+      const f = pickedFiles[i];
+      const mb = (f.size / 1024 / 1024).toFixed(1);
+      const { uploadId } = await uploadFileChunked(f, mb, `(${i + 1}/${pickedFiles.length}) `);
+      uploadIds.push(uploadId);
+    }
+    setStatus(`큐 모드: ${pickedFiles.length}개 클립을 서버에서 이어 붙이는 중...`);
+    const r = await fetch(`${BACKEND_URL}/api/uploads/merge`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uploadIds, options: jobOptions }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || `병합 실패 (HTTP ${r.status})`);
+    uploadResult = body;
+  } else if (sourceFile.size > CHUNK_UPLOAD_THRESHOLD_MB * 1024 * 1024) {
+    // 큰 파일은 조각으로 올린다 — 한 번에 올리면 중간에 한 번만 끊겨도 처음부터다.
     uploadResult = await uploadJobChunked(sourceFile, jobOptions, totalMb);
   } else {
+    // 작은 파일은 왕복이 늘 뿐이라 단일 요청(XHR, 진행률·타임아웃 지원)을 쓴다.
     const fd = new FormData();
     fd.append("video", sourceFile);
     fd.append("options", JSON.stringify(jobOptions));
@@ -2115,7 +2144,7 @@ async function uploadJobChunked(file, options, totalMb) {
     const mbps = offset / 1024 / 1024 / ((Date.now() - started) / 1000);
     const remainSec = mbps > 0 ? (file.size / 1024 / 1024 - offset / 1024 / 1024) / mbps : 0;
     setStatus(
-      `큐 모드: 영상 업로드 ${pct}% (${(offset / 1024 / 1024).toFixed(0)} / ${totalMb} MB` +
+      `큐 모드: ${label}영상 업로드 ${pct}% (${(offset / 1024 / 1024).toFixed(0)} / ${totalMb} MB` +
       `${remainSec > 5 ? ` · 남은 시간 약 ${fmtClock(remainSec)}` : ""})`
     );
     setBar(10 + pct * 0.2);
