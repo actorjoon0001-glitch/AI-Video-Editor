@@ -227,6 +227,33 @@
           </details>
 
           <label class="toggle">
+            <input type="checkbox" id="makeShorts" />
+            <span>세로본도 만들기 — 릴스 · 틱톡용 9:16</span>
+          </label>
+          <div class="substyle-grid">
+            <label>세로본 길이
+              <select id="shortsLength">
+                <option value="30">30초</option>
+                <option value="45">45초</option>
+                <option value="60" selected>60초</option>
+                <option value="90">90초</option>
+                <option value="120">2분</option>
+              </select>
+            </label>
+            <label>세로로 옮기는 방식
+              <select id="shortsFit">
+                <option value="blur" selected>흐린 배경 — 화면 전체 유지</option>
+                <option value="crop">좌우 잘라내기 — 꽉 차지만 양옆 손실</option>
+              </select>
+            </label>
+          </div>
+          <p class="hint-row">
+            * 편집·자막까지 끝난 영상에서 <b>말이 제일 촘촘한 구간</b>을 골라 세로로 뽑습니다.
+            자막을 구웠으면 자막이 들어간 채로 나옵니다 — 숏폼은 소리 없이 보는 사람이 많습니다.
+            집 내부 와이드샷은 좌우를 자르면 절반 넘게 사라져서 <b>흐린 배경</b>이 기본입니다.
+          </p>
+
+          <label class="toggle">
             <input type="checkbox" id="ytUpload" checked />
             <span>YouTube 업로드 — 편집이 끝나면 게시</span>
           </label>
@@ -364,6 +391,17 @@
           <a id="srtDownloadBtn" class="btn disabled" download="subtitles.srt" aria-disabled="true" role="button">SRT</a>
           <a id="vttDownloadBtn" class="btn disabled" download="subtitles.vtt" aria-disabled="true" role="button">VTT</a>
           <a id="burnedDownloadBtn" class="btn disabled" download="subtitled.mp4" aria-disabled="true" role="button" hidden>자막 번인본</a>
+        </div>
+
+        <div class="shorts-block" id="shortsBlock" hidden>
+          <h4 class="thumbs-title">세로본 <span class="thumbs-hint" id="shortsHint"></span></h4>
+          <div class="shorts-row">
+            <video id="shortsVideo" class="shorts-video" controls playsinline preload="metadata"></video>
+            <div class="shorts-side">
+              <p class="hint-row" id="shortsNote"></p>
+              <a id="shortsDownloadBtn" class="btn" download="shorts.mp4" role="button">세로본 내려받기</a>
+            </div>
+          </div>
         </div>
 
         <!-- 올리기 전에 멈춰 서는 자리. 유튜브는 올린 뒤 영상 파일을 못 바꾸므로,

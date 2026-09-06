@@ -557,14 +557,14 @@ function friendlyTranscribeError(e) {
 // thumbnail / metadata / upload 를 순차 처리. 한 단계가 실패해도 비치명적
 // 단계는 다음 단계로 진행 (partial success). GET 로 폴링, 단계별 retry 지원.
 
-const STAGE_NAMES = ["edit", "transcribe", "burn", "thumbnail", "metadata", "upload"];
+const STAGE_NAMES = ["edit", "transcribe", "burn", "shorts", "thumbnail", "metadata", "upload"];
 
 // 핵심 단계 — 실패하면 후속 stage 들 의미 없으니 전체 실패로.
 const CRITICAL_STAGES = new Set(["edit"]);
 
 // 개별 재시도를 받는 stage. edit 은 원본 업로드가 이미 지워져서, upload 는
 // 중복 게시 위험 때문에 제외한다 (upload 는 실패했을 때만 아래에서 허용).
-const RETRYABLE_STAGES = new Set(["transcribe", "burn", "thumbnail", "metadata"]);
+const RETRYABLE_STAGES = new Set(["transcribe", "burn", "shorts", "thumbnail", "metadata"]);
 
 const pipelineJobs = new Map();   // id → job state
 const PIPELINE_JOB_TTL_MS = 60 * 60 * 1000; // 1h
@@ -676,7 +676,9 @@ function newPipelineJob(id, options) {
 }
 
 function computeJobStatus(job) {
-  const states = STAGE_NAMES.map((n) => job.stages[n].status);
+  // 단계가 늘어나면 예전 작업에는 그 칸이 없다. 없는 칸을 읽다 터지면 작업
+  // 전체가 조회 불가가 되므로 "아직 안 함"으로 본다.
+  const states = STAGE_NAMES.map((n) => job.stages[n]?.status || "queued");
   // "검토 대기" 는 진행 중도 완료도 아니다. running 이라고 하면 화면이 계속
   // 기다리게 되고, done 이라고 하면 아직 안 올라간 걸 올라갔다고 하게 된다.
   if (states.includes("review")) return "review";
@@ -775,6 +777,17 @@ function sanitizeStageResult(name, result) {
   if (name === "burn") {
     return {
       url: result.url,
+      sizeBytes: result.sizeBytes,
+      durationMs: result.durationMs,
+    };
+  }
+  if (name === "shorts") {
+    return {
+      url: result.url,
+      startSec: result.startSec,
+      lengthSec: result.lengthSec,
+      fit: result.fit,
+      withSubtitles: result.withSubtitles === true,
       sizeBytes: result.sizeBytes,
       durationMs: result.durationMs,
     };
@@ -1493,6 +1506,10 @@ function sanitizeJobOptions(opts) {
     padding: clamp(Number(opts.padding) || 0.1, 0, 1),
     // 후속 stage 옵션 — 모두 명시적 opt-in.
     burn: opts.burn === true,
+    // 릴스·틱톡용 세로본. 길이는 숏폼에서 실제로 쓰는 범위로만 받는다.
+    shorts: opts.shorts === true,
+    shortsLengthSec: clamp(parseInt(opts.shortsLengthSec, 10) || 60, 15, 180),
+    shortsFit: opts.shortsFit === "crop" ? "crop" : "blur",
     metadata: opts.metadata === true,
     metadataPersona: String(opts.metadataPersona || "").slice(0, 500),
     // 설명글 템플릿과 채널 고정값. 코드가 아니라 사용자가 들고 있어야 문구를
@@ -1678,6 +1695,9 @@ async function runJobPipeline(id, inputPath) {
   // ── burn ── (비치명적) 자막 SRT 가 있어야 의미가 있다.
   await runOptionalStage(job, "burn", () => burnStageFor(job, editedPath));
 
+  // ── shorts ── (비치명적) 릴스·틱톡용 세로본.
+  await runOptionalStage(job, "shorts", () => shortsStageFor(job, editedPath));
+
   // ── thumbnail ── (비치명적)
   if (job.options.thumbnails) {
     await runStage(job, "thumbnail", () => thumbnailStageFor(job, editedPath));
@@ -1722,6 +1742,11 @@ function stageSkipReason(job, name) {
     if (!job.stages.transcribe.result?.srt) return "SRT 자막이 비어 있음";
     return null;
   }
+  if (name === "shorts") {
+    if (!o.shorts) return "옵션 OFF";
+    if (job.stages.edit?.status !== "done") return "편집 단계가 성공해야 세로본 생성 가능";
+    return null;
+  }
   if (name === "metadata") {
     if (!o.metadata) return "옵션 OFF";
     if (job.stages.transcribe?.status !== "done") return "자막 단계가 성공해야 메타데이터 생성 가능";
@@ -1747,6 +1772,8 @@ async function retryJobStage(id, stage) {
     await runStage(job, "thumbnail", () => thumbnailStageFor(job, editedPath));
   } else if (stage === "burn") {
     await runOptionalStage(job, "burn", () => burnStageFor(job, editedPath));
+  } else if (stage === "shorts") {
+    await runOptionalStage(job, "shorts", () => shortsStageFor(job, editedPath));
   } else if (stage === "metadata") {
     await runOptionalStage(job, "metadata", () => metadataStageFor(job));
   } else if (stage === "upload") {
@@ -1821,6 +1848,187 @@ async function transcribeStageFor(job, editedPath) {
     durationMs: Date.now() - t0,
     srtUrl: result.srt ? `/api/jobs/${job.id}/files/subtitles.srt` : null,
     vttUrl: result.vtt ? `/api/jobs/${job.id}/files/subtitles.vtt` : null,
+  };
+}
+
+// ── 세로본 (릴스 · 틱톡) ────────────────────────────────────────────────────
+//
+// 유튜브용 결과물은 16:9 다. 릴스와 틱톡은 9:16 이라 그대로 못 올린다.
+// 원본을 다시 올리게 하는 대신, 이미 편집된 영상에서 세로본을 한 편 더 뽑는다.
+//
+// 어디를 자를지는 자막이 알려준다. 말이 제일 촘촘한 구간이 대개 설명이 붙는
+// 대목이고, 소리 크기로 고르는 것보다 훨씬 정확하다 (에어컨 소리가 제일 큰
+// 구간을 고르는 일이 없다).
+const SHORTS_W = 1080;
+const SHORTS_H = 1920;
+
+function pickShortsWindow(segments, totalSec, lengthSec) {
+  if (!segments?.length || totalSec <= lengthSec) return 0;
+  // 문장 시작점만 후보로 둔다 — 말 중간에서 시작하면 무슨 얘긴지 알 수 없다.
+  let bestStart = 0;
+  let bestScore = -1;
+  for (const seg of segments) {
+    const start = Math.max(0, Math.min(seg.start, totalSec - lengthSec));
+    const end = start + lengthSec;
+    let score = 0;
+    for (const s of segments) {
+      // 창 안에 들어온 만큼만 센다. 걸친 문장은 걸친 비율만큼.
+      const overlap = Math.min(s.end, end) - Math.max(s.start, start);
+      if (overlap <= 0) continue;
+      const dur = Math.max(0.01, s.end - s.start);
+      score += (s.text || "").trim().length * (overlap / dur);
+    }
+    if (score > bestScore) { bestScore = score; bestStart = start; }
+  }
+  return bestStart;
+}
+
+// 16:9 를 9:16 으로 옮기는 두 가지 방법.
+//
+// crop 은 좌우를 3분의 2 가까이 잘라낸다 — 인물은 괜찮지만 집 내부 와이드샷은
+// 반 이상이 사라진다. blur 는 화면 전체를 남기고 위아래를 흐린 배경으로 채운다.
+// 집을 보여주는 게 목적이면 아무것도 안 잘리는 쪽이 기본이어야 한다.
+function shortsFilter(fit) {
+  if (fit === "crop") {
+    return `scale=${SHORTS_W}:${SHORTS_H}:force_original_aspect_ratio=increase,` +
+      `crop=${SHORTS_W}:${SHORTS_H},setsar=1`;
+  }
+  return (
+    `split=2[bg][fg];` +
+    `[bg]scale=${SHORTS_W}:${SHORTS_H}:force_original_aspect_ratio=increase,` +
+    `crop=${SHORTS_W}:${SHORTS_H},boxblur=40:3[bgb];` +
+    `[fg]scale=${SHORTS_W}:-2[fgs];` +
+    `[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1`
+  );
+}
+
+// 줄바꿈을 직접 넣는다.
+//
+// ffmpeg 은 SRT 를 ASS 로 바꾸면서 스크립트 해상도를 늘 384x288 (4:3) 로 박는다.
+// 그 4:3 캔버스를 9:16 화면에 펴 놓으니 가로와 세로의 배율이 달라져서, libass 는
+// 화면이 아직 반이나 남았는데도 줄을 끊는다. 게다가 한글은 글자 사이 어디서나
+// 끊을 수 있어 "가격에" 가 "가 / 격에" 로 갈라진다.
+// 배율을 맞출 방법이 없으니 우리가 띄어쓰기에서 미리 끊고, libass 에게는
+// WrapStyle=2 로 "네가 끊지 마라" 고 한다.
+const SHORTS_WRAP_CHARS = 13;
+
+function wrapCaption(text, maxChars = SHORTS_WRAP_CHARS) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = "";
+  for (const w of words) {
+    if (!cur) {
+      cur = w;
+    } else if (cur.length + 1 + w.length <= maxChars) {
+      cur += " " + w;
+    } else {
+      lines.push(cur);
+      cur = w;
+    }
+    // 띄어쓰기 없이 긴 낱말은 그냥 잘라 넘긴다 — 안 그러면 한 줄이 화면을 넘는다.
+    while (cur.length > maxChars) {
+      lines.push(cur.slice(0, maxChars));
+      cur = cur.slice(maxChars);
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.join("\n");
+}
+
+// 잘라낼 구간에 걸치는 자막만 남기고 0초 기준으로 당긴다.
+// 원본 SRT 를 그대로 쓰면 31초 지점부터 잘라낸 영상에 31초짜리 타임코드가
+// 붙어서 자막이 아예 안 나온다.
+function sliceSrt(segments, startSec, lengthSec) {
+  const end = startSec + lengthSec;
+  const lines = [];
+  let n = 0;
+  for (const s of segments || []) {
+    if (s.end <= startSec || s.start >= end) continue;
+    const from = Math.max(0, s.start - startSec);
+    const to = Math.min(lengthSec, s.end - startSec);
+    if (to - from < 0.05) continue;
+    const text = wrapCaption(s.text);
+    if (!text) continue;
+    lines.push(`${++n}\n${srtTime(from)} --> ${srtTime(to)}\n${text}\n`);
+  }
+  return lines.join("\n");
+}
+
+function srtTime(sec) {
+  const ms = Math.max(0, Math.round(sec * 1000));
+  const p = (v, n = 2) => String(v).padStart(n, "0");
+  return `${p(Math.floor(ms / 3600000))}:${p(Math.floor((ms % 3600000) / 60000))}:` +
+    `${p(Math.floor((ms % 60000) / 1000))},${p(ms % 1000, 3)}`;
+}
+
+async function shortsStageFor(job, editedPath) {
+  // 자막을 구운 영상은 쓰지 않는다. 그걸 세로로 옮기면 자막까지 같이 줄거나
+  // 잘린다 — 흐린 배경에서는 글자가 절반 크기가 되고, 좌우를 잘라내면 문장
+  // 양끝이 화면 밖으로 나간다. 둘 다 실제로 그렇게 나왔다.
+  // 세로로 옮긴 다음에 자막을 얹으면 세로 화면에 맞는 크기로 온전히 들어간다.
+  const totalSec = job.stages.edit?.result?.durationSec || await probeDurationSec(editedPath);
+  const lengthSec = Math.min(job.options.shortsLengthSec || 60, totalSec);
+  const segments = job.stages.transcribe?.status === "done"
+    ? job.stages.transcribe.result?.segments
+    : null;
+  const startSec = pickShortsWindow(segments, totalSec, lengthSec);
+
+  let chain = `[0:v]${shortsFilter(job.options.shortsFit)}`;
+  let withSubtitles = false;
+  if (job.options.burn && segments?.length) {
+    const srt = sliceSrt(segments, startSec, lengthSec);
+    if (srt.trim()) {
+      const srtPath = path.join(TMP, `${job.id}.shorts.srt`);
+      await writeFile(srtPath, srt, "utf8");
+      job.artifacts.push(srtPath);
+      const escaped = srtPath.replace(/\\/g, "/").replace(/:/g, "\\:");
+      // 세로 화면은 아래쪽 15% 쯤을 앱 UI(설명글·버튼)가 덮는다. 그 위로 올린다.
+      // 글자는 폰으로 보는 화면이라 본편보다 키운다.
+      const style = buildForceStyle(job.options.subtitleStyle, {
+        frameH: SHORTS_H, fontScale: 1.4, marginVPx: 300, marginHPx: 60,
+      }) + ",WrapStyle=2";
+      chain += `,subtitles='${escaped}':force_style='${style}'`;
+      withSubtitles = true;
+    }
+  }
+
+  const out = path.join(TMP, `${job.id}.shorts.mp4`);
+  const t0 = Date.now();
+  job.stages.shorts.progress = { outTimeSec: 0, totalSec: lengthSec, pct: 0 };
+
+  await runFFmpeg([
+    "-nostdin",
+    "-ss", startSec.toFixed(2),
+    "-i", editedPath,
+    "-t", lengthSec.toFixed(2),
+    "-filter_complex", `${chain}[v]`,
+    "-map", "[v]",
+    "-map", "0:a?",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+    "-c:a", "aac", "-b:a", "160k",
+    "-movflags", "+faststart",
+    "-progress", "pipe:2",
+    "-y", out,
+  ], {
+    timeoutMs: 5 * 60 * 1000,
+    onProgress: ({ outTimeSec }) => {
+      job.stages.shorts.progress = {
+        outTimeSec, totalSec: lengthSec,
+        pct: Math.min(99, Math.round((outTimeSec / lengthSec) * 100)),
+      };
+    },
+  });
+
+  job.artifacts.push(out);
+  return {
+    _path: out,
+    url: `/api/jobs/${job.id}/files/shorts.mp4`,
+    startSec,
+    lengthSec,
+    fit: job.options.shortsFit,
+    withSubtitles,
+    sizeBytes: (await stat(out)).size,
+    durationMs: Date.now() - t0,
   };
 }
 
@@ -1917,7 +2125,10 @@ function subtitleFontFamily(key) {
 // 180px 짜리 글자가 나와 화면을 잡아먹는다. UI 는 "1080p 픽셀"로 받고 여기서
 // 한 번만 환산한다.
 const ASS_PLAY_RES_Y = 288;
-const pxToAss = (px) => Math.max(0, (Number(px) || 0) * (ASS_PLAY_RES_Y / 1080));
+// px 는 "결과물 높이 기준 픽셀"이다. 가로 영상은 1080 높이가 기준이고, 세로본은
+// 1920 이라 같은 값을 쓰면 글자가 1.8배로 커진다.
+const pxToAssAt = (px, frameH) => Math.max(0, (Number(px) || 0) * (ASS_PLAY_RES_Y / frameH));
+const pxToAss = (px) => pxToAssAt(px, 1080);
 
 function assColour(hex, alphaPct = 100) {
   const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ""));
@@ -1947,16 +2158,24 @@ function sanitizeSubtitleStyle(v) {
   };
 }
 
-function buildForceStyle(style) {
+function buildForceStyle(style, {
+  frameH = 1080, fontScale = 1, marginVPx = null, marginHPx = null,
+} = {}) {
   const st = sanitizeSubtitleStyle(style);
+  const px = (v) => pxToAssAt(v, frameH);
   const parts = [
     `FontName=${subtitleFontFamily(st.font)}`,
-    `FontSize=${pxToAss(st.fontSize).toFixed(1)}`,
+    `FontSize=${px(st.fontSize * fontScale).toFixed(1)}`,
     `PrimaryColour=${assColour(st.color, 100)}`,
     `Bold=${st.bold ? -1 : 0}`,
-    `MarginV=${Math.round(pxToAss(st.marginV))}`,
+    `MarginV=${Math.round(px(marginVPx ?? st.marginV))}`,
     "Shadow=0",
   ];
+  // 줄바꿈 위치는 좌우 여백이 정한다. 한글은 글자 사이 어디서나 끊을 수 있어서
+  // 여백을 안 주면 "가격에" 가 "가 / 격에" 로 갈라진다.
+  if (marginHPx != null) {
+    parts.push(`MarginL=${Math.round(px(marginHPx))}`, `MarginR=${Math.round(px(marginHPx))}`);
+  }
   if (st.background === "box") {
     // BorderStyle=3(불투명 박스)에서 libass 는 박스를 BackColour 가 아니라
     // OutlineColour 로 칠한다. BackColour 만 지정하면 사용자가 무슨 색을 골라도
@@ -1965,10 +2184,10 @@ function buildForceStyle(style) {
     const box = assColour(st.boxColor, st.boxOpacity);
     // Outline 은 여기서 박스 안쪽 여백 — 1080p 기준 10px 정도가 보기 좋다.
     parts.push("BorderStyle=3", `OutlineColour=${box}`, `BackColour=${box}`,
-      `Outline=${pxToAss(10).toFixed(1)}`);
+      `Outline=${px(10).toFixed(1)}`);
   } else {
     parts.push("BorderStyle=1", `OutlineColour=${assColour(st.outlineColor, 100)}`,
-      `Outline=${pxToAss(st.outline).toFixed(1)}`);
+      `Outline=${px(st.outline * fontScale).toFixed(1)}`);
   }
   return parts.join(",");
 }
