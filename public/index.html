@@ -247,6 +247,11 @@
               </select>
             </label>
           </div>
+          <div class="row tiktok-row">
+            <span class="meta-label" id="tiktokStatus">틱톡: 확인 중...</span>
+            <a class="btn btn-sm" id="tiktokConnect" target="_blank" rel="noopener" hidden>틱톡 연결</a>
+            <button type="button" class="btn ghost btn-sm" id="tiktokDisconnect" hidden>연결 끊기</button>
+          </div>
           <p class="hint-row">
             * 편집·자막까지 끝난 영상에서 <b>말이 제일 촘촘한 구간</b>을 골라 세로로 뽑습니다.
             자막을 구웠으면 자막이 들어간 채로 나옵니다 — 숏폼은 소리 없이 보는 사람이 많습니다.
@@ -400,6 +405,8 @@
             <div class="shorts-side">
               <p class="hint-row" id="shortsNote"></p>
               <a id="shortsDownloadBtn" class="btn" download="shorts.mp4" role="button">세로본 내려받기</a>
+              <button type="button" class="btn primary" id="shortsToTiktok" hidden>틱톡 받은함으로 보내기</button>
+              <p class="hint-row" id="tiktokSendStatus"></p>
             </div>
           </div>
         </div>

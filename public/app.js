@@ -500,6 +500,7 @@ function wireQueueStageOptions() {
       publicOpt.disabled = true;
       publicOpt.textContent = "전체 공개 (public) — 서버에서 비활성";
     }
+    renderTiktokStatus(health);
   };
   queue.addEventListener("change", sync);
   sync();
@@ -1396,6 +1397,11 @@ async function checkBackendHealth() {
       metadataProvider: body.metadataProvider || null,
       youtube: body.youtube === true,
       youtubeAllowsPublic: body.youtubeAllowsPublic === true,
+      // 이 목록은 화이트리스트다. 여기 안 적으면 서버가 아무리 보내도 화면까지
+      // 못 온다 — 썸네일 카드와 폴백 사유를 이미 그렇게 한 번씩 잃었다.
+      tiktok: body.tiktok === true,
+      tiktokConnected: body.tiktokConnected === true,
+      tiktokPersistent: body.tiktokPersistent === true,
       // 설치돼 있다고 확인된 자막 서체. 화이트리스트라 빠뜨리면 목록이 안 채워진다.
       subtitleFonts: Array.isArray(body.subtitleFonts) ? body.subtitleFonts : null,
       // 업로드 상한·여유 디스크. 이걸 빠뜨려서, 서버에서 상한을 10GB 로 올린 뒤에도
@@ -2513,6 +2519,80 @@ async function applySubtitleEdits() {
   }
 }
 
+// ── 틱톡 ────────────────────────────────────────────────────────────────────
+//
+// 세로본을 크리에이터 "받은함"(드래프트)으로 보낸다. 게시 버튼은 사람이 앱에서
+// 누른다 — 틱톡이 바로 게시하려면 심사를 요구하는데, 통과 전에는 무엇을 올려도
+// 비공개로 잠기기 때문에 받은함 쪽이 실제로 쓸 수 있는 유일한 길이다.
+let tiktokReady = false;
+
+function renderTiktokStatus(health) {
+  const label = $("tiktokStatus");
+  const connect = $("tiktokConnect");
+  const disconnect = $("tiktokDisconnect");
+  if (!label) return;
+
+  tiktokReady = health.tiktok === true && health.tiktokConnected === true;
+
+  if (!health.ok) {
+    label.textContent = "틱톡: 백엔드 확인 실패";
+  } else if (!health.tiktok) {
+    label.textContent = "틱톡: 서버에 키 없음 (TIKTOK_CLIENT_KEY / SECRET)";
+  } else if (!health.tiktokConnected) {
+    label.textContent = "틱톡: 계정 연결 안 됨";
+  } else {
+    label.textContent = health.tiktokPersistent
+      ? "틱톡: 연결됨"
+      : "틱톡: 연결됨 (경고 — 저장소가 없어 재시작하면 끊깁니다)";
+  }
+
+  // 키가 있어야 연결 버튼이 의미가 있다. 연결 끊기는 연결됐을 때만.
+  if (connect) {
+    connect.hidden = !health.tiktok || tiktokReady;
+    connect.href = `${BACKEND_URL}/api/tiktok/connect`;
+  }
+  if (disconnect) disconnect.hidden = !tiktokReady;
+
+  const send = $("shortsToTiktok");
+  if (send) send.hidden = !tiktokReady || $("shortsBlock")?.hidden !== false;
+}
+
+function wireTiktok() {
+  $("tiktokDisconnect")?.addEventListener("click", async () => {
+    if (!BACKEND_URL) return;
+    try {
+      await fetch(`${BACKEND_URL}/api/tiktok/disconnect`, { method: "POST" });
+      await checkBackendHealth();
+    } catch (e) {
+      appendLog(`틱톡 연결 끊기 실패: ${e?.message || e}`);
+    }
+  });
+
+  $("shortsToTiktok")?.addEventListener("click", async () => {
+    const jobId = currentJobId();
+    const btn = $("shortsToTiktok");
+    const note = $("tiktokSendStatus");
+    if (!jobId) return;
+    btn.disabled = true;
+    if (note) note.textContent = "틱톡으로 보내는 중... (영상 크기에 따라 몇 십 초)";
+    try {
+      const r = await fetch(`${BACKEND_URL}/api/jobs/${jobId}/tiktok`, { method: "POST" });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      if (note) {
+        note.textContent =
+          "보냈습니다 — 틱톡 앱 > 프로필 > 받은함(또는 알림)에서 확인하고 게시하세요." +
+          ` (${(j.sizeBytes / 1024 / 1024).toFixed(1)}MB)`;
+      }
+      appendLog(`틱톡 받은함 전송: ${j.publishId}`);
+    } catch (e) {
+      if (note) note.textContent = `실패: ${e?.message || e}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 // 세로본 — 릴스·틱톡에 올릴 9:16 결과물. 어느 구간을 골랐는지까지 보여야
 // "왜 하필 저 장면이지" 를 눌러 보지 않고도 판단할 수 있다.
 function renderShorts(stage) {
@@ -2537,6 +2617,11 @@ function renderShorts(stage) {
       r.withSubtitles ? "자막 포함" : "자막 없음",
     ].join(" · ");
   }
+  // 세로본이 생겼으니 보내기 버튼을 쓸 수 있다 (틱톡이 연결돼 있다면).
+  const send = $("shortsToTiktok");
+  if (send) send.hidden = !tiktokReady;
+  const sendNote = $("tiktokSendStatus");
+  if (sendNote) sendNote.textContent = "";
 }
 
 // ── 업로드 전 검토 ──────────────────────────────────────────────────────────
@@ -3216,6 +3301,7 @@ onReady(() => {
   restorePrefs();
   wirePrefPersistence();
   wireTopbar();
+  wireTiktok();
   for (const id of ["subFontSize", "subMarginV", "subColor", "subBackground",
                     "subBoxColor", "subBoxOpacity", "subBold",
                     "subFont", "subOutlineColor", "subOutline"]) {
