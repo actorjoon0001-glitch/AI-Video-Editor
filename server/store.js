@@ -111,6 +111,43 @@ export async function loadJob(id) {
   return rows?.[0] || null;
 }
 
+// ── 작은 키-값 보관함 ───────────────────────────────────────────────────────
+//
+// 틱톡은 토큰을 갱신할 때마다 refresh token 자체를 새것으로 바꿔 준다. 그래서
+// 유튜브처럼 환경변수에 한 번 넣어두는 방식이 통하지 않는다 — 서버가 자기
+// 환경변수를 고쳐 쓸 수는 없으니, 새로 받은 토큰을 어딘가 적어 둬야 다음
+// 재시작 때도 이어서 쓸 수 있다.
+// 값이 빈 문자열인 것과 아예 없는 것은 다르다. "연결을 끊었다"를 빈 문자열로
+// 적어 두는데, 둘을 같게 다루면 환경변수에 남아 있는 씨앗 토큰이 되살아나서
+// 끊기 버튼이 아무 일도 안 한 것처럼 된다. 없으면 undefined, 있으면 그 값.
+export async function getSecret(key) {
+  if (!storeConfigured()) return undefined;
+  try {
+    const rows = await call(`app_secrets?key=eq.${encodeURIComponent(key)}&select=value&limit=1`);
+    return rows?.length ? String(rows[0].value ?? "") : undefined;
+  } catch (e) {
+    console.warn(`[store] ${key} 읽기 실패: ${e?.message || e}`);
+    return undefined;
+  }
+}
+
+export async function setSecret(key, value) {
+  if (!storeConfigured()) return false;
+  try {
+    await call("app_secrets?on_conflict=key", {
+      method: "POST",
+      body: [{ key, value, updated_at: new Date().toISOString() }],
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+    return true;
+  } catch (e) {
+    // 여기서 실패하면 다음 재시작 때 연결이 끊긴다. 조용히 넘기면 안 되는
+    // 실패라 로그를 남기고, 호출한 쪽이 사용자에게 알릴 수 있게 false 를 준다.
+    console.error(`[store] ${key} 저장 실패 — 재시작하면 연결이 끊깁니다: ${e?.message || e}`);
+    return false;
+  }
+}
+
 export async function deleteExpired() {
   if (!storeConfigured()) return 0;
   try {

@@ -23,6 +23,10 @@ import { detectKeeps } from "./silence.js";
 import { dropCache, startPageCacheJanitor } from "./pagecache.js";
 import { composeThumbnailCard } from "./thumbcard.js";
 import {
+  tiktokConfigured, tiktokConnected, tiktokStoreReady,
+  authorizeUrl, redirectUri, exchangeCode, uploadToInbox, publishStatus, disconnect as tiktokDisconnect,
+} from "./tiktok.js";
+import {
   storeConfigured, saveJob, listJobs, loadJob, deleteExpired, STORE_RETENTION_DAYS,
 } from "./store.js";
 
@@ -123,6 +127,20 @@ checkWhisperImport().then((r) => {
 
 // 헬스체크. /healthz 는 인프라용, /api/health 는 프론트엔드가 라우트 가용성을
 // 확인하기 위해 호출. routes 배열로 어떤 엔드포인트가 살아있는지 명시한다.
+// 틱톡 연결 여부는 보관함을 읽어야 알 수 있어 비동기다. health 는 동기라
+// 매번 물어볼 수 없으니, 부팅할 때와 연결 상태가 바뀔 때만 갱신해 둔다.
+const tiktokState = { connected: false };
+
+async function refreshTiktokState() {
+  try {
+    tiktokState.connected = await tiktokConnected();
+  } catch (e) {
+    tiktokState.connected = false;
+    console.warn(`[tiktok] 연결 상태 확인 실패: ${e?.message || e}`);
+  }
+  return tiktokState.connected;
+}
+
 function healthBody() {
   return {
     ok: true,
@@ -140,6 +158,12 @@ function healthBody() {
     subtitleFonts: subtitleFonts.map(({ key, label }) => ({ key, label })),
     youtube: youtubeConfigured(),
     youtubeAllowsPublic: youtubeAllowsPublic(),
+    // 틱톡은 "키가 있는가"와 "계정이 연결됐는가"가 다르다. 키만 넣고 연결을
+    // 안 한 상태가 실제로 자주 생기므로 둘을 따로 보여준다.
+    tiktok: tiktokConfigured(),
+    tiktokConnected: tiktokState.connected,
+    // 갱신된 토큰을 적어 둘 곳이 없으면 재시작 한 번에 연결이 끊긴다.
+    tiktokPersistent: tiktokStoreReady(),
     // 업로드 상한을 올릴 수 있는지는 남은 디스크와 메모리가 정한다. 원본 + 편집본이
     // 동시에 올라가므로 파일 크기의 최소 2배가 필요하다.
     limits: diskAndMemory(),
@@ -1309,6 +1333,114 @@ app.post("/api/jobs/:id/youtube", express.json({ limit: "1mb" }), async (req, re
   }
 });
 
+// ── 틱톡 ────────────────────────────────────────────────────────────────────
+//
+// 연결 자체를 우리 서버에서 끝낸다. 유튜브 때는 OAuth Playground 를 거치느라
+// 화면을 몇 번이나 오갔는데, 틱톡은 콜백 주소만 등록해 두면 버튼 한 번이면 된다.
+
+// state 는 CSRF 방지용. 혼자 쓰는 도구라 메모리에 하나만 들고 있으면 충분하다.
+let tiktokAuthState = null;
+
+app.get("/api/tiktok/connect", (req, res) => {
+  if (!tiktokConfigured()) {
+    return res.status(400).type("text/html; charset=utf-8").send(
+      "<h2>틱톡 자격 증명이 없습니다</h2><p>렌더 환경변수에 TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET 을 넣어 주세요.</p>"
+    );
+  }
+  tiktokAuthState = randomUUID();
+  res.redirect(authorizeUrl(req, tiktokAuthState));
+});
+
+app.get("/api/tiktok/callback", async (req, res) => {
+  const page = (title, body) => res.type("text/html; charset=utf-8").send(
+    `<!doctype html><meta charset="utf-8"><title>${title}</title>` +
+    `<body style="font:16px/1.7 system-ui;padding:40px;background:#111;color:#eee">` +
+    `<h2>${title}</h2>${body}</body>`
+  );
+
+  if (req.query.error) {
+    return page("틱톡 연결 실패", `<p>${escapeHtmlServer(String(req.query.error_description || req.query.error))}</p>`);
+  }
+  // state 가 안 맞으면 우리가 시작한 흐름이 아니다.
+  if (!req.query.state || req.query.state !== tiktokAuthState) {
+    return page("틱톡 연결 실패", "<p>요청이 만료됐거나 우리가 시작한 연결이 아닙니다. 다시 눌러 주세요.</p>");
+  }
+  tiktokAuthState = null;
+
+  try {
+    await exchangeCode(String(req.query.code || ""), redirectUri(req));
+    await refreshTiktokState();
+    const warn = tiktokStoreReady()
+      ? ""
+      : "<p style='color:#fb0'>주의: 기록 저장소(Supabase)가 없어 서버가 재시작되면 다시 연결해야 합니다.</p>";
+    console.log("[tiktok] 계정 연결 완료");
+    page("틱톡 연결 완료", `<p>이 창을 닫고 편집 화면으로 돌아가면 됩니다.</p>${warn}`);
+  } catch (e) {
+    console.error("[tiktok] 연결 실패:", e);
+    page("틱톡 연결 실패", `<p>${escapeHtmlServer(String(e?.message || e))}</p>`);
+  }
+});
+
+app.post("/api/tiktok/disconnect", async (req, res) => {
+  await tiktokDisconnect();
+  await refreshTiktokState();
+  res.json({ ok: true, connected: tiktokState.connected });
+});
+
+// 세로본을 틱톡 받은함으로 보낸다. 게시는 사람이 앱에서 한다.
+app.post("/api/jobs/:id/tiktok", async (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const job = pipelineJobs.get(id);
+  if (!job) return res.status(404).json({ error: "작업을 찾을 수 없거나 만료됐습니다." });
+  if (!tiktokConfigured()) return res.status(400).json({ error: "서버에 틱톡 자격 증명이 없습니다." });
+  if (!(await tiktokConnected())) {
+    return res.status(409).json({ error: "틱톡 계정이 연결되지 않았습니다. '틱톡 연결'을 먼저 눌러 주세요." });
+  }
+
+  const file = path.join(TMP, `${id}.shorts.mp4`);
+  if (!existsSync(file)) {
+    return res.status(400).json({
+      error: "이 작업에는 세로본이 없습니다. '세로본도 만들기'를 켜고 다시 만들어 주세요.",
+    });
+  }
+
+  try {
+    const out = await uploadToInbox(file, {
+      onProgress: ({ chunk, chunks, sent, total }) => {
+        console.log(`[job ${id}] 틱톡 전송 ${chunk}/${chunks} (${((sent / total) * 100).toFixed(0)}%)`);
+      },
+    });
+    // 기록에 남겨야 화면이 새로고침 뒤에도 "보냈음"을 안다.
+    job.tiktok = { publishId: out.publishId, sentAt: Date.now(), sizeBytes: out.sizeBytes };
+    saveJob(job);
+    console.log(`[job ${id}] 틱톡 받은함 전송 완료 — ${out.publishId}`);
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    console.error(`[job ${id}] 틱톡 전송 실패:`, e);
+    res.status(502).json({ error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/jobs/:id/tiktok", async (req, res) => {
+  const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
+  const job = pipelineJobs.get(id);
+  const publishId = job?.tiktok?.publishId;
+  if (!publishId) return res.status(404).json({ error: "이 작업에서 틱톡으로 보낸 영상이 없습니다." });
+  try {
+    res.json({ publishId, ...(await publishStatus(publishId)) });
+  } catch (e) {
+    res.status(502).json({ error: String(e?.message || e) });
+  }
+});
+
+// 위의 안내 페이지는 우리가 만든 문자열을 그대로 넣는 자리가 있다. 틱톡이
+// 돌려준 오류 문구가 그대로 들어가므로 최소한의 이스케이프는 해야 한다.
+function escapeHtmlServer(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
 // ── 업로드 전 검토 ──────────────────────────────────────────────────────────
 
 function reviewJobOr404(req, res) {
@@ -2454,6 +2586,12 @@ function probeVideoHeight(file) {
 const server = app.listen(PORT, () => {
   console.log(`AI Video Editor backend listening on :${PORT}`);
   console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
+  if (tiktokConfigured()) {
+    refreshTiktokState().then((c) => {
+      console.log(`[tiktok] 자격 증명 있음 · 계정 연결 ${c ? "됨" : "안 됨"}` +
+        `${tiktokStoreReady() ? "" : " · 경고: 보관함이 없어 재시작하면 연결이 끊깁니다"}`);
+    });
+  }
 });
 
 // 컨테이너에서 node 가 PID 1 로 뜨면 커널이 기본 시그널 동작을 걸어주지 않는다.
