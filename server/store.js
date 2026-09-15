@@ -65,6 +65,10 @@ function snapshot(job) {
     payload: {
       stages,
       options: job.options || null,
+      // 원본이 디스크 어디에 있는지. 이게 없으면 서버가 한 번 재시작하는 순간
+      // 6GB 짜리 원본이 남아 있는데도 다시 만들 방법이 없어진다 — 실제로
+      // 편집이 실패한 작업을 고쳐 돌리려다 그 벽에 부딪혔다.
+      inputPath: job.inputPath || null,
       createdAt: job.createdAt,
       startedAt: job.startedAt || null,
       completedAt: job.completedAt || null,
