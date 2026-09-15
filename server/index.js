@@ -9,7 +9,7 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import { randomUUID } from "crypto";
 import { mkdir, unlink, stat, writeFile, truncate, readdir, open as openFile } from "fs/promises";
 import { existsSync, statfsSync, createWriteStream, readFileSync } from "fs";
@@ -169,6 +169,8 @@ function healthBody() {
     ffmpegThreads: FFMPEG_THREADS,
     hostCpus: os.cpus().length,
     cgroupCpus: cgroupCpuCount(),
+    // 어떤 ffmpeg 이 도는지. 로컬에서 재현이 안 될 때 제일 먼저 확인할 값이다.
+    ffmpegVersion: ffmpegVersion,
     // 업로드 상한을 올릴 수 있는지는 남은 디스크와 메모리가 정한다. 원본 + 편집본이
     // 동시에 올라가므로 파일 크기의 최소 2배가 필요하다.
     limits: diskAndMemory(),
@@ -2839,6 +2841,28 @@ const FFMPEG_THREADS = (() => {
   return clamp(cgroupCpuCount() ?? 2, 1, 4);
 })();
 
+// 부팅할 때 한 번 찍어 둔다. 로컬과 서버의 ffmpeg 이 다르면 "여기선 되는데"
+// 라는 말만 반복하게 된다.
+let ffmpegVersion = "unknown";
+try {
+  const out = execFileSync("ffmpeg", ["-version"], { encoding: "utf8", timeout: 5000 });
+  ffmpegVersion = out.split("\n")[0].replace(/^ffmpeg version /, "").trim().slice(0, 80);
+} catch {}
+
+// ffmpeg 의 마지막 stderr 를 쓸모 있게 자른다.
+//
+// 그냥 뒤에서 2000자를 떼면 필터 인자만 잔뜩 나온다. 컷 구간이 100개가 넘으면
+// 필터 문자열이 6000자라, 정작 어느 필터가 왜 죽었는지 적힌 줄이 밀려나서
+// 안 보인다 — "Cannot allocate memory" 만 보이고 누가 못 잡았는지는 모르는
+// 상태로 한참을 헤맸다. 긴 따옴표 덩어리를 먼저 줄이면 진단 줄이 남는다.
+function condenseFfmpegError(stderr, limit = 2000) {
+  const shrunk = String(stderr).replace(
+    /'[^']{200,}'/g,
+    (m) => `'…(${m.length - 2}자 생략)…'`
+  );
+  return shrunk.slice(-limit);
+}
+
 function runFFmpeg(args, { onProgress, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
     // 스레드 설정은 맨 앞에 둔다 — 여기 있어야 디코더와 인코더 양쪽에 걸린다.
@@ -2897,7 +2921,7 @@ function runFFmpeg(args, { onProgress, timeoutMs } = {}) {
           "ffmpeg 가 메모리 부족으로 강제 종료됐습니다 (exit 137). 더 짧은 영상으로 시도해 주세요."
         ));
       }
-      reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-2000)}`));
+      reject(new Error(`ffmpeg exited ${code}: ${condenseFfmpegError(stderr)}`));
     });
   });
 }
