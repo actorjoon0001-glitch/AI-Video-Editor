@@ -2251,6 +2251,57 @@ function renderJobPipeline(job) {
   ol.querySelectorAll("[data-retry]").forEach((btn) => {
     btn.addEventListener("click", () => retryJobStage(job.jobId, btn.dataset.retry));
   });
+  renderJobActions(job);
+}
+
+// 작업이 실패해도 원본은 하루 동안 서버에 남아 있다. 그런데 "다시 만들기" 는
+// 업로드까지 성공한 작업에만 보여서, 정작 다시 만들어야 하는 실패한 작업에서는
+// 쓸 수가 없었다 — 6GB 를 다시 올리는 것 말고는 길이 없었다.
+function renderJobActions(job) {
+  const row = $("jobActions");
+  if (!row) return;
+  row.innerHTML = "";
+  const failed = job.status === "failed" || job.status === "partial";
+  if (!failed || !job.canRerun) return;
+
+  const note = document.createElement("span");
+  note.className = "meta-label";
+  note.textContent = "원본이 아직 서버에 있습니다 — 다시 올리지 않고 만들 수 있습니다.";
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn primary btn-sm";
+  btn.textContent = "같은 원본으로 다시 만들기";
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    note.textContent = "다시 시작하는 중...";
+    try {
+      // 무음 감지를 이미 했으면 그 결과를 물려줘서 다시 안 돌게 한다.
+      const keeps = job.stages?.detect?.result?.keeps;
+      const options = rerunOptions();
+      if (Array.isArray(keeps) && keeps.length) options.keeps = keeps;
+      const r = await fetch(`${BACKEND_URL}/api/jobs/${job.jobId}/rerun`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ options }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      appendLog(`다시 만들기 시작: ${j.jobId}`);
+      rememberJob(j.jobId);
+      renderJobPipeline(makeInitialJobState(j.jobId));
+      runBtn.disabled = true;
+      try {
+        await followJob(j.jobId, j.pollIntervalMs);
+      } finally {
+        runBtn.disabled = false;
+      }
+    } catch (e) {
+      note.textContent = `다시 만들기 실패: ${e?.message || e}`;
+      btn.disabled = false;
+    }
+  });
+  row.append(btn, note);
 }
 
 function jobStageDetailText(key, s) {

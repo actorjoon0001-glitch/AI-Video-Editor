@@ -164,6 +164,11 @@ function healthBody() {
     tiktokConnected: tiktokState.connected,
     // 갱신된 토큰을 적어 둘 곳이 없으면 재시작 한 번에 연결이 끊긴다.
     tiktokPersistent: tiktokStoreReady(),
+    // ffmpeg 이 실제로 몇 스레드를 쓰는지, 그리고 호스트가 몇 개로 보이는지.
+    // 둘이 크게 벌어지면 그게 곧 메모리 사고의 원인이다.
+    ffmpegThreads: FFMPEG_THREADS,
+    hostCpus: os.cpus().length,
+    cgroupCpus: cgroupCpuCount(),
     // 업로드 상한을 올릴 수 있는지는 남은 디스크와 메모리가 정한다. 원본 + 편집본이
     // 동시에 올라가므로 파일 크기의 최소 2배가 필요하다.
     limits: diskAndMemory(),
@@ -1540,7 +1545,22 @@ app.post("/api/jobs/:id/review/skip", async (req, res) => {
 // 올릴 필요가 없다. 결과는 새 작업이고, 유튜브에는 새 비공개 영상으로 올라간다.
 app.post("/api/jobs/:id/rerun", express.json({ limit: "4mb" }), async (req, res) => {
   const id = String(req.params.id).replace(/[^a-f0-9-]/gi, "");
-  const prev = pipelineJobs.get(id);
+  let prev = pipelineJobs.get(id);
+
+  // 메모리에 없으면 보관 기록에서 되살린다. 원본 파일은 하루 동안 디스크에
+  // 남아 있는데, 배포나 재시작 한 번이면 그 파일을 가리키는 작업이 사라져서
+  // 6GB 를 다시 올려야 했다 — 파일은 멀쩡히 거기 있는데도.
+  if (!prev && storeConfigured()) {
+    try {
+      const row = await loadJob(id);
+      if (row?.payload?.inputPath) {
+        prev = { options: row.payload.options || {}, inputPath: row.payload.inputPath,
+                 sourceName: row.source_name || "" };
+      }
+    } catch (e) {
+      console.warn(`[job ${id}] 보관 기록 조회 실패: ${e?.message || e}`);
+    }
+  }
   if (!prev) return res.status(404).json({ error: "작업을 찾을 수 없거나 만료됐습니다." });
   if (!prev.inputPath || !existsSync(prev.inputPath)) {
     return res.status(410).json({ error: "원본 영상이 서버에서 지워졌습니다. 다시 업로드해 주세요." });
@@ -2775,9 +2795,54 @@ function atempoChain(speed) {
   return parts.join(",");
 }
 
+// ffmpeg 이 쓸 스레드 수.
+//
+// ffmpeg 은 스레드 수를 /proc/cpuinfo 로 정한다. 그런데 컨테이너 안에서 그건
+// 호스트의 코어 수지 우리 몫이 아니다 — 이 서비스는 1 CPU / 2GB 인데 호스트는
+// 램이 126GB 짜리라 코어가 수십 개다. 그래서 ffmpeg 이 수십 개 스레드를 띄우고,
+// 스레드마다 디코더 프레임 버퍼를 따로 잡는다. 프레임이 클수록 이게 치명적이다.
+//
+// 실측 (5472x3078 원본, 구간 106개 select 필터):
+//     -threads 1  →  470MB      -threads 16 → 1260MB
+//     -threads 2  →  521MB      -threads 32 → 2104MB   ← 2GB 한도 초과
+//
+// 실제로 6GB 짜리 드론 원본에서 "Error initializing complex filters. Cannot
+// allocate memory" 로 편집 단계가 즉사했다. 메모리가 119MB 밖에 안 쓰이고 있을
+// 때도 똑같이 죽었으니, 남은 메모리의 문제가 아니라 한 번에 잡으려는 양의
+// 문제였다.
+//
+// CPU 가 하나뿐이라 스레드를 늘려서 빨라질 것도 없다. cgroup 이 실제로 허락한
+// 몫을 읽어서 그만큼만 쓴다.
+function cgroupCpuCount() {
+  try {
+    // cgroup v2: "<quota> <period>" 또는 "max <period>"
+    const [quota, period] = readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim().split(/\s+/);
+    if (quota !== "max") {
+      const n = Math.floor(Number(quota) / Number(period));
+      if (Number.isFinite(n) && n >= 1) return n;
+    }
+  } catch {}
+  return null;
+}
+
+const FFMPEG_THREADS = (() => {
+  const env = parseInt(process.env.FFMPEG_THREADS, 10);
+  if (Number.isFinite(env) && env >= 1) return env;
+  // 몫을 못 읽으면 2 로 둔다. 호스트 코어 수를 그대로 쓰는 것보다는 늘 안전하다.
+  return clamp(cgroupCpuCount() ?? 2, 1, 4);
+})();
+
 function runFFmpeg(args, { onProgress, timeoutMs } = {}) {
   return new Promise((resolve, reject) => {
-    const ff = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    // 스레드 설정은 맨 앞에 둔다 — 여기 있어야 디코더와 인코더 양쪽에 걸린다.
+    // 필터 스레드는 따로 세므로 같이 묶어 준다.
+    const threaded = [
+      "-threads", String(FFMPEG_THREADS),
+      "-filter_threads", String(FFMPEG_THREADS),
+      "-filter_complex_threads", String(FFMPEG_THREADS),
+      ...args,
+    ];
+    const ff = spawn("ffmpeg", threaded, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     let timer = null;
     let timedOut = false;
