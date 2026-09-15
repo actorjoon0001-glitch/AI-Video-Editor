@@ -2766,8 +2766,94 @@ async function processVideo(input, output, opts, { onProgress, timeoutMs, filter
   return { quality, requestedQuality: asked, sourceHeight, filterMode: useSelect ? "select" : "trim" };
 }
 
-// select 식이 거절당하면 trim+concat 으로 한 번 더. 두 방식은 결과가 같고
-// 비용만 다르므로, 한쪽이 안 되면 다른 쪽으로 가는 게 맞다.
+// 구간 하나당 분기를 하나씩 만드는 trim+concat 은 메모리가 구간 수에 비례해
+// 늘어난다. 4K 원본 실측으로 구간당 약 8.4MB — 106 구간이면 컨테이너 한도
+// 2GB 를 그냥 넘어선다 (실제로 10% 진행에 2008MB 를 쓰고 있었다).
+//
+// 그래서 한 번에 다 하지 않고 나눠서 한다. 한 묶음씩 잘라 임시 파일로 굽고,
+// 마지막에 이어 붙인다. 메모리는 묶음 크기가 정하므로 구간이 몇 개든 일정하다.
+const TRIM_BATCH_SIZE = 20;
+
+async function processVideoBatched(input, output, opts, { onProgress, timeoutMs } = {}) {
+  const asked = QUALITY_SIZES[opts.quality] ? opts.quality : "1080p";
+  const sourceHeight = await probeVideoHeight(input);
+  const quality = capQualityToSource(asked, sourceHeight);
+  const ratioFilter = ratioToFilter(ratio_of(opts), quality);
+  const speed = opts.speed || 1;
+  const keeps = opts.keeps;
+
+  const batches = [];
+  for (let i = 0; i < keeps.length; i += TRIM_BATCH_SIZE) {
+    batches.push(keeps.slice(i, i + TRIM_BATCH_SIZE));
+  }
+  console.log(`[encode] 나눠 굽기 — 구간 ${keeps.length}개를 ${batches.length}묶음으로 (묶음당 최대 ${TRIM_BATCH_SIZE}개)`);
+
+  const partPaths = [];
+  const cleanup = async () => {
+    await Promise.all(partPaths.map((f) => unlink(f).catch(() => {})));
+    await unlink(`${output}.parts.txt`).catch(() => {});
+  };
+
+  try {
+    for (let b = 0; b < batches.length; b++) {
+      const batch = batches[b];
+      const parts = [];
+      let ci = "";
+      batch.forEach((k, i) => {
+        parts.push(`[0:v]trim=start=${k.start.toFixed(3)}:end=${k.end.toFixed(3)},setpts=PTS-STARTPTS,${ratioFilter}[v${i}]`);
+        parts.push(`[0:a]atrim=start=${k.start.toFixed(3)}:end=${k.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`);
+        ci += `[v${i}][a${i}]`;
+      });
+      let filter = parts.join(";") + `;${ci}concat=n=${batch.length}:v=1:a=1[vcat][acat]`;
+      // 속도는 묶음 안에서 처리한다. 묶음 경계가 곧 컷 경계라 새로 생기는
+      // 이음매가 없다. 음량 정규화는 전체를 봐야 하므로 마지막에 한 번만 한다.
+      filter += `;[vcat]setpts=${(1 / speed).toFixed(4)}*PTS[vfinal]`;
+      if (speed !== 1.0) filter += `;[acat]${atempoChain(speed)}[afinal]`;
+      else filter += `;[acat]anull[afinal]`;
+
+      const partPath = `${output}.part${b}.mp4`;
+      partPaths.push(partPath);
+      await runFFmpeg([
+        "-nostdin", "-i", input,
+        "-filter_complex", filter,
+        "-map", "[vfinal]", "-map", "[afinal]",
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", String(QUALITY_CRF[quality] ?? 20),
+        "-c:a", "aac", "-b:a", "160k",
+        "-progress", "pipe:2",
+        "-y", partPath,
+      ], {
+        timeoutMs,
+        // 진행률은 묶음 단위로 환산한다 — 묶음 하나가 끝날 때마다 훌쩍 뛰는
+        // 것보다 그 안에서도 움직이는 편이 멈춘 것과 구분된다.
+        onProgress: ({ outTimeSec }) => {
+          onProgress?.({ outTimeSec, batch: b, batches: batches.length });
+        },
+      });
+    }
+
+    // 묶음들을 이어 붙인다. 화면은 이미 다 구워졌으므로 그대로 복사하고,
+    // 음량 정규화만 여기서 한 번 — 전체를 놓고 재야 균일해진다.
+    const listPath = `${output}.parts.txt`;
+    await writeFile(listPath, partPaths.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
+    const joinArgs = ["-nostdin", "-f", "concat", "-safe", "0", "-i", listPath, "-c:v", "copy"];
+    if (opts.loudnorm) joinArgs.push("-af", "loudnorm=I=-16:LRA=11:TP=-1.5", "-c:a", "aac", "-b:a", "160k");
+    else joinArgs.push("-c:a", "copy");
+    joinArgs.push("-movflags", "+faststart", "-y", output);
+    await runFFmpeg(joinArgs, { timeoutMs });
+  } finally {
+    await cleanup();
+  }
+
+  return { quality, requestedQuality: asked, sourceHeight, filterMode: "batched" };
+}
+
+// opts.ratio 를 한 군데서만 읽도록 — 배치 경로와 단일 경로가 갈라지지 않게.
+function ratio_of(opts) {
+  return ["16:9", "9:16", "1:1"].includes(opts.ratio) ? opts.ratio : "16:9";
+}
+
+// select 식이 거절당하면 나눠 굽기로 한 번 더. 결과는 같고 비용만 다르다.
 async function processVideoWithFallback(input, output, opts, runOpts = {}) {
   try {
     return await processVideo(input, output, opts, runOpts);
@@ -2776,20 +2862,9 @@ async function processVideoWithFallback(input, output, opts, runOpts = {}) {
     const selectRejected = /Error initializing filter 'a?select'/.test(msg) ||
       /Cannot allocate memory/.test(msg);
     const n = opts.keeps?.length || 0;
-    const wasSelect = n > SELECT_FILTER_THRESHOLD;
-    // trim+concat 은 구간마다 분기를 하나씩 만들어서 메모리가 구간 수에 비례해
-    // 늘어난다. 실측으로 106 구간에 1.2GB 였으니, 컨테이너가 2GB 인 이상
-    // 수백 구간짜리는 시도해 봐야 OOM 으로 끝난다 — 그건 실패를 바꿔치기하는
-    // 것뿐이라 하지 않는다.
-    const trimAffordable = n <= TRIM_FALLBACK_MAX_KEEPS;
-    if (!selectRejected || !wasSelect || !trimAffordable || runOpts.filterMode === "trim") {
-      if (selectRejected && wasSelect && !trimAffordable) {
-        console.warn(`[encode] 구간이 ${n}개라 trim+concat 으로도 감당이 안 됩니다 — 그대로 실패시킵니다.`);
-      }
-      throw e;
-    }
-    console.warn(`[encode] select 방식이 거절당해 trim+concat 으로 다시 시도합니다: ${msg.slice(-160)}`);
-    return processVideo(input, output, opts, { ...runOpts, filterMode: "trim" });
+    if (!selectRejected || n <= SELECT_FILTER_THRESHOLD || runOpts.filterMode === "trim") throw e;
+    console.warn(`[encode] select 방식이 거절당해 나눠 굽기로 다시 시도합니다: ${msg.slice(-160)}`);
+    return processVideoBatched(input, output, opts, { ...runOpts, filterMode: "trim" });
   }
 }
 
