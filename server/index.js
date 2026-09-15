@@ -1800,7 +1800,7 @@ async function runJobPipeline(id, inputPath) {
     const expectedSec = keptSec / (job.options.speed || 1);
     job.stages.edit.progress = { outTimeSec: 0, totalSec: expectedSec, pct: 0 };
 
-    const enc = await processVideo(inputPath, editedPath, job.options, {
+    const enc = await processVideoWithFallback(inputPath, editedPath, job.options, {
       // 5분 동안 ffmpeg 가 진행 신호를 하나도 못 내면 멎은 것으로 보고 중단한다.
       // 이게 없으면 프론트가 30분 타임아웃까지 "running" 만 보고 있게 된다.
       timeoutMs: 5 * 60 * 1000,
@@ -1823,6 +1823,7 @@ async function runJobPipeline(id, inputPath) {
       sizeBytes,
       durationMs: Date.now() - t0,
       quality: enc.quality,
+      filterMode: enc.filterMode,
       // 원본보다 큰 화질을 골랐으면 조용히 내리지 말고 그 사실을 남긴다.
       downgradedFrom: enc.quality !== enc.requestedQuality ? enc.requestedQuality : null,
       sourceHeight: enc.sourceHeight || null,
@@ -2670,21 +2671,34 @@ process.on("unhandledRejection", (e) => {
 // 미세하게 어긋날 수 있어, 구간이 적을 때는 더 정확한 trim+concat 을 쓴다.
 const SELECT_FILTER_THRESHOLD = 30;
 
-async function processVideo(input, output, opts, { onProgress, timeoutMs } = {}) {
+// select 가 거절당했을 때 trim+concat 으로 되돌아갈 수 있는 상한.
+// 실측 (106 구간, 1080p 출력, -threads 1): 최대 1165MB. 구간 수에 비례하므로
+// 2GB 컨테이너에서 200 구간이 사실상 한계다.
+const TRIM_FALLBACK_MAX_KEEPS = 200;
+
+async function processVideo(input, output, opts, { onProgress, timeoutMs, filterMode = "auto" } = {}) {
   const { keeps, ratio, speed, loudnorm } = opts;
   const asked = QUALITY_SIZES[opts.quality] ? opts.quality : "1080p";
   // 원본보다 큰 화질을 고르면 여기서 내린다. 안 그러면 없는 화질을 만드느라
   // 몇 시간을 더 쓰고 결과는 똑같다.
   const sourceHeight = await probeVideoHeight(input);
   const quality = capQualityToSource(asked, sourceHeight);
-  if (quality !== asked) {
-    console.log(`[encode] 원본 ${sourceHeight}p — ${asked} 요청을 ${quality} 로 낮춥니다 (확대해도 화질은 안 늘어납니다).`);
-  }
+  console.log(`[encode] 원본 ${sourceHeight || "?"}p · 목표 ${quality}` +
+    `${quality !== asked ? ` (${asked} 요청을 낮춤 — 확대해도 화질은 안 늘어납니다)` : ""}` +
+    ` · 구간 ${keeps.length}개`);
 
   const ratioFilter = ratioToFilter(ratio, quality);
   let filter;
 
-  if (keeps.length > SELECT_FILTER_THRESHOLD) {
+  // 구간이 많으면 select 식 하나로 처리하는 게 기본이다. 다만 그 식이 어떤
+  // 원본에서는 ffmpeg 이 "Cannot allocate memory" 로 거절하는 일이 있었다 —
+  // 똑같은 식을 같은 ffmpeg 판으로 로컬에서 돌리면 멀쩡히 통과하는데도.
+  // 원인을 못 짚은 채로 작업을 통째로 날리는 것보다는, 예전부터 쓰던
+  // trim+concat 으로 한 번 더 시도해 보는 편이 낫다.
+  const useSelect = filterMode === "select" ||
+    (filterMode === "auto" && keeps.length > SELECT_FILTER_THRESHOLD);
+
+  if (useSelect) {
     // 구간을 OR(+) 로 이어 붙인 하나의 select 식.
     // between(t,s,e) 은 끝 경계를 포함(t<=e)해서 구간마다 프레임이 한 장씩 더
     // 붙고, 오디오는 샘플 단위라 그만큼 안 늘어난다 → 구간 수에 비례해 A/V 가
@@ -2749,7 +2763,34 @@ async function processVideo(input, output, opts, { onProgress, timeoutMs } = {})
 
   await runFFmpeg(args, { onProgress, timeoutMs });
   // 실제로 쓴 화질을 돌려준다 — 요청과 다를 수 있고, 다르면 화면에 알려야 한다.
-  return { quality, requestedQuality: asked, sourceHeight };
+  return { quality, requestedQuality: asked, sourceHeight, filterMode: useSelect ? "select" : "trim" };
+}
+
+// select 식이 거절당하면 trim+concat 으로 한 번 더. 두 방식은 결과가 같고
+// 비용만 다르므로, 한쪽이 안 되면 다른 쪽으로 가는 게 맞다.
+async function processVideoWithFallback(input, output, opts, runOpts = {}) {
+  try {
+    return await processVideo(input, output, opts, runOpts);
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const selectRejected = /Error initializing filter 'a?select'/.test(msg) ||
+      /Cannot allocate memory/.test(msg);
+    const n = opts.keeps?.length || 0;
+    const wasSelect = n > SELECT_FILTER_THRESHOLD;
+    // trim+concat 은 구간마다 분기를 하나씩 만들어서 메모리가 구간 수에 비례해
+    // 늘어난다. 실측으로 106 구간에 1.2GB 였으니, 컨테이너가 2GB 인 이상
+    // 수백 구간짜리는 시도해 봐야 OOM 으로 끝난다 — 그건 실패를 바꿔치기하는
+    // 것뿐이라 하지 않는다.
+    const trimAffordable = n <= TRIM_FALLBACK_MAX_KEEPS;
+    if (!selectRejected || !wasSelect || !trimAffordable || runOpts.filterMode === "trim") {
+      if (selectRejected && wasSelect && !trimAffordable) {
+        console.warn(`[encode] 구간이 ${n}개라 trim+concat 으로도 감당이 안 됩니다 — 그대로 실패시킵니다.`);
+      }
+      throw e;
+    }
+    console.warn(`[encode] select 방식이 거절당해 trim+concat 으로 다시 시도합니다: ${msg.slice(-160)}`);
+    return processVideo(input, output, opts, { ...runOpts, filterMode: "trim" });
+  }
 }
 
 // 출력 해상도표. 세로 기준(720p/1080p)으로 비율마다 목표 크기를 잡는다.
