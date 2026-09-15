@@ -1553,9 +1553,16 @@ app.post("/api/jobs/:id/rerun", express.json({ limit: "4mb" }), async (req, res)
   if (!prev && storeConfigured()) {
     try {
       const row = await loadJob(id);
-      if (row?.payload?.inputPath) {
-        prev = { options: row.payload.options || {}, inputPath: row.payload.inputPath,
-                 sourceName: row.source_name || "" };
+      if (row) {
+        // 이 줄이 생기기 전에 저장된 기록에는 원본 경로가 없다. 합쳐서 만든
+        // 작업은 합본 파일 이름이 곧 작업 번호라서 되짚을 수 있다 — 이름이
+        // 그 작업 자신의 번호이므로 남의 파일을 집을 위험도 없다.
+        const guess = path.join(TMP, `${id}.upload`);
+        const input = row.payload?.inputPath || (existsSync(guess) ? guess : null);
+        if (input) {
+          prev = { options: row.payload?.options || {}, inputPath: input,
+                   sourceName: row.source_name || "" };
+        }
       }
     } catch (e) {
       console.warn(`[job ${id}] 보관 기록 조회 실패: ${e?.message || e}`);
