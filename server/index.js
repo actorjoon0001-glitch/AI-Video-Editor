@@ -2671,10 +2671,6 @@ process.on("unhandledRejection", (e) => {
 // 미세하게 어긋날 수 있어, 구간이 적을 때는 더 정확한 trim+concat 을 쓴다.
 const SELECT_FILTER_THRESHOLD = 30;
 
-// select 가 거절당했을 때 trim+concat 으로 되돌아갈 수 있는 상한.
-// 실측 (106 구간, 1080p 출력, -threads 1): 최대 1165MB. 구간 수에 비례하므로
-// 2GB 컨테이너에서 200 구간이 사실상 한계다.
-const TRIM_FALLBACK_MAX_KEEPS = 200;
 
 async function processVideo(input, output, opts, { onProgress, timeoutMs, filterMode = "auto" } = {}) {
   const { keeps, ratio, speed, loudnorm } = opts;
@@ -2766,75 +2762,76 @@ async function processVideo(input, output, opts, { onProgress, timeoutMs, filter
   return { quality, requestedQuality: asked, sourceHeight, filterMode: useSelect ? "select" : "trim" };
 }
 
-// 구간 하나당 분기를 하나씩 만드는 trim+concat 은 메모리가 구간 수에 비례해
-// 늘어난다. 4K 원본 실측으로 구간당 약 8.4MB — 106 구간이면 컨테이너 한도
-// 2GB 를 그냥 넘어선다 (실제로 10% 진행에 2008MB 를 쓰고 있었다).
+// 구간이 많을 때의 안전한 경로: 구간마다 따로 잘라 굽고 마지막에 이어 붙인다.
 //
-// 그래서 한 번에 다 하지 않고 나눠서 한다. 한 묶음씩 잘라 임시 파일로 굽고,
-// 마지막에 이어 붙인다. 메모리는 묶음 크기가 정하므로 구간이 몇 개든 일정하다.
-const TRIM_BATCH_SIZE = 20;
-
-async function processVideoBatched(input, output, opts, { onProgress, timeoutMs } = {}) {
+// 앞서 두 가지를 해봤고 둘 다 2GB 안에서 안 됐다. select 식 하나로 처리하는
+// 방식은 이 원본에서 ffmpeg 이 아예 거절했고, trim 필터를 구간마다 하나씩
+// 다는 방식은 메모리가 구간 수에 비례해 늘어 2GB 를 넘겼다.
+//
+// 게다가 trim 필터에는 더 나쁜 성질이 있다 — 되감지를 않는다. 앞부분을 건너뛰는
+// 게 아니라 원본을 처음부터 끝까지 디코딩하면서 범위 밖 프레임을 버린다. 그래서
+// 묶음으로 나눠도 묶음마다 11분을 통째로 다시 디코딩했다. 느린 게 당연했다.
+//
+// -ss 를 입력 앞에 두면 그때는 진짜로 되감는다. 구간 하나당 그 구간만 디코딩하고,
+// 한 번에 하나씩만 돌리므로 메모리는 구간 수와 무관하게 평범한 인코딩 한 번치다.
+async function processVideoPerSegment(input, output, opts, { onProgress, timeoutMs } = {}) {
   const asked = QUALITY_SIZES[opts.quality] ? opts.quality : "1080p";
   const sourceHeight = await probeVideoHeight(input);
   const quality = capQualityToSource(asked, sourceHeight);
-  const ratioFilter = ratioToFilter(ratio_of(opts), quality);
+  const ratio = ["16:9", "9:16", "1:1"].includes(opts.ratio) ? opts.ratio : "16:9";
+  const ratioFilter = ratioToFilter(ratio, quality);
   const speed = opts.speed || 1;
   const keeps = opts.keeps;
+  const totalSec = keeps.reduce((n, k) => n + (k.end - k.start), 0) / speed;
 
-  const batches = [];
-  for (let i = 0; i < keeps.length; i += TRIM_BATCH_SIZE) {
-    batches.push(keeps.slice(i, i + TRIM_BATCH_SIZE));
-  }
-  console.log(`[encode] 나눠 굽기 — 구간 ${keeps.length}개를 ${batches.length}묶음으로 (묶음당 최대 ${TRIM_BATCH_SIZE}개)`);
+  console.log(`[encode] 구간별로 굽기 — ${keeps.length}개 구간, 원본 ${sourceHeight || "?"}p → ${quality}`);
 
   const partPaths = [];
+  const listPath = `${output}.parts.txt`;
   const cleanup = async () => {
     await Promise.all(partPaths.map((f) => unlink(f).catch(() => {})));
-    await unlink(`${output}.parts.txt`).catch(() => {});
+    await unlink(listPath).catch(() => {});
   };
 
   try {
-    for (let b = 0; b < batches.length; b++) {
-      const batch = batches[b];
-      const parts = [];
-      let ci = "";
-      batch.forEach((k, i) => {
-        parts.push(`[0:v]trim=start=${k.start.toFixed(3)}:end=${k.end.toFixed(3)},setpts=PTS-STARTPTS,${ratioFilter}[v${i}]`);
-        parts.push(`[0:a]atrim=start=${k.start.toFixed(3)}:end=${k.end.toFixed(3)},asetpts=PTS-STARTPTS[a${i}]`);
-        ci += `[v${i}][a${i}]`;
-      });
-      let filter = parts.join(";") + `;${ci}concat=n=${batch.length}:v=1:a=1[vcat][acat]`;
-      // 속도는 묶음 안에서 처리한다. 묶음 경계가 곧 컷 경계라 새로 생기는
-      // 이음매가 없다. 음량 정규화는 전체를 봐야 하므로 마지막에 한 번만 한다.
-      filter += `;[vcat]setpts=${(1 / speed).toFixed(4)}*PTS[vfinal]`;
-      if (speed !== 1.0) filter += `;[acat]${atempoChain(speed)}[afinal]`;
-      else filter += `;[acat]anull[afinal]`;
-
-      const partPath = `${output}.part${b}.mp4`;
+    let doneSec = 0;
+    for (let i = 0; i < keeps.length; i++) {
+      const k = keeps[i];
+      const dur = Math.max(0.02, k.end - k.start);
+      const partPath = `${output}.part${i}.mp4`;
       partPaths.push(partPath);
-      await runFFmpeg([
-        "-nostdin", "-i", input,
-        "-filter_complex", filter,
-        "-map", "[vfinal]", "-map", "[afinal]",
+
+      let filter = `${ratioFilter},setpts=${(1 / speed).toFixed(4)}*PTS`;
+      const args = [
+        "-nostdin",
+        // -i 앞의 -ss 라야 되감기다. 뒤에 두면 처음부터 디코딩하면서 버린다.
+        "-ss", k.start.toFixed(3),
+        "-t", dur.toFixed(3),
+        "-i", input,
+        "-vf", filter,
+      ];
+      if (speed !== 1.0) args.push("-af", atempoChain(speed).replace(/^,/, ""));
+      args.push(
         "-c:v", "libx264", "-preset", "veryfast",
         "-crf", String(QUALITY_CRF[quality] ?? 20),
         "-c:a", "aac", "-b:a", "160k",
         "-progress", "pipe:2",
         "-y", partPath,
-      ], {
+      );
+
+      const base = doneSec;
+      await runFFmpeg(args, {
         timeoutMs,
-        // 진행률은 묶음 단위로 환산한다 — 묶음 하나가 끝날 때마다 훌쩍 뛰는
-        // 것보다 그 안에서도 움직이는 편이 멈춘 것과 구분된다.
-        onProgress: ({ outTimeSec }) => {
-          onProgress?.({ outTimeSec, batch: b, batches: batches.length });
-        },
+        onProgress: ({ outTimeSec }) => onProgress?.({ outTimeSec: base + outTimeSec }),
       });
+      doneSec += dur / speed;
+      if (i % 10 === 0 || i === keeps.length - 1) {
+        console.log(`[encode] 구간 ${i + 1}/${keeps.length} (${doneSec.toFixed(0)}s / ${totalSec.toFixed(0)}s)`);
+      }
     }
 
-    // 묶음들을 이어 붙인다. 화면은 이미 다 구워졌으므로 그대로 복사하고,
-    // 음량 정규화만 여기서 한 번 — 전체를 놓고 재야 균일해진다.
-    const listPath = `${output}.parts.txt`;
+    // 화면은 이미 최종본이라 그대로 복사한다. 음량 정규화만 여기서 한 번 —
+    // 구간마다 따로 맞추면 이음매마다 소리 크기가 달라진다.
     await writeFile(listPath, partPaths.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
     const joinArgs = ["-nostdin", "-f", "concat", "-safe", "0", "-i", listPath, "-c:v", "copy"];
     if (opts.loudnorm) joinArgs.push("-af", "loudnorm=I=-16:LRA=11:TP=-1.5", "-c:a", "aac", "-b:a", "160k");
@@ -2845,26 +2842,21 @@ async function processVideoBatched(input, output, opts, { onProgress, timeoutMs 
     await cleanup();
   }
 
-  return { quality, requestedQuality: asked, sourceHeight, filterMode: "batched" };
+  return { quality, requestedQuality: asked, sourceHeight, filterMode: "per-segment" };
 }
 
-// opts.ratio 를 한 군데서만 읽도록 — 배치 경로와 단일 경로가 갈라지지 않게.
-function ratio_of(opts) {
-  return ["16:9", "9:16", "1:1"].includes(opts.ratio) ? opts.ratio : "16:9";
-}
-
-// select 식이 거절당하면 나눠 굽기로 한 번 더. 결과는 같고 비용만 다르다.
+// select 식이 거절당하면 구간별로 굽는다. 결과는 같고 비용만 다르다.
 async function processVideoWithFallback(input, output, opts, runOpts = {}) {
   try {
     return await processVideo(input, output, opts, runOpts);
   } catch (e) {
     const msg = String(e?.message || e);
     const selectRejected = /Error initializing filter 'a?select'/.test(msg) ||
-      /Cannot allocate memory/.test(msg);
+      /Cannot allocate memory/.test(msg) || /exit 137/.test(msg) || /메모리 부족/.test(msg);
     const n = opts.keeps?.length || 0;
     if (!selectRejected || n <= SELECT_FILTER_THRESHOLD || runOpts.filterMode === "trim") throw e;
-    console.warn(`[encode] select 방식이 거절당해 나눠 굽기로 다시 시도합니다: ${msg.slice(-160)}`);
-    return processVideoBatched(input, output, opts, { ...runOpts, filterMode: "trim" });
+    console.warn(`[encode] select 방식이 거절당해 구간별 굽기로 다시 시도합니다: ${msg.slice(-160)}`);
+    return processVideoPerSegment(input, output, opts, { ...runOpts, filterMode: "trim" });
   }
 }
 
