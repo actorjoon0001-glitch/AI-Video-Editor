@@ -248,6 +248,10 @@
             </label>
           </div>
           <div class="row tiktok-row">
+            <span class="meta-label" id="ytChannelStatus">유튜브 채널: 확인 중...</span>
+            <a class="btn btn-sm" id="ytConnect" target="_blank" rel="noopener">채널 연결 / 추가</a>
+          </div>
+          <div class="row tiktok-row">
             <span class="meta-label" id="tiktokStatus">틱톡: 확인 중...</span>
             <a class="btn btn-sm" id="tiktokConnect" target="_blank" rel="noopener" hidden>틱톡 연결</a>
             <button type="button" class="btn ghost btn-sm" id="tiktokDisconnect" hidden>연결 끊기</button>
@@ -452,6 +456,9 @@
               </label>
               <label>태그 (쉼표로 구분)
                 <input type="text" id="reviewTags" />
+              </label>
+              <label id="reviewChannelRow" hidden>올릴 채널
+                <select id="reviewChannel"></select>
               </label>
               <label>공개 범위
                 <select id="reviewPrivacy">

@@ -501,6 +501,7 @@ function wireQueueStageOptions() {
       publicOpt.textContent = "전체 공개 (public) — 서버에서 비활성";
     }
     renderTiktokStatus(health);
+    renderYoutubeChannels(health);
   };
   queue.addEventListener("change", sync);
   sync();
@@ -1402,6 +1403,8 @@ async function checkBackendHealth() {
       tiktok: body.tiktok === true,
       tiktokConnected: body.tiktokConnected === true,
       tiktokPersistent: body.tiktokPersistent === true,
+      youtubeOAuth: body.youtubeOAuth === true,
+      youtubeChannels: Array.isArray(body.youtubeChannels) ? body.youtubeChannels : [],
       // 설치돼 있다고 확인된 자막 서체. 화이트리스트라 빠뜨리면 목록이 안 채워진다.
       subtitleFonts: Array.isArray(body.subtitleFonts) ? body.subtitleFonts : null,
       // 업로드 상한·여유 디스크. 이걸 빠뜨려서, 서버에서 상한을 10GB 로 올린 뒤에도
@@ -2570,6 +2573,32 @@ async function applySubtitleEdits() {
   }
 }
 
+// ── 유튜브 채널 ─────────────────────────────────────────────────────────────
+//
+// 채널을 여러 개 등록해 두고 영상마다 고른다. 예전에는 환경 변수에 토큰 하나라
+// 채널을 바꾸려면 서버 설정을 갈아끼워야 했다.
+let youtubeChannels = [];
+
+function renderYoutubeChannels(health) {
+  youtubeChannels = health.youtubeChannels || [];
+  const label = $("ytChannelStatus");
+  const connect = $("ytConnect");
+  if (connect) {
+    connect.hidden = !health.youtubeOAuth;
+    connect.href = `${BACKEND_URL}/api/youtube/connect`;
+  }
+  if (!label) return;
+  if (!health.ok) label.textContent = "유튜브 채널: 백엔드 확인 실패";
+  else if (!health.youtubeOAuth) label.textContent = "유튜브 채널: 서버에 키 없음";
+  else if (!youtubeChannels.length) {
+    label.textContent = health.youtube
+      ? "유튜브 채널: 서버 설정 채널 1개 (연결하면 여러 개 쓸 수 있음)"
+      : "유튜브 채널: 연결 안 됨";
+  } else {
+    label.textContent = `유튜브 채널 ${youtubeChannels.length}개: ${youtubeChannels.map((c) => c.title).join(", ")}`;
+  }
+}
+
 // ── 틱톡 ────────────────────────────────────────────────────────────────────
 //
 // 세로본을 크리에이터 "받은함"(드래프트)으로 보낸다. 게시 버튼은 사람이 앱에서
@@ -2712,6 +2741,20 @@ function renderReview(job) {
   setValue("reviewTitle", rv.title || "");
   setValue("reviewDesc", rv.description || "");
   setValue("reviewTags", (rv.tags || []).join(", "));
+  const chRow = $("reviewChannelRow");
+  const chSel = $("reviewChannel");
+  const chans = rv.channels || youtubeChannels;
+  if (chRow && chSel) {
+    // 채널이 하나뿐이면 고를 게 없다 — 줄을 아예 안 보여준다.
+    chRow.hidden = chans.length < 2;
+    chSel.innerHTML = "";
+    for (const c of chans) {
+      const o = document.createElement("option");
+      o.value = c.id; o.textContent = c.title;
+      chSel.appendChild(o);
+    }
+    if (rv.channelId) chSel.value = rv.channelId;
+  }
   setValue("reviewPrivacy", rv.privacy || "private");
   setValue("reviewThumbPick", rv.thumbnail || "card");
   [0, 1, 2].forEach((i) => setValue(`reviewLine${i + 1}`, rv.lines?.[i] || ""));
@@ -2783,6 +2826,7 @@ async function sendReviewPatch(extra = {}, { quiet = false } = {}) {
     description: $("reviewDesc")?.value ?? undefined,
     tags: ($("reviewTags")?.value || "").split(",").map((t) => t.trim()).filter(Boolean),
     privacy: $("reviewPrivacy")?.value || undefined,
+    channelId: $("reviewChannel")?.value || undefined,
     thumbnail: $("reviewThumbPick")?.value || undefined,
     lines: [0, 1, 2].map((i) => $(`reviewLine${i + 1}`)?.value || ""),
     ...extra,
@@ -2921,6 +2965,7 @@ function renderMetadata(metaStage, uploadStage) {
       if (st) {
         st.textContent = [
           `제목: ${up.title || "-"}`,
+          up.channelTitle ? `채널: ${up.channelTitle}` : null,
           up.publishAt ? `예약 게시: ${up.publishAt}` : null,
           up.thumbnailSet ? "썸네일 적용됨" : (up.thumbnailError ? `썸네일 실패: ${up.thumbnailError}` : null),
           // 카드 합성은 실패해도 업로드를 막지 않는다. 그래서 조용히 원본 사진이
