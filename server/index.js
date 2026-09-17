@@ -656,6 +656,18 @@ const SOURCE_TTL_MS = 24 * 60 * 60 * 1000;
 // 오기 전에 20GB 가 먼저 찬다. 그래서 나이 말고 남은 용량으로도 한 번 더 건다.
 const SOURCE_FREE_FLOOR_MB = 6000;
 
+// 이 원본을 아직 쓸 작업이 있는가.
+//
+// 예전에는 실행 중인 작업만 봤다. 그런데 작업이 큐에서 기다리는 동안에는
+// 원본 경로가 작업이 아니라 큐 항목에만 있어서, 정리 로직 눈에는 주인 없는
+// 파일로 보였다 — 8.2GB 를 16분에 걸쳐 올려놓고 앞 작업을 기다리던 원본이
+// 그대로 지워졌다. 기다리는 중인 것도 쓰는 중인 것이다.
+export function sourceInUse(file, jobs, queue) {
+  for (const j of jobs) if (j?.inputPath === file) return true;
+  for (const q of queue) if (q?.inputPath === file) return true;
+  return false;
+}
+
 export async function sweepOldSources() {
   let names;
   try {
@@ -664,7 +676,7 @@ export async function sweepOldSources() {
     return console.warn(`[cleanup] 작업 폴더를 읽지 못했습니다: ${e?.message || e}`);
   }
 
-  const inUse = (file) => [...pipelineJobs.values()].some((j) => j.inputPath === file);
+  const inUse = (file) => sourceInUse(file, pipelineJobs.values(), jobQueue);
   const sources = [];
   for (const name of names) {
     if (!name.endsWith(".upload")) continue;
@@ -1800,6 +1812,10 @@ const jobQueue = [];
 let jobRunning = false;
 
 function enqueueJob(id, inputPath) {
+  // 실행을 시작할 때가 아니라 줄을 설 때부터 원본을 붙여 둔다. 그래야 정리
+  // 로직이 "아직 시작 안 한 작업의 원본"도 쓰는 중으로 본다.
+  const job = pipelineJobs.get(id);
+  if (job) job.inputPath = inputPath;
   jobQueue.push({ id, inputPath });
   refreshQueuePositions();
   pumpJobQueue();
