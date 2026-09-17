@@ -106,7 +106,10 @@ export async function saveJob(job) {
 }
 
 export async function listJobs(limit = 50) {
-  const cols = "id,created_at,expires_at,status,title,video_id,video_url,privacy,source_name";
+  // payload 통째로는 안 가져온다 — 자막 본문이 200KB 까지 들어 있어서 50건이면
+  // 응답이 수 MB 가 된다. 원본 경로 한 줄만 뽑아 쓴다.
+  const cols = "id,created_at,expires_at,status,title,video_id,video_url,privacy,source_name," +
+    "input_path:payload->>inputPath";
   return call(`jobs?select=${cols}&order=created_at.desc&limit=${Math.min(200, limit)}`);
 }
 

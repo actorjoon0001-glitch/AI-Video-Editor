@@ -1156,8 +1156,16 @@ app.get("/api/jobs", async (req, res) => {
       videoId: r.video_id,
       videoUrl: r.video_url,
       privacy: r.privacy,
-      // 파일이 아직 있으면 다시 만들 수 있고, 없으면 기록만 남은 것이다.
-      filesAvailable: pipelineJobs.has(r.id),
+      sourceName: r.source_name || null,
+      // 다시 만들 수 있는지는 "메모리에 작업이 있나"가 아니라 "원본이 디스크에
+      // 있나"다. 재시작으로 작업 기록이 메모리에서 사라져도 파일은 남아 있고,
+      // rerun 은 그걸 되짚어 쓴다 — 여기서 메모리만 보면 멀쩡히 다시 만들 수
+      // 있는 작업을 "기록만 남음"으로 보여주게 된다.
+      filesAvailable: Boolean(
+        pipelineJobs.get(r.id)?.inputPath ||
+        (r.input_path && existsSync(r.input_path)) ||
+        existsSync(path.join(TMP, `${r.id}.upload`))
+      ),
     }));
     res.json({ store: "supabase", retentionDays: STORE_RETENTION_DAYS, jobs });
   } catch (e) {
