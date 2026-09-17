@@ -1300,11 +1300,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
   background: var(--panel-2);
 }
 .archive-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 13.5px;
   font-weight: 600;
   color: var(--fg);
   overflow-wrap: anywhere;
 }
+.archive-head .archive-name { min-width: 0; }
 .archive-sub {
   font-size: 11.5px;
   color: var(--muted);
@@ -1320,3 +1324,53 @@ textarea:focus { outline: none; border-color: var(--accent); }
 /* 틱톡 연결 상태 줄 — 상태 문구와 버튼을 같은 줄에 */
 .tiktok-row { align-items: center; gap: 10px; flex-wrap: wrap; }
 .tiktok-row .meta-label { margin-bottom: 0; }
+
+/* ── 작업창 ─────────────────────────────────────────────────────────────── */
+/* 결과 패널 밖에 있는 상시 패널. 진행 중인 작업이 없어도 지난 작업이 보여야 한다. */
+.workbin {
+  margin-top: 16px;
+  padding: 22px;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: 16px;
+}
+.workbin-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.workbin-head .result-title { margin: 0; }
+.workbin-head .btn { margin-left: auto; }
+
+.workbin-group { margin-top: 18px; }
+.workbin-group:first-child { margin-top: 0; }
+.workbin-group-title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .02em;
+}
+/* 내 확인을 기다리는 줄은 눈에 먼저 들어와야 한다. */
+.workbin-group--review .workbin-group-title { color: var(--accent); }
+
+.archive-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.badge-review  { color: #062017; background: var(--accent); border-color: transparent; }
+.badge-running,
+.badge-queued  { color: #fbbf24; border-color: rgba(251, 191, 36, .4); }
+.badge-done    { color: #34d399; border-color: rgba(52, 211, 153, .4); }
+.badge-failed,
+.badge-partial { color: var(--danger); border-color: rgba(255, 122, 122, .4); }
+
+.archive-name { font-weight: 500; }
+.job-archive-item.state-review { border-color: var(--accent); }

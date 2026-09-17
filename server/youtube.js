@@ -18,12 +18,15 @@ import path from "path";
 const CHUNK_SIZE = 8 * 1024 * 1024;
 const PRIVACY_VALUES = new Set(["private", "unlisted", "public"]);
 
+// 올릴 수 있는 상태인가. 클라이언트 자격 증명은 필수이고, 토큰은 환경 변수에
+// 있거나(예전 방식) 화면에서 연결한 채널이 하나라도 있으면 된다. 뒤쪽은
+// 비동기라 여기서 못 보므로, 서버가 부팅 때 확인해 이 값을 채워 준다.
+let connectedChannelCount = 0;
+export function noteConnectedChannels(n) { connectedChannelCount = n; }
+
 export function youtubeConfigured() {
-  return Boolean(
-    process.env.YOUTUBE_CLIENT_ID &&
-    process.env.YOUTUBE_CLIENT_SECRET &&
-    process.env.YOUTUBE_REFRESH_TOKEN
-  );
+  if (!process.env.YOUTUBE_CLIENT_ID || !process.env.YOUTUBE_CLIENT_SECRET) return false;
+  return Boolean(process.env.YOUTUBE_REFRESH_TOKEN) || connectedChannelCount > 0;
 }
 
 export function youtubeAllowsPublic() {
@@ -49,6 +52,7 @@ export async function uploadVideo({
   publishAtIso = null,
   thumbnailPath = null,
   onProgress = null,
+  refreshToken = null,
 }) {
   if (!youtubeConfigured()) {
     throw new Error(
@@ -59,7 +63,7 @@ export async function uploadVideo({
   const safeTitle = String(title || "").trim().slice(0, 100);
   if (!safeTitle) throw new Error("업로드하려면 제목이 필요합니다.");
 
-  const accessToken = await getAccessToken();
+  const accessToken = await getAccessToken(refreshToken);
   const size = (await stat(videoPath)).size;
 
   const body = {
@@ -102,11 +106,15 @@ export async function uploadVideo({
   return result;
 }
 
-async function getAccessToken() {
+async function getAccessToken(refreshToken = null) {
+  // 채널을 골라 올릴 수 있으므로 토큰을 밖에서 받는다. 안 주면 예전처럼
+  // 환경 변수 — 등록된 채널이 없는 배포에서도 그대로 돌아야 한다.
+  const token = refreshToken || process.env.YOUTUBE_REFRESH_TOKEN;
+  if (!token) throw new Error("YouTube refresh token 이 없습니다. 화면에서 채널을 연결해 주세요.");
   const form = new URLSearchParams({
     client_id: process.env.YOUTUBE_CLIENT_ID,
     client_secret: process.env.YOUTUBE_CLIENT_SECRET,
-    refresh_token: process.env.YOUTUBE_REFRESH_TOKEN,
+    refresh_token: token,
     grant_type: "refresh_token",
   }).toString();
 
@@ -120,9 +128,9 @@ async function getAccessToken() {
       `YouTube 토큰 갱신 실패 (HTTP ${res.status}). refresh token 이 만료됐거나 취소됐을 수 있습니다: ${res.text.slice(0, 300)}`
     );
   }
-  const token = JSON.parse(res.text).access_token;
-  if (!token) throw new Error("YouTube 토큰 응답에 access_token 이 없습니다.");
-  return token;
+  const access = JSON.parse(res.text).access_token;
+  if (!access) throw new Error("YouTube 토큰 응답에 access_token 이 없습니다.");
+  return access;
 }
 
 async function startResumableSession(accessToken, body, size) {
@@ -253,6 +261,7 @@ export async function updateVideo({
   tags = null,
   privacy = null,
   thumbnailPath = null,
+  refreshToken = null,
 }) {
   if (!youtubeConfigured()) {
     throw new Error(
@@ -262,7 +271,7 @@ export async function updateVideo({
   const id = String(videoId || "").trim();
   if (!id) throw new Error("videoId 가 필요합니다.");
 
-  const accessToken = await getAccessToken();
+  const accessToken = await getAccessToken(refreshToken);
 
   const cur = await request(
     `https://www.googleapis.com/youtube/v3/videos?part=snippet,status&id=${encodeURIComponent(id)}`,

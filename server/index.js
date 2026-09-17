@@ -18,7 +18,11 @@ import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { generateMetadata, metadataProvider, fillDescriptionTemplate, descriptionVarsFrom } from "./metadata.js";
-import { uploadVideo, updateVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy } from "./youtube.js";
+import { uploadVideo, updateVideo, youtubeConfigured, youtubeAllowsPublic, sanitizePrivacy, noteConnectedChannels } from "./youtube.js";
+import {
+  youtubeOAuthConfigured, youtubeRedirectUri, youtubeAuthorizeUrl,
+  addChannelFromCode, listChannels, publicChannels, removeChannel, refreshTokenFor,
+} from "./youtube-channels.js";
 import { detectKeeps } from "./silence.js";
 import { dropCache, startPageCacheJanitor } from "./pagecache.js";
 import { composeThumbnailCard } from "./thumbcard.js";
@@ -131,6 +135,20 @@ checkWhisperImport().then((r) => {
 // 매번 물어볼 수 없으니, 부팅할 때와 연결 상태가 바뀔 때만 갱신해 둔다.
 const tiktokState = { connected: false };
 
+// health 는 동기라 보관함을 매번 읽을 수 없다. 부팅 때와 채널이 바뀔 때만 갱신.
+let youtubeChannelCache = [];
+
+async function refreshYoutubeChannels() {
+  try {
+    const list = await listChannels();
+    youtubeChannelCache = publicChannels(list);
+    noteConnectedChannels(list.length);
+  } catch (e) {
+    console.warn(`[youtube] 채널 목록 확인 실패: ${e?.message || e}`);
+  }
+  return youtubeChannelCache;
+}
+
 async function refreshTiktokState() {
   try {
     tiktokState.connected = await tiktokConnected();
@@ -164,6 +182,9 @@ function healthBody() {
     tiktokConnected: tiktokState.connected,
     // 갱신된 토큰을 적어 둘 곳이 없으면 재시작 한 번에 연결이 끊긴다.
     tiktokPersistent: tiktokStoreReady(),
+    // 연결해 둔 유튜브 채널들. 영상마다 어디로 올릴지 고를 수 있게.
+    youtubeOAuth: youtubeOAuthConfigured(),
+    youtubeChannels: youtubeChannelCache,
     // ffmpeg 이 실제로 몇 스레드를 쓰는지, 그리고 호스트가 몇 개로 보이는지.
     // 둘이 크게 벌어지면 그게 곧 메모리 사고의 원인이다.
     ffmpegThreads: FFMPEG_THREADS,
@@ -635,6 +656,18 @@ const SOURCE_TTL_MS = 24 * 60 * 60 * 1000;
 // 오기 전에 20GB 가 먼저 찬다. 그래서 나이 말고 남은 용량으로도 한 번 더 건다.
 const SOURCE_FREE_FLOOR_MB = 6000;
 
+// 이 원본을 아직 쓸 작업이 있는가.
+//
+// 예전에는 실행 중인 작업만 봤다. 그런데 작업이 큐에서 기다리는 동안에는
+// 원본 경로가 작업이 아니라 큐 항목에만 있어서, 정리 로직 눈에는 주인 없는
+// 파일로 보였다 — 8.2GB 를 16분에 걸쳐 올려놓고 앞 작업을 기다리던 원본이
+// 그대로 지워졌다. 기다리는 중인 것도 쓰는 중인 것이다.
+export function sourceInUse(file, jobs, queue) {
+  for (const j of jobs) if (j?.inputPath === file) return true;
+  for (const q of queue) if (q?.inputPath === file) return true;
+  return false;
+}
+
 export async function sweepOldSources() {
   let names;
   try {
@@ -643,7 +676,7 @@ export async function sweepOldSources() {
     return console.warn(`[cleanup] 작업 폴더를 읽지 못했습니다: ${e?.message || e}`);
   }
 
-  const inUse = (file) => [...pipelineJobs.values()].some((j) => j.inputPath === file);
+  const inUse = (file) => sourceInUse(file, pipelineJobs.values(), jobQueue);
   const sources = [];
   for (const name of names) {
     if (!name.endsWith(".upload")) continue;
@@ -763,6 +796,8 @@ function reviewResponse(job) {
       description: rv.description,
       tags: rv.tags,
       privacy: rv.privacy,
+      channelId: rv.channelId,
+      channels: youtubeChannelCache,
       thumbnail: rv.thumbnail,
       frameIndex: rv.frameIndex,
       frameUrls: frames,
@@ -852,6 +887,7 @@ function sanitizeStageResult(name, result) {
       // 화이트리스트라 여기 안 적으면 프론트까지 못 간다. 카드가 왜 안 붙었는지는
       // 조용히 사라지면 안 되는 정보다.
       thumbnailCard: result.thumbnailCard || null,
+      channelTitle: result.channelTitle || null,
     };
   }
   return result;
@@ -1120,8 +1156,16 @@ app.get("/api/jobs", async (req, res) => {
       videoId: r.video_id,
       videoUrl: r.video_url,
       privacy: r.privacy,
-      // 파일이 아직 있으면 다시 만들 수 있고, 없으면 기록만 남은 것이다.
-      filesAvailable: pipelineJobs.has(r.id),
+      sourceName: r.source_name || null,
+      // 다시 만들 수 있는지는 "메모리에 작업이 있나"가 아니라 "원본이 디스크에
+      // 있나"다. 재시작으로 작업 기록이 메모리에서 사라져도 파일은 남아 있고,
+      // rerun 은 그걸 되짚어 쓴다 — 여기서 메모리만 보면 멀쩡히 다시 만들 수
+      // 있는 작업을 "기록만 남음"으로 보여주게 된다.
+      filesAvailable: Boolean(
+        pipelineJobs.get(r.id)?.inputPath ||
+        (r.input_path && existsSync(r.input_path)) ||
+        existsSync(path.join(TMP, `${r.id}.upload`))
+      ),
     }));
     res.json({ store: "supabase", retentionDays: STORE_RETENTION_DAYS, jobs });
   } catch (e) {
@@ -1320,7 +1364,9 @@ app.post("/api/jobs/:id/youtube", express.json({ limit: "1mb" }), async (req, re
   }
 
   try {
+    const cred = await refreshTokenFor(job.review?.channelId || null);
     const out = await updateVideo({
+      refreshToken: cred?.token || null,
       videoId,
       title: typeof b.title === "string" ? b.title : null,
       description: typeof b.description === "string" ? b.description : null,
@@ -1338,6 +1384,58 @@ app.post("/api/jobs/:id/youtube", express.json({ limit: "1mb" }), async (req, re
     console.error(`[job ${id}] 유튜브 수정 실패:`, e);
     res.status(502).json({ error: String(e?.message || e) });
   }
+});
+
+// ── 유튜브 채널 연결 ────────────────────────────────────────────────────────
+//
+// 채널마다 토큰을 따로 보관해 두고 업로드할 때 고른다. 예전에는 환경 변수에
+// refresh token 하나만 넣을 수 있어서, 채널을 바꾸려면 OAuth Playground 를
+// 다시 돌려 환경 변수를 갈아끼워야 했고 두 채널을 같이 쓸 수는 없었다.
+
+let youtubeAuthState = null;
+
+app.get("/api/youtube/connect", (req, res) => {
+  if (!youtubeOAuthConfigured()) {
+    return res.status(400).type("text/html; charset=utf-8").send(
+      "<h2>유튜브 자격 증명이 없습니다</h2><p>렌더 환경변수에 YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET 을 넣어 주세요.</p>"
+    );
+  }
+  youtubeAuthState = randomUUID();
+  res.redirect(youtubeAuthorizeUrl(req, youtubeAuthState));
+});
+
+app.get("/api/youtube/callback", async (req, res) => {
+  const page = (title, body) => res.type("text/html; charset=utf-8").send(
+    `<!doctype html><meta charset="utf-8"><title>${title}</title>` +
+    `<body style="font:16px/1.7 system-ui;padding:40px;background:#111;color:#eee">` +
+    `<h2>${title}</h2>${body}</body>`
+  );
+  if (req.query.error) {
+    return page("채널 연결 실패", `<p>${escapeHtmlServer(String(req.query.error))}</p>`);
+  }
+  if (!req.query.state || req.query.state !== youtubeAuthState) {
+    return page("채널 연결 실패", "<p>요청이 만료됐거나 우리가 시작한 연결이 아닙니다. 다시 눌러 주세요.</p>");
+  }
+  youtubeAuthState = null;
+  try {
+    const out = await addChannelFromCode(String(req.query.code || ""), youtubeRedirectUri(req));
+    await refreshYoutubeChannels();
+    const warn = out.stored ? "" :
+      "<p style='color:#fb0'>주의: 기록 저장소(Supabase)가 없어 서버가 재시작되면 다시 연결해야 합니다.</p>";
+    console.log(`[youtube] 채널 ${out.replaced ? "갱신" : "추가"}: ${out.channel.title}`);
+    page(`채널 ${out.replaced ? "갱신" : "추가"} 완료`,
+      `<p><b>${escapeHtmlServer(out.channel.title)}</b></p>` +
+      `<p>이 창을 닫고 편집 화면으로 돌아가면 됩니다.</p>${warn}`);
+  } catch (e) {
+    console.error("[youtube] 채널 연결 실패:", e);
+    page("채널 연결 실패", `<p>${escapeHtmlServer(String(e?.message || e))}</p>`);
+  }
+});
+
+app.post("/api/youtube/channels/:id/remove", async (req, res) => {
+  const ok = await removeChannel(String(req.params.id));
+  const list = await refreshYoutubeChannels();
+  res.json({ ok, channels: list });
 });
 
 // ── 틱톡 ────────────────────────────────────────────────────────────────────
@@ -1480,6 +1578,9 @@ app.post("/api/jobs/:id/review", express.json({ limit: "1mb" }), async (req, res
     rv.tags = b.tags.map((t) => String(t).trim()).filter(Boolean).slice(0, 40);
   }
   if (b.privacy) rv.privacy = sanitizePrivacy(b.privacy);
+  if (typeof b.channelId === "string" && youtubeChannelCache.some((c) => c.id === b.channelId)) {
+    rv.channelId = b.channelId;
+  }
   if (["card", "raw", "none"].includes(b.thumbnail)) rv.thumbnail = b.thumbnail;
 
   // 카드를 다시 그려야 하는 변경인지 먼저 판단한다 — 매번 다시 그리면 문구를
@@ -1719,6 +1820,10 @@ const jobQueue = [];
 let jobRunning = false;
 
 function enqueueJob(id, inputPath) {
+  // 실행을 시작할 때가 아니라 줄을 설 때부터 원본을 붙여 둔다. 그래야 정리
+  // 로직이 "아직 시작 안 한 작업의 원본"도 쓰는 중으로 본다.
+  const job = pipelineJobs.get(id);
+  if (job) job.inputPath = inputPath;
   jobQueue.push({ id, inputPath });
   refreshQueuePositions();
   pumpJobQueue();
@@ -2470,6 +2575,8 @@ async function prepareReview(job) {
     description: meta.description || "",
     tags: Array.isArray(meta.tags) ? meta.tags : [],
     privacy: job.options.privacy,
+    // 어느 채널로 올릴지. 등록해 둔 게 없으면 예전처럼 환경 변수 채널로 간다.
+    channelId: youtubeChannelCache[0]?.id || null,
     // 프레임이 아예 없으면 얹을 자리도 없다.
     thumbnail: frames.length ? "card" : "none",
     frameIndex: 0,
@@ -2503,6 +2610,7 @@ async function uploadInputsFor(job) {
       description: rv.description || "",
       tags: rv.tags || [],
       privacy: rv.privacy || job.options.privacy,
+      channelId: rv.channelId || null,
       thumbnailPath,
       thumbnailCard: rv.card,
     };
@@ -2547,6 +2655,8 @@ async function uploadStageFor(job, editedPath) {
   const burned = job.stages.burn?.status === "done" ? job.stages.burn.result?._path : null;
   const videoPath = burned && existsSync(burned) ? burned : editedPath;
   const inputs = await uploadInputsFor(job);
+  const cred = await refreshTokenFor(inputs.channelId);
+  if (cred?.channelTitle) console.log(`[job ${job.id}] 업로드 채널: ${cred.channelTitle}`);
 
   const result = await uploadVideo({
     videoPath,
@@ -2554,13 +2664,14 @@ async function uploadStageFor(job, editedPath) {
     description: inputs.description,
     tags: inputs.tags,
     privacy: inputs.privacy,
+    refreshToken: cred?.token || null,
     publishAtIso: job.options.publishAt,
     thumbnailPath: inputs.thumbnailPath && existsSync(inputs.thumbnailPath) ? inputs.thumbnailPath : null,
     onProgress: ({ uploaded, total }) => {
       console.log(`[job ${job.id}] upload ${((uploaded / total) * 100).toFixed(0)}%`);
     },
   });
-  return { ...result, thumbnailCard: inputs.thumbnailCard };
+  return { ...result, thumbnailCard: inputs.thumbnailCard, channelTitle: cred?.channelTitle || null };
 }
 
 function uploadTitleFor(job) {
@@ -2616,6 +2727,9 @@ function probeVideoHeight(file) {
 const server = app.listen(PORT, () => {
   console.log(`AI Video Editor backend listening on :${PORT}`);
   console.log(`Allowed origins: ${ALLOWED_ORIGINS.join(", ")}`);
+  refreshYoutubeChannels().then((list) => {
+    if (list.length) console.log(`[youtube] 연결된 채널 ${list.length}개: ${list.map((c) => c.title).join(", ")}`);
+  });
   if (tiktokConfigured()) {
     refreshTiktokState().then((c) => {
       console.log(`[tiktok] 자격 증명 있음 · 계정 연결 ${c ? "됨" : "안 됨"}` +
