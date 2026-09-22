@@ -1779,7 +1779,9 @@ function sanitizeJobOptions(opts) {
     burn: opts.burn === true,
     // 릴스·틱톡용 세로본. 길이는 숏폼에서 실제로 쓰는 범위로만 받는다.
     shorts: opts.shorts === true,
-    shortsLengthSec: clamp(parseInt(opts.shortsLengthSec, 10) || 60, 15, 180),
+    // 유튜브는 3분까지 숏츠로 쳐 주지만, 이 채널은 1분 안에 끝내는 걸로 정했다.
+    // 규칙을 화면에만 적어 두면 언젠가 그보다 긴 값이 넘어온다 — 여기서 자른다.
+    shortsLengthSec: clamp(parseInt(opts.shortsLengthSec, 10) || 60, 15, SHORTS_MAX_SEC),
     shortsFit: opts.shortsFit === "crop" ? "crop" : "blur",
     metadata: opts.metadata === true,
     metadataPersona: String(opts.metadataPersona || "").slice(0, 500),
@@ -2135,6 +2137,9 @@ async function transcribeStageFor(job, editedPath) {
 // 어디를 자를지는 자막이 알려준다. 말이 제일 촘촘한 구간이 대개 설명이 붙는
 // 대목이고, 소리 크기로 고르는 것보다 훨씬 정확하다 (에어컨 소리가 제일 큰
 // 구간을 고르는 일이 없다).
+// 숏폼 길이 상한. 유튜브 기준(3분)이 아니라 채널 운영 기준이다.
+const SHORTS_MAX_SEC = 60;
+
 const SHORTS_W = 1080;
 const SHORTS_H = 1920;
 

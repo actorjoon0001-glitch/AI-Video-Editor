@@ -233,11 +233,10 @@
           <div class="substyle-grid">
             <label>세로본 길이
               <select id="shortsLength">
+                <option value="20">20초</option>
                 <option value="30">30초</option>
                 <option value="45">45초</option>
-                <option value="60" selected>60초</option>
-                <option value="90">90초</option>
-                <option value="120">2분</option>
+                <option value="60" selected>60초 (최대)</option>
               </select>
             </label>
             <label>세로로 옮기는 방식
@@ -260,6 +259,8 @@
             * 편집·자막까지 끝난 영상에서 <b>말이 제일 촘촘한 구간</b>을 골라 세로로 뽑습니다.
             자막을 구웠으면 자막이 들어간 채로 나옵니다 — 숏폼은 소리 없이 보는 사람이 많습니다.
             집 내부 와이드샷은 좌우를 자르면 절반 넘게 사라져서 <b>흐린 배경</b>이 기본입니다.
+            길이는 <b>1분까지</b>만 고를 수 있습니다 (유튜브는 3분까지 숏츠로 인정하지만
+            채널 기준을 1분으로 잡았습니다).
           </p>
 
           <label class="toggle">
@@ -301,7 +302,7 @@
               <span id="paddingVal">0.10 s</span>
             </label>
             <label>숏폼 길이(초)
-              <input type="range" id="shortLen" min="15" max="90" step="5" value="45" />
+              <input type="range" id="shortLen" min="15" max="60" step="5" value="45" />
               <span id="shortLenVal">45 s</span>
             </label>
           </div>
