@@ -798,6 +798,10 @@ function reviewResponse(job) {
       privacy: rv.privacy,
       channelId: rv.channelId,
       channels: youtubeChannelCache,
+      uploadTarget: rv.uploadTarget,
+      // 세로본이 실제로 있을 때만 고를 수 있다.
+      hasShorts: Boolean(shortsPathFor(job)),
+      shortsLengthSec: job.stages.shorts?.result?.lengthSec || null,
       thumbnail: rv.thumbnail,
       frameIndex: rv.frameIndex,
       frameUrls: frames,
@@ -888,6 +892,10 @@ function sanitizeStageResult(name, result) {
       // 조용히 사라지면 안 되는 정보다.
       thumbnailCard: result.thumbnailCard || null,
       channelTitle: result.channelTitle || null,
+      uploadTarget: result.uploadTarget || null,
+      uploads: (result.uploads || []).map((u) => ({
+        kind: u.kind, videoId: u.videoId, url: u.url, privacyStatus: u.privacyStatus,
+      })),
     };
   }
   return result;
@@ -1581,6 +1589,7 @@ app.post("/api/jobs/:id/review", express.json({ limit: "1mb" }), async (req, res
   if (typeof b.channelId === "string" && youtubeChannelCache.some((c) => c.id === b.channelId)) {
     rv.channelId = b.channelId;
   }
+  if (UPLOAD_TARGETS.has(b.uploadTarget)) rv.uploadTarget = b.uploadTarget;
   if (["card", "raw", "none"].includes(b.thumbnail)) rv.thumbnail = b.thumbnail;
 
   // 카드를 다시 그려야 하는 변경인지 먼저 판단한다 — 매번 다시 그리면 문구를
@@ -2577,6 +2586,8 @@ async function prepareReview(job) {
     privacy: job.options.privacy,
     // 어느 채널로 올릴지. 등록해 둔 게 없으면 예전처럼 환경 변수 채널로 간다.
     channelId: youtubeChannelCache[0]?.id || null,
+    // 본편 / 숏폼 / 둘 다. 세로본이 없으면 화면에서 아예 안 보여준다.
+    uploadTarget: "main",
     // 프레임이 아예 없으면 얹을 자리도 없다.
     thumbnail: frames.length ? "card" : "none",
     frameIndex: 0,
@@ -2611,6 +2622,7 @@ async function uploadInputsFor(job) {
       tags: rv.tags || [],
       privacy: rv.privacy || job.options.privacy,
       channelId: rv.channelId || null,
+      uploadTarget: rv.uploadTarget || "main",
       thumbnailPath,
       thumbnailCard: rv.card,
     };
@@ -2651,27 +2663,68 @@ async function uploadInputsFor(job) {
 
 // YouTube 업로드. 자막 번인본이 있으면 그쪽을 올린다 (사용자가 번인을 요청한
 // 이상 그게 최종 산출물이므로).
+// 무엇을 올릴지는 검토 화면에서 고른다.
+//
+// 유튜브는 3분 이하이면서 1:1~9:16 인 영상을 자동으로 숏츠로 분류한다. 따로
+// 표시할 API 필드는 없다 — 세로본을 그냥 올리면 숏츠가 된다.
+const UPLOAD_TARGETS = new Set(["main", "shorts", "both"]);
+
+function shortsPathFor(job) {
+  const p = job.stages.shorts?.status === "done" ? job.stages.shorts.result?._path : null;
+  return p && existsSync(p) ? p : null;
+}
+
 async function uploadStageFor(job, editedPath) {
   const burned = job.stages.burn?.status === "done" ? job.stages.burn.result?._path : null;
-  const videoPath = burned && existsSync(burned) ? burned : editedPath;
+  const mainPath = burned && existsSync(burned) ? burned : editedPath;
+  const shortsPath = shortsPathFor(job);
   const inputs = await uploadInputsFor(job);
   const cred = await refreshTokenFor(inputs.channelId);
   if (cred?.channelTitle) console.log(`[job ${job.id}] 업로드 채널: ${cred.channelTitle}`);
 
-  const result = await uploadVideo({
-    videoPath,
-    title: inputs.title,
-    description: inputs.description,
-    tags: inputs.tags,
-    privacy: inputs.privacy,
-    refreshToken: cred?.token || null,
-    publishAtIso: job.options.publishAt,
-    thumbnailPath: inputs.thumbnailPath && existsSync(inputs.thumbnailPath) ? inputs.thumbnailPath : null,
-    onProgress: ({ uploaded, total }) => {
-      console.log(`[job ${job.id}] upload ${((uploaded / total) * 100).toFixed(0)}%`);
-    },
-  });
-  return { ...result, thumbnailCard: inputs.thumbnailCard, channelTitle: cred?.channelTitle || null };
+  // 세로본이 없으면 고를 것도 없다 — 조용히 본편만 올린다.
+  const want = UPLOAD_TARGETS.has(inputs.uploadTarget) ? inputs.uploadTarget : "main";
+  const target = shortsPath ? want : "main";
+
+  const plan = [];
+  if (target === "main" || target === "both") {
+    plan.push({ kind: "main", path: mainPath, thumbnail: inputs.thumbnailPath });
+  }
+  if (target === "shorts" || target === "both") {
+    // 숏츠에는 썸네일을 올리지 않는다. 우리 카드는 16:9 라 세로 화면에서
+    // 잘려 보이고, 애초에 숏츠는 영상 프레임을 쓴다.
+    plan.push({ kind: "shorts", path: shortsPath, thumbnail: null });
+  }
+
+  const uploads = [];
+  for (const item of plan) {
+    console.log(`[job ${job.id}] ${item.kind === "shorts" ? "숏폼" : "본편"} 업로드 시작`);
+    const r = await uploadVideo({
+      videoPath: item.path,
+      title: inputs.title,
+      description: inputs.description,
+      tags: inputs.tags,
+      privacy: inputs.privacy,
+      refreshToken: cred?.token || null,
+      publishAtIso: job.options.publishAt,
+      thumbnailPath: item.thumbnail && existsSync(item.thumbnail) ? item.thumbnail : null,
+      onProgress: ({ uploaded, total }) => {
+        console.log(`[job ${job.id}] ${item.kind} upload ${((uploaded / total) * 100).toFixed(0)}%`);
+      },
+    });
+    uploads.push({ kind: item.kind, ...r });
+  }
+
+  // 첫 결과를 위로 올려 둔다 — 화면과 기록이 예전처럼 videoId/url 하나를
+  // 읽고 있어서, 그걸 바꾸면 지난 작업 기록까지 같이 깨진다.
+  const first = uploads[0] || {};
+  return {
+    ...first,
+    uploads,
+    uploadTarget: target,
+    thumbnailCard: inputs.thumbnailCard,
+    channelTitle: cred?.channelTitle || null,
+  };
 }
 
 function uploadTitleFor(job) {

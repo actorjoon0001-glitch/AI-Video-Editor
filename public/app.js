@@ -2741,6 +2741,24 @@ function renderReview(job) {
   setValue("reviewTitle", rv.title || "");
   setValue("reviewDesc", rv.description || "");
   setValue("reviewTags", (rv.tags || []).join(", "));
+  // 세로본이 있을 때만 "무엇을 올릴까" 를 보여준다. 없으면 고를 게 없다.
+  const tgRow = $("reviewTargetRow");
+  const tgSel = $("reviewTarget");
+  if (tgRow && tgSel) {
+    tgRow.hidden = !rv.hasShorts;
+    if (rv.hasShorts) {
+      tgSel.value = rv.uploadTarget || "main";
+      const len = rv.shortsLengthSec ? `${Math.round(rv.shortsLengthSec)}초` : "";
+      // 3분을 넘으면 유튜브가 숏츠로 안 잡고 그냥 세로 영상이 된다.
+      const tooLong = rv.shortsLengthSec > 180;
+      const opt = tgSel.querySelector('option[value="shorts"]');
+      if (opt) {
+        opt.textContent = tooLong
+          ? `숏폼만 (${len} — 3분 초과라 일반 영상으로 올라감)`
+          : `숏폼만 (9:16 · ${len} — 유튜브 숏츠)`;
+      }
+    }
+  }
   const chRow = $("reviewChannelRow");
   const chSel = $("reviewChannel");
   const chans = rv.channels || youtubeChannels;
@@ -2827,6 +2845,7 @@ async function sendReviewPatch(extra = {}, { quiet = false } = {}) {
     tags: ($("reviewTags")?.value || "").split(",").map((t) => t.trim()).filter(Boolean),
     privacy: $("reviewPrivacy")?.value || undefined,
     channelId: $("reviewChannel")?.value || undefined,
+    uploadTarget: $("reviewTargetRow")?.hidden ? undefined : ($("reviewTarget")?.value || undefined),
     thumbnail: $("reviewThumbPick")?.value || undefined,
     lines: [0, 1, 2].map((i) => $(`reviewLine${i + 1}`)?.value || ""),
     ...extra,
@@ -2966,6 +2985,9 @@ function renderMetadata(metaStage, uploadStage) {
         st.textContent = [
           `제목: ${up.title || "-"}`,
           up.channelTitle ? `채널: ${up.channelTitle}` : null,
+          (up.uploads || []).length > 1
+            ? `본편 + 숏폼 ${up.uploads.length}개 게시`
+            : (up.uploadTarget === "shorts" ? "숏폼으로 게시" : null),
           up.publishAt ? `예약 게시: ${up.publishAt}` : null,
           up.thumbnailSet ? "썸네일 적용됨" : (up.thumbnailError ? `썸네일 실패: ${up.thumbnailError}` : null),
           // 카드 합성은 실패해도 업로드를 막지 않는다. 그래서 조용히 원본 사진이

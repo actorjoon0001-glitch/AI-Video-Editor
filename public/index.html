@@ -469,6 +469,13 @@
               <label>태그 (쉼표로 구분)
                 <input type="text" id="reviewTags" />
               </label>
+              <label id="reviewTargetRow" hidden>무엇을 올릴까
+                <select id="reviewTarget">
+                  <option value="main">본편만 (16:9)</option>
+                  <option value="shorts">숏폼만 (9:16 — 유튜브 숏츠)</option>
+                  <option value="both">둘 다 — 본편 + 숏폼</option>
+                </select>
+              </label>
               <label id="reviewChannelRow" hidden>올릴 채널
                 <select id="reviewChannel"></select>
               </label>
