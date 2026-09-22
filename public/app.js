@@ -501,6 +501,7 @@ function wireQueueStageOptions() {
       publicOpt.textContent = "전체 공개 (public) — 서버에서 비활성";
     }
     renderTiktokStatus(health);
+    renderYoutubeChannels(health);
   };
   queue.addEventListener("change", sync);
   sync();
@@ -1402,6 +1403,8 @@ async function checkBackendHealth() {
       tiktok: body.tiktok === true,
       tiktokConnected: body.tiktokConnected === true,
       tiktokPersistent: body.tiktokPersistent === true,
+      youtubeOAuth: body.youtubeOAuth === true,
+      youtubeChannels: Array.isArray(body.youtubeChannels) ? body.youtubeChannels : [],
       // 설치돼 있다고 확인된 자막 서체. 화이트리스트라 빠뜨리면 목록이 안 채워진다.
       subtitleFonts: Array.isArray(body.subtitleFonts) ? body.subtitleFonts : null,
       // 업로드 상한·여유 디스크. 이걸 빠뜨려서, 서버에서 상한을 10GB 로 올린 뒤에도
@@ -2570,6 +2573,32 @@ async function applySubtitleEdits() {
   }
 }
 
+// ── 유튜브 채널 ─────────────────────────────────────────────────────────────
+//
+// 채널을 여러 개 등록해 두고 영상마다 고른다. 예전에는 환경 변수에 토큰 하나라
+// 채널을 바꾸려면 서버 설정을 갈아끼워야 했다.
+let youtubeChannels = [];
+
+function renderYoutubeChannels(health) {
+  youtubeChannels = health.youtubeChannels || [];
+  const label = $("ytChannelStatus");
+  const connect = $("ytConnect");
+  if (connect) {
+    connect.hidden = !health.youtubeOAuth;
+    connect.href = `${BACKEND_URL}/api/youtube/connect`;
+  }
+  if (!label) return;
+  if (!health.ok) label.textContent = "유튜브 채널: 백엔드 확인 실패";
+  else if (!health.youtubeOAuth) label.textContent = "유튜브 채널: 서버에 키 없음";
+  else if (!youtubeChannels.length) {
+    label.textContent = health.youtube
+      ? "유튜브 채널: 서버 설정 채널 1개 (연결하면 여러 개 쓸 수 있음)"
+      : "유튜브 채널: 연결 안 됨";
+  } else {
+    label.textContent = `유튜브 채널 ${youtubeChannels.length}개: ${youtubeChannels.map((c) => c.title).join(", ")}`;
+  }
+}
+
 // ── 틱톡 ────────────────────────────────────────────────────────────────────
 //
 // 세로본을 크리에이터 "받은함"(드래프트)으로 보낸다. 게시 버튼은 사람이 앱에서
@@ -2712,6 +2741,20 @@ function renderReview(job) {
   setValue("reviewTitle", rv.title || "");
   setValue("reviewDesc", rv.description || "");
   setValue("reviewTags", (rv.tags || []).join(", "));
+  const chRow = $("reviewChannelRow");
+  const chSel = $("reviewChannel");
+  const chans = rv.channels || youtubeChannels;
+  if (chRow && chSel) {
+    // 채널이 하나뿐이면 고를 게 없다 — 줄을 아예 안 보여준다.
+    chRow.hidden = chans.length < 2;
+    chSel.innerHTML = "";
+    for (const c of chans) {
+      const o = document.createElement("option");
+      o.value = c.id; o.textContent = c.title;
+      chSel.appendChild(o);
+    }
+    if (rv.channelId) chSel.value = rv.channelId;
+  }
   setValue("reviewPrivacy", rv.privacy || "private");
   setValue("reviewThumbPick", rv.thumbnail || "card");
   [0, 1, 2].forEach((i) => setValue(`reviewLine${i + 1}`, rv.lines?.[i] || ""));
@@ -2783,6 +2826,7 @@ async function sendReviewPatch(extra = {}, { quiet = false } = {}) {
     description: $("reviewDesc")?.value ?? undefined,
     tags: ($("reviewTags")?.value || "").split(",").map((t) => t.trim()).filter(Boolean),
     privacy: $("reviewPrivacy")?.value || undefined,
+    channelId: $("reviewChannel")?.value || undefined,
     thumbnail: $("reviewThumbPick")?.value || undefined,
     lines: [0, 1, 2].map((i) => $(`reviewLine${i + 1}`)?.value || ""),
     ...extra,
@@ -2921,6 +2965,7 @@ function renderMetadata(metaStage, uploadStage) {
       if (st) {
         st.textContent = [
           `제목: ${up.title || "-"}`,
+          up.channelTitle ? `채널: ${up.channelTitle}` : null,
           up.publishAt ? `예약 게시: ${up.publishAt}` : null,
           up.thumbnailSet ? "썸네일 적용됨" : (up.thumbnailError ? `썸네일 실패: ${up.thumbnailError}` : null),
           // 카드 합성은 실패해도 업로드를 막지 않는다. 그래서 조용히 원본 사진이
@@ -3090,77 +3135,166 @@ function currentJobId() {
 // 작업 목록이 서버 메모리에만 있던 동안은 새로고침 한 번, 배포 한 번에 통째로
 // 사라졌다. 끝난 영상의 유튜브 링크조차 못 찾는 일이 실제로 있었다.
 // 이제 서버가 Supabase 에 기록을 남기므로, 여기서는 그걸 읽어 보여주기만 한다.
+// 작업을 상태별로 묶어 보여준다.
+//
+// 예전에는 시간순 한 줄 목록이었고, 그마저도 결과 패널 안에 있어서 진행 중인
+// 작업이 없으면 통째로 안 보였다. 실제로 찾게 되는 건 "지금 내 확인을 기다리는
+// 게 있나", "끝난 건 어디 있나" 두 가지라, 그 순서로 묶는다.
+const ARCHIVE_GROUPS = [
+  { key: "review",  label: "확인 기다리는 중", match: (s) => s === "review" },
+  { key: "active",  label: "진행 중",          match: (s) => s === "running" || s === "queued" },
+  { key: "done",    label: "완료",             match: (s) => s === "done" },
+  { key: "failed",  label: "실패 · 일부 실패", match: (s) => s === "failed" || s === "partial" },
+];
+const ARCHIVE_BADGE = {
+  review: "확인 대기", running: "진행 중", queued: "대기 중",
+  done: "완료", failed: "실패", partial: "일부 실패",
+};
+
+let archiveTimer = null;
+
 async function loadArchive() {
-  const list = $("archiveList");
+  const wrap = $("archiveGroups");
   const note = $("archiveNote");
   const hint = $("archiveHint");
-  if (!list || !BACKEND_URL) return;
+  if (!wrap || !BACKEND_URL) return;
 
-  list.innerHTML = "";
-  if (note) note.textContent = "불러오는 중...";
   try {
     const r = await fetch(`${BACKEND_URL}/api/jobs?limit=50`);
     const body = await r.json();
     if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
 
     if (body.store !== "supabase") {
+      wrap.innerHTML = "";
       if (note) note.textContent = body.note || "기록 저장소가 설정되지 않았습니다.";
       if (hint) hint.textContent = "";
       return;
     }
     if (hint) hint.textContent = `${body.retentionDays}일 보관`;
     if (!body.jobs.length) {
+      wrap.innerHTML = "";
       if (note) note.textContent = "아직 보관된 작업이 없습니다.";
       return;
     }
     if (note) note.textContent = "";
 
-    for (const j of body.jobs) {
-      const li = document.createElement("li");
-      li.className = "job-archive-item";
+    wrap.innerHTML = "";
+    for (const g of ARCHIVE_GROUPS) {
+      const rows = body.jobs.filter((j) => g.match(j.status));
+      if (!rows.length) continue;
 
-      const when = new Date(j.createdAt).toLocaleString("ko-KR", {
-        month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
-      });
-      const head = document.createElement("div");
-      head.className = "archive-head";
-      head.textContent = j.title || j.id.slice(0, 8);
-      li.appendChild(head);
+      const sec = document.createElement("div");
+      sec.className = `workbin-group workbin-group--${g.key}`;
+      const h = document.createElement("h4");
+      h.className = "workbin-group-title";
+      h.textContent = `${g.label} (${rows.length})`;
+      sec.appendChild(h);
 
-      const sub = document.createElement("div");
-      sub.className = "archive-sub";
-      // 파일이 남아 있는지가 "다시 만들 수 있는지" 를 가른다. 기록만 남았을 때
-      // 그걸 안 알려주면 버튼을 눌러 보고 나서야 알게 된다.
-      sub.textContent = [
-        when,
-        j.status,
-        `보관 ${j.daysLeft}일 남음`,
-        j.filesAvailable ? "다시 만들기 가능" : "기록만 남음",
-      ].join(" · ");
-      li.appendChild(sub);
-
-      const row = document.createElement("div");
-      row.className = "archive-actions";
-      if (j.videoUrl) {
-        const a = document.createElement("a");
-        a.className = "btn ghost btn-sm";
-        a.href = j.videoUrl; a.target = "_blank"; a.rel = "noopener";
-        a.textContent = `유튜브 열기 (${j.privacy || "?"})`;
-        row.appendChild(a);
-      }
-      const open = document.createElement("button");
-      open.type = "button";
-      open.className = "btn ghost btn-sm";
-      open.textContent = "결과 열기";
-      open.addEventListener("click", () => openArchivedJob(j.id));
-      row.appendChild(open);
-      li.appendChild(row);
-
-      list.appendChild(li);
+      const ol = document.createElement("ol");
+      ol.className = "job-archive";
+      for (const j of rows) ol.appendChild(archiveRow(j));
+      sec.appendChild(ol);
+      wrap.appendChild(sec);
     }
+
+    // 움직이는 게 있으면 알아서 갱신한다 — 새로고침을 눌러야만 바뀌면
+    // 끝났는지 보려고 계속 누르게 된다.
+    const moving = body.jobs.some((j) => j.status === "running" || j.status === "queued");
+    clearTimeout(archiveTimer);
+    if (moving) archiveTimer = setTimeout(loadArchive, 15000);
   } catch (e) {
     if (note) note.textContent = `목록을 못 불러왔습니다: ${e?.message || e}`;
   }
+}
+
+function archiveRow(j) {
+  const li = document.createElement("li");
+  li.className = `job-archive-item state-${j.status}`;
+
+  const head = document.createElement("div");
+  head.className = "archive-head";
+  const badge = document.createElement("span");
+  badge.className = `archive-badge badge-${j.status}`;
+  badge.textContent = ARCHIVE_BADGE[j.status] || j.status;
+  const name = document.createElement("span");
+  name.className = "archive-name";
+  name.textContent = j.title || j.sourceName || j.id.slice(0, 8);
+  head.append(badge, name);
+  li.appendChild(head);
+
+  const when = new Date(j.createdAt).toLocaleString("ko-KR", {
+    month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+  const sub = document.createElement("div");
+  sub.className = "archive-sub";
+  // 원본이 남아 있는지가 "다시 만들 수 있는지" 를 가른다. 그걸 안 알려주면
+  // 버튼을 눌러 보고 나서야 알게 된다.
+  sub.textContent = [
+    when,
+    `보관 ${j.daysLeft}일 남음`,
+    j.filesAvailable ? "원본 있음 — 다시 만들 수 있음" : "기록만 남음",
+  ].join(" · ");
+  li.appendChild(sub);
+
+  const row = document.createElement("div");
+  row.className = "archive-actions";
+
+  if (j.status === "review") {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn primary btn-sm";
+    b.textContent = "검토하고 업로드";
+    b.addEventListener("click", () => openArchivedJob(j.id));
+    row.appendChild(b);
+  } else {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "btn ghost btn-sm";
+    open.textContent = "결과 열기";
+    open.addEventListener("click", () => openArchivedJob(j.id));
+    row.appendChild(open);
+  }
+
+  if (j.videoUrl) {
+    const a = document.createElement("a");
+    a.className = "btn ghost btn-sm";
+    a.href = j.videoUrl; a.target = "_blank"; a.rel = "noopener";
+    a.textContent = `유튜브 (${j.privacy || "?"})`;
+    row.appendChild(a);
+  }
+
+  // 실패한 작업은 여기서 바로 다시 돌릴 수 있어야 한다 — 결과를 열어서
+  // 실패를 확인한 다음에야 버튼을 찾는 건 한 번 더 도는 길이다.
+  if ((j.status === "failed" || j.status === "partial") && j.filesAvailable) {
+    const again = document.createElement("button");
+    again.type = "button";
+    again.className = "btn btn-sm";
+    again.textContent = "다시 만들기";
+    again.addEventListener("click", async () => {
+      again.disabled = true;
+      again.textContent = "시작하는 중...";
+      try {
+        const r = await fetch(`${BACKEND_URL}/api/jobs/${j.id}/rerun`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ options: rerunOptions() }),
+        });
+        const b = await r.json();
+        if (!r.ok) throw new Error(b.error || `HTTP ${r.status}`);
+        appendLog(`다시 만들기 시작: ${b.jobId}`);
+        rememberJob(b.jobId);
+        loadArchive();
+        followJob(b.jobId, b.pollIntervalMs).catch(onError);
+      } catch (e) {
+        again.disabled = false;
+        again.textContent = `실패: ${String(e?.message || e).slice(0, 40)}`;
+      }
+    });
+    row.appendChild(again);
+  }
+
+  li.appendChild(row);
+  return li;
 }
 
 // 보관된 작업을 결과 패널에 되살린다. 파일이 지워졌으면 다운로드 링크는 없고
@@ -3375,13 +3509,9 @@ onReady(() => {
   const tpl = $("descTemplate");
   if (tpl && !tpl.value.trim()) tpl.value = DEFAULT_DESC_TEMPLATE;
   $("archiveRefresh")?.addEventListener("click", loadArchive);
-  // 펼칠 때 처음 한 번만 읽는다 — 화면을 열자마자 매번 부를 이유는 없다.
-  $("archiveCard")?.addEventListener("toggle", (e) => {
-    if (e.target.open && !e.target.dataset.loaded) {
-      e.target.dataset.loaded = "1";
-      loadArchive();
-    }
-  });
+  // 이제 항상 보이는 패널이라 화면을 열 때 바로 채운다. 지난 작업을 찾으려고
+  // 뭔가를 먼저 눌러야 했던 게 원래 문제였다.
+  loadArchive();
 
   $("descTemplateReset")?.addEventListener("click", () => {
     if (!tpl) return;
