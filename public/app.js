@@ -2750,11 +2750,13 @@ function renderReview(job) {
       tgSel.value = rv.uploadTarget || "main";
       const len = rv.shortsLengthSec ? `${Math.round(rv.shortsLengthSec)}초` : "";
       // 3분을 넘으면 유튜브가 숏츠로 안 잡고 그냥 세로 영상이 된다.
-      const tooLong = rv.shortsLengthSec > 180;
+      // 1분을 넘기면 채널 기준에 어긋난다. 서버가 60초로 자르므로 여기 걸릴
+      // 일은 없지만, 예전 설정으로 만들어 둔 작업을 열었을 때는 보여야 한다.
+      const tooLong = rv.shortsLengthSec > 60;
       const opt = tgSel.querySelector('option[value="shorts"]');
       if (opt) {
         opt.textContent = tooLong
-          ? `숏폼만 (${len} — 3분 초과라 일반 영상으로 올라감)`
+          ? `숏폼만 (${len} — 1분 초과)`
           : `숏폼만 (9:16 · ${len} — 유튜브 숏츠)`;
       }
     }
@@ -3380,7 +3382,16 @@ function restorePrefs() {
     if (p[id] !== undefined && $(id)) $(id).checked = p[id];
   }
   for (const id of [...PREF_RANGES, ...PREF_TEXTS]) {
-    if (p[id] !== undefined && $(id)) $(id).value = p[id];
+    if (p[id] === undefined) continue;
+    const el = $(id);
+    if (!el) continue;
+    // 선택지가 줄어든 뒤에도 옛 값이 저장돼 있을 수 있다. 없는 값을 넣으면
+    // select 가 빈 상태가 되어 아무것도 안 고른 것처럼 보인다 — 숏폼 길이에서
+    // 120초를 없앴을 때 실제로 그렇게 될 뻔했다.
+    if (el.tagName === "SELECT" && !Array.from(el.options).some((o) => o.value === String(p[id]))) {
+      continue;
+    }
+    el.value = p[id];
   }
   // 슬라이더 라벨 재동기화
   for (const [src, label, fmt] of sliders) {
